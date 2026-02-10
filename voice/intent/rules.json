@@ -1,0 +1,374 @@
+[
+  {
+    "pattern": "open google",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://www.google.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open youtube",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://www.youtube.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open gmail",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://mail.google.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open maps",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://maps.google.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open google maps",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://maps.google.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open instagram",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://www.instagram.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open facebook",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://www.facebook.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open reddit",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://www.reddit.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open twitter",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://twitter.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open x",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://twitter.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open linkedin",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://www.linkedin.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open amazon",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://www.amazon.in"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open flipkart",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://www.flipkart.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open netflix",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://www.netflix.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open prime video",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://www.primevideo.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open hotstar",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://www.hotstar.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open spotify",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://open.spotify.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open chat gpt",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://chat.openai.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open chatgpt",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://chat.openai.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open gemini",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://gemini.google.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open github",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://github.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open stack overflow",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://stackoverflow.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open hugging face",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://huggingface.co"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open chrome",
+    "intent_id": "OPEN_APP",
+    "params": {
+      "app_name": "chrome"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open edge",
+    "intent_id": "OPEN_APP",
+    "params": {
+      "app_name": "msedge"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open microsoft edge",
+    "intent_id": "OPEN_APP",
+    "params": {
+      "app_name": "msedge"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open notepad",
+    "intent_id": "OPEN_APP",
+    "params": {
+      "app_name": "notepad"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open calculator",
+    "intent_id": "OPEN_APP",
+    "params": {
+      "app_name": "calc"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open task manager",
+    "intent_id": "OPEN_APP",
+    "params": {
+      "app_name": "taskmgr"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open settings",
+    "intent_id": "OPEN_APP",
+    "params": {
+      "app_name": "ms-settings:"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open file explorer",
+    "intent_id": "OPEN_APP",
+    "params": {
+      "app_name": "explorer"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open vs code",
+    "intent_id": "OPEN_APP",
+    "params": {
+      "app_name": "code"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open visual studio code",
+    "intent_id": "OPEN_APP",
+    "params": {
+      "app_name": "code"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open terminal",
+    "intent_id": "OPEN_APP",
+    "params": {
+      "app_name": "cmd"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open command prompt",
+    "intent_id": "OPEN_APP",
+    "params": {
+      "app_name": "cmd"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open powershell",
+    "intent_id": "OPEN_APP",
+    "params": {
+      "app_name": "powershell"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "search google",
+    "intent_id": "SEARCH_WEB",
+    "params": {
+      "query": ""
+    },
+    "confidence": 0.9
+  },
+  {
+    "pattern": "search on google",
+    "intent_id": "SEARCH_WEB",
+    "params": {
+      "query": ""
+    },
+    "confidence": 0.9
+  },
+  {
+    "pattern": "search youtube",
+    "intent_id": "SEARCH_WEB",
+    "params": {
+      "query": ""
+    },
+    "confidence": 0.9
+  },
+  {
+    "pattern": "scroll up",
+    "intent_id": "NAVIGATION",
+    "params": {
+      "direction": "UP",
+      "count": 3
+    },
+    "confidence": 0.99
+  },
+  {
+    "pattern": "scroll down",
+    "intent_id": "NAVIGATION",
+    "params": {
+      "direction": "DOWN",
+      "count": 3
+    },
+    "confidence": 0.99
+  },
+  {
+    "pattern": "go left",
+    "intent_id": "NAVIGATION",
+    "params": {
+      "direction": "LEFT",
+      "count": 1
+    },
+    "confidence": 0.99
+  },
+  {
+    "pattern": "go right",
+    "intent_id": "NAVIGATION",
+    "params": {
+      "direction": "RIGHT",
+      "count": 1
+    },
+    "confidence": 0.99
+  },
+  {
+    "pattern": "command mode",
+    "intent_id": "MODE_SWITCH",
+    "params": {
+      "mode": "COMMAND"
+    },
+    "confidence": 0.99
+  },
+  {
+    "pattern": "dictation mode",
+    "intent_id": "MODE_SWITCH",
+    "params": {
+      "mode": "DICTATION"
+    },
+    "confidence": 0.99
+  },
+  {
+    "pattern": "navigation mode",
+    "intent_id": "MODE_SWITCH",
+    "params": {
+      "mode": "NAVIGATION"
+    },
+    "confidence": 0.99
+  }
+]

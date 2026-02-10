@@ -1,0 +1,74 @@
+[
+  {
+    "pattern": "open youtube",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://www.youtube.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open notepad",
+    "intent_id": "OPEN_APP",
+    "params": {
+      "app_name": "notepad"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "open google",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://www.google.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "search trips to mi",
+    "intent_id": "SEARCH_WEB",
+    "params": {
+      "query": "trips to mi"
+    },
+    "confidence": 0.99
+  },
+  {
+    "pattern": "search strips to",
+    "intent_id": "SEARCH_WEB",
+    "params": {
+      "query": "strips to"
+    },
+    "confidence": 0.99
+  },
+  {
+    "pattern": "search who invented computers",
+    "intent_id": "SEARCH_WEB",
+    "params": {
+      "query": "who invented computers"
+    },
+    "confidence": 0.99
+  },
+  {
+    "pattern": "search tripura",
+    "intent_id": "SEARCH_WEB",
+    "params": {
+      "query": "tripura"
+    },
+    "confidence": 0.99
+  },
+  {
+    "pattern": "open gmail",
+    "intent_id": "OPEN_WEBSITE",
+    "params": {
+      "url": "https://mail.google.com"
+    },
+    "confidence": 0.95
+  },
+  {
+    "pattern": "navigation mode",
+    "intent_id": "MODE_SWITCH",
+    "params": {
+      "mode": "NAVIGATION"
+    },
+    "confidence": 0.99
+  }
+]

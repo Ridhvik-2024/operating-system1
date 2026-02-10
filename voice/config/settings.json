@@ -1,0 +1,67 @@
+{
+  "debug": {
+    "enabled": true,
+    "log_level": "INFO",
+    "print_intents": true,
+    "print_execution": true,
+    "print_ai_raw_output": false
+  },
+
+  "speech": {
+    "language": "en-IN",
+    "listen_timeout_sec": 5,
+    "phrase_time_limit_sec": 8,
+    "ambient_noise_adjust_sec": 0.5
+  },
+
+  "ai": {
+    "enabled": false,
+    "provider": "g4f",
+    "timeout_sec": 10,
+    "max_calls_per_minute": 2,
+    "max_calls_per_day": 50,
+    "min_confidence": 0.7
+  },
+
+  "learning": {
+    "enabled": true,
+    "min_confidence_to_learn": 0.9,
+    "auto_learn": true,
+    "learnable_intents": [
+      "OPEN_WEBSITE",
+      "OPEN_APP",
+      "SEARCH_WEB",
+      "KEY_COMMAND",
+      "MODE_SWITCH"
+    ]
+  },
+
+  "execution": {
+    "default_mode": "COMMAND",
+    "typing_delay_sec": 0.01,
+    "combo_delay_sec": 0.05
+  },
+
+  "safety": {
+    "allow_file_paths": false,
+    "allow_destructive_actions": false,
+    "fail_on_unknown_intent": true
+  },
+
+  
+  "confidence_ladder": {
+    "priority": {
+      "STATE": 3,
+      "RULES": 2,
+      "AI": 1,
+      "UNKNOWN": 0
+    },
+    "min_confidence": {
+      "STATE": 0.0,
+      "RULES": 0.7,
+      "AI": 0.85,
+      "UNKNOWN": 1.1
+    }
+  
+}
+}

@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "provider": "huggingface",
+  "model": "mistralai/Mistral-7B-Instruct",
+  "api_key_env": "HUGGINGFACE_API_KEY",
+  "min_confidence": 0.8,
+  "timeout_sec": 20
+}

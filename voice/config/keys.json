@@ -1,0 +1,37 @@
+{
+  "debug": {
+    "print_key_events": true
+  },
+
+  "virtual_keys": {
+    "CTRL": 17,
+    "SHIFT": 16,
+    "ALT": 18,
+    "ENTER": 13,
+    "TAB": 9,
+    "ESC": 27,
+    "UP": 38,
+    "DOWN": 40,
+    "LEFT": 37,
+    "RIGHT": 39
+  },
+
+  "shortcuts": {
+    "save": ["CTRL", "S"],
+    "copy": ["CTRL", "C"],
+    "paste": ["CTRL", "V"],
+    "cut": ["CTRL", "X"],
+    "undo": ["CTRL", "Z"],
+    "redo": ["CTRL", "Y"],
+    "select_all": ["CTRL", "A"],
+    "new_tab": ["CTRL", "T"],
+    "close_tab": ["CTRL", "W"]
+  },
+
+  "navigation": {
+    "scroll_up": ["UP"],
+    "scroll_down": ["DOWN"],
+    "move_left": ["LEFT"],
+    "move_right": ["RIGHT"]
+  }
+}
