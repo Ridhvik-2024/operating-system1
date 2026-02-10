@@ -72,4 +72,12 @@ If you are an AI, tool, or human reviewer, **read files in this exact order**:
 
 ---
 
-## 🔗 Dependency Graph (Conceptual)
+## links
+https://raw.githubusercontent.com/Ridhvik-2024/operating-system1/main/os_sys_creating_ai_prompt.md
+https://raw.githubusercontent.com/Ridhvik-2024/operating-system1/main/os_sys_decided.md
+https://raw.githubusercontent.com/Ridhvik-2024/operating-system1/main/os_sys_open_decisions.md
+https://raw.githubusercontent.com/Ridhvik-2024/operating-system1/main/os_sys_improvements.md
+https://raw.githubusercontent.com/Ridhvik-2024/operating-system1/main/action_descriptor.schema.md
+https://raw.githubusercontent.com/Ridhvik-2024/operating-system1/main/sandbox_result.schema.md
+https://raw.githubusercontent.com/Ridhvik-2024/operating-system1/main/policy_engine.interface.md
+https://raw.githubusercontent.com/Ridhvik-2024/operating-system1/main/rollback_snapshot.contract.md
