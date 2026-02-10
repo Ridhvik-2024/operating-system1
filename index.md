@@ -73,6 +73,7 @@ If you are an AI, tool, or human reviewer, **read files in this exact order**:
 ---
 
 ## links
+### RAW
 https://raw.githubusercontent.com/Ridhvik-2024/operating-system1/main/os_sys_creating_ai_prompt.md
 https://raw.githubusercontent.com/Ridhvik-2024/operating-system1/main/os_sys_decided.md
 https://raw.githubusercontent.com/Ridhvik-2024/operating-system1/main/os_sys_open_decisions.md
@@ -81,3 +82,13 @@ https://raw.githubusercontent.com/Ridhvik-2024/operating-system1/main/action_des
 https://raw.githubusercontent.com/Ridhvik-2024/operating-system1/main/sandbox_result.schema.md
 https://raw.githubusercontent.com/Ridhvik-2024/operating-system1/main/policy_engine.interface.md
 https://raw.githubusercontent.com/Ridhvik-2024/operating-system1/main/rollback_snapshot.contract.md
+
+### blob
+https://github.com/Ridhvik-2024/operating-system1/blob/main/os_sys_creating_ai_prompt.md
+https://github.com/Ridhvik-2024/operating-system1/blob/main/os_sys_decided.md
+https://github.com/Ridhvik-2024/operating-system1/blob/main/os_sys_open_decisions.md
+https://github.com/Ridhvik-2024/operating-system1/blob/main/os_sys_improvements.md
+https://github.com/Ridhvik-2024/operating-system1/blob/main/action_descriptor.schema.md
+https://github.com/Ridhvik-2024/operating-system1/blob/main/sandbox_result.schema.md
+https://github.com/Ridhvik-2024/operating-system1/blob/main/policy_engine.interface.md
+https://github.com/Ridhvik-2024/operating-system1/blob/main/rollback_snapshot.contract.md
