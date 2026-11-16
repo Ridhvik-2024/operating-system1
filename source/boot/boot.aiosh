@@ -1,0 +1,26 @@
+# /etc/aios/boot.aiosh — AI-OS system bring-up, executed by aios-init
+# through aiosh (the AI-native shell) at every boot. The shell runs in
+# MICRO mode (M7): the OS's own tiny language model classifies and speaks
+# here — LLM-first boot, fully deterministic, no network.
+version
+echo boot: micro-lm cortex check
+lm classify run the nightly report in the background at idle priority
+lm gen about the scheduler
+echo boot: verifying tools
+6*7
+echo boot: verifying memory
+remember AI-OS v1.0 boot completed
+recall AI-OS v1.0
+echo boot: natural language routing (background class)
+later, summarize the workspace notes
+wait all
+jobs
+echo boot: durable state (M8 ext2 side disk)
+dur
+echo boot: publishing on sembus
+emit boot.up '{"milestone":"v1.0","status":"services.up"}'
+echo boot: kernel bridge status
+kernel
+echo boot: autopilot governor status
+autopilot
+echo boot: aiosh bring-up complete

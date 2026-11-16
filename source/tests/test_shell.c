@@ -1,0 +1,359 @@
+/* test_shell.c — M5: aiosh engine tests.
+ * Covers: parser (quotes, key=value, {json}, pipes, sequences), variable
+ * expansion ($var $out $? $json $$), text builtins (count/grep/head),
+ * tool stages + pipe injection, the scripted intent router (unit),
+ * foreground agent runs, background jobs (spawn/jobs/wait/kill), memory
+ * builtins, sembus events, audit integrity, and script end-to-end flow. */
+#include "t.h"
+#include "aios/shell.h"
+#include "aios/sembus.h"
+#include "../src/shroute.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static sh_shell *sh = NULL;
+
+static void run(const char *line, sh_result *r) {
+    sh_exec(sh, line, r);
+}
+
+/* ---- sembus capture ---- */
+static char cap_ping[512] = {0};
+static int  cap_shcmd = 0;
+
+static void cap_ping_fn(const char *topic, const char *payload,
+                        size_t len, void *ud) {
+    (void)topic; (void)ud;
+    snprintf(cap_ping, sizeof cap_ping, "%.*s", (int)(len > 500 ? 500 : len),
+             payload);
+}
+static void cap_shcmd_fn(const char *topic, const char *payload,
+                         size_t len, void *ud) {
+    (void)payload; (void)len; (void)ud;
+    if (strcmp(topic, "sh.cmd") == 0) cap_shcmd = 1;
+}
+
+static void write_file(const char *path, const char *content) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); exit(1); }
+    fputs(content, f);
+    fclose(f);
+}
+
+static void shell_tests(void) {
+    (void)!system("rm -rf build/test-shell");
+    CHECK(aios_mkdirs("build/test-shell/jail") == AIOS_OK, "mkdir jail");
+    CHECK(aios_mkdirs("build/test-shell/store") == AIOS_OK, "mkdir store");
+    write_file("build/test-shell/jail/notes.txt",
+               "hello ai-os\nsecond line\n");
+    write_file("build/test-shell/jail/metrics.csv", "module,loc\nmem,900\n");
+
+    sh = sh_create("build/test-shell/jail", "build/test-shell/store");
+    CHECK(sh != NULL, "shell created");
+    if (!sh) return;
+    CHECK(strcmp(sh_cortex_mode(sh), "scripted") == 0, "default cortex");
+    sembus_sub(sh_bus(sh), "test.ping", cap_ping_fn, NULL);
+    sembus_sub(sh_bus(sh), "*", cap_shcmd_fn, NULL);
+
+    /* ---- basics ---- */
+    sh_result r;
+    run("version", &r);
+    CHECK(r.status == 0, "version ok");
+    CHECK_STR_CONTAINS(r.text, AIOS_VERSION, "version string matches AIOS_VERSION");
+    CHECK(r.json != NULL && json_type_of(r.json) == JSON_OBJ, "version json");
+    sh_result_free(&r);
+
+    run("echo hello world", &r);
+    CHECK(r.status == 0 && strcmp(r.text, "hello world") == 0, "echo joins args");
+    sh_result_free(&r);
+
+    run("echo \"a b\"  c", &r);
+    CHECK(r.status == 0 && strcmp(r.text, "a b c") == 0, "quoting");
+    sh_result_free(&r);
+
+    /* ---- variables ---- */
+    run("set f notes.txt", &r);
+    CHECK(r.status == 0, "set f");
+    sh_result_free(&r);
+    run("echo $f", &r);
+    CHECK(r.status == 0 && strcmp(r.text, "notes.txt") == 0, "$f expands");
+    sh_result_free(&r);
+    run("echo ${f}", &r);
+    CHECK(r.status == 0 && strcmp(r.text, "notes.txt") == 0, "${f} expands");
+    sh_result_free(&r);
+
+    run("echo $?", &r);
+    CHECK(strcmp(r.text, "0") == 0, "$? is 0 after success");
+    sh_result_free(&r);
+
+    run("fs.read missing.txt", &r);
+    CHECK(r.status == 1, "fs.read of missing file fails");
+    CHECK(r.error != NULL && strstr(r.error, "fs.read"), "error text present");
+    sh_result_free(&r);
+    run("echo $?", &r);
+    CHECK(strcmp(r.text, "1") == 0, "$? is 1 after failure");
+    sh_result_free(&r);
+
+    run("echo abc", &r);
+    sh_result_free(&r);
+    run("echo $out", &r);
+    CHECK(strcmp(r.text, "abc") == 0, "$out is last output");
+    sh_result_free(&r);
+
+    run("echo $$", &r);
+    CHECK(strcmp(r.text, "$") == 0, "$$ is a literal dollar");
+    sh_result_free(&r);
+
+    run("unset f", &r);
+    sh_result_free(&r);
+    run("echo [$f]", &r);
+    CHECK(strcmp(r.text, "[]") == 0, "unset variable expands empty");
+    sh_result_free(&r);
+
+    /* ---- comments, sequences ---- */
+    run("   # a comment", &r);
+    CHECK(r.status == 0 && r.text[0] == 0, "comment line is a no-op");
+    sh_result_free(&r);
+    run("echo a ; echo b", &r);
+    CHECK(r.status == 0 && strcmp(r.text, "a\nb") == 0, "; sequences lines");
+    sh_result_free(&r);
+
+    /* ---- pipes + text builtins ---- */
+    run("fs.read notes.txt | count", &r);
+    CHECK(r.status == 0 && strcmp(r.text, "2") == 0, "piped count = 2 lines");
+    sh_result_free(&r);
+    run("fs.read notes.txt | grep second", &r);
+    CHECK(strcmp(r.text, "second line") == 0, "piped grep");
+    sh_result_free(&r);
+    run("fs.read notes.txt | head 1", &r);
+    CHECK(strcmp(r.text, "hello ai-os") == 0, "piped head");
+    sh_result_free(&r);
+    run("echo one two three | count -w", &r);
+    CHECK(strcmp(r.text, "3") == 0, "count -w words");
+    sh_result_free(&r);
+    run("count", &r);
+    CHECK(r.status == 1 && strstr(r.error, "piped"), "count without pipe errors");
+    sh_result_free(&r);
+
+    /* ---- tool stages ---- */
+    run("calc expr=12*(7+5)", &r);
+    CHECK(r.status == 0 && strcmp(r.text, "144") == 0, "calc key=value");
+    CHECK(r.json && json_num(json_obj_get(r.json, "value")) == 144.0,
+          "calc json result");
+    sh_result_free(&r);
+    run("calc '{\"expr\":\"2+3\"}'", &r);
+    CHECK(r.status == 0 && strcmp(r.text, "5") == 0, "calc {json} argument");
+    sh_result_free(&r);
+    run("echo 6*7 | calc", &r);
+    CHECK(r.status == 0 && strcmp(r.text, "42") == 0, "pipe into calc");
+    sh_result_free(&r);
+    run("echo piped-data | fs.write path=pipe.txt", &r);
+    CHECK(r.status == 0, "pipe into fs.write");
+    sh_result_free(&r);
+    run("fs.read pipe.txt", &r);
+    CHECK(strcmp(r.text, "piped-data") == 0, "piped content was written");
+    sh_result_free(&r);
+    run("fs.read notes.txt | memory.search", &r);
+    CHECK(r.status == 0, "pipe into memory.search");
+    sh_result_free(&r);
+
+    /* ---- intent router (scripted) through the full shell ---- */
+    run("12*(7+5)", &r);
+    CHECK(r.status == 0 && strcmp(r.text, "144") == 0, "NL arithmetic -> calc");
+    sh_result_free(&r);
+    run("read notes.txt", &r);
+    CHECK(r.status == 0 && strstr(r.text, "hello ai-os"), "NL read -> fs.read");
+    sh_result_free(&r);
+    run("list files", &r);
+    CHECK(r.status == 0 && strstr(r.text, "notes.txt"), "NL list -> fs.list");
+    sh_result_free(&r);
+    run("what can you do", &r);
+    CHECK(r.status == 0 && strstr(r.text, "scripted"), "NL question -> reply");
+    sh_result_free(&r);
+
+    /* ---- memory builtins ---- */
+    run("remember aiosh-test-fact-42", &r);
+    CHECK(r.status == 0 && strstr(r.text, "remembered"), "remember stores");
+    sh_result_free(&r);
+    run("recall aiosh-test-fact", &r);
+    CHECK(r.status == 0 && strstr(r.text, "aiosh-test-fact-42"),
+          "recall finds it");
+    sh_result_free(&r);
+
+    /* ---- foreground agent (scripted cortex) ---- */
+    run("summarize the workspace", &r);
+    CHECK(r.status == 0 && strstr(r.text, "summary.md"),
+          "NL action verb -> agent run");
+    sh_result_free(&r);
+    {
+        FILE *f = fopen("build/test-shell/jail/summary.md", "r");
+        CHECK(f != NULL, "agent wrote summary.md in the jail");
+        if (f) fclose(f);
+    }
+
+    /* ---- sembus events ---- */
+    run("emit test.ping '{\"x\":42}'", &r);
+    CHECK(r.status == 0 && strstr(r.text, "2 subscriber"),
+          "emit publishes (exact + wildcard subscribers)");
+    sh_result_free(&r);
+    CHECK(strstr(cap_ping, "42") != NULL, "subscriber got test.ping payload");
+    CHECK(cap_shcmd == 1, "sh.cmd events published");
+
+    /* ---- history, vars listing, cortex switching ---- */
+    run("history", &r);
+    CHECK(r.status == 0 && strstr(r.text, "summarize the workspace"),
+          "history records lines");
+    sh_result_free(&r);
+    run("set f notes.txt", &r);
+    sh_result_free(&r);
+    run("vars", &r);
+    CHECK(strstr(r.text, "f=notes.txt"), "vars lists name=value");
+    sh_result_free(&r);
+    run("cortex llm", &r);
+    CHECK(r.status == 0 && strstr(r.text, "llm"), "cortex switches to llm");
+    sh_result_free(&r);
+    CHECK(strcmp(sh_cortex_mode(sh), "llm") == 0, "mode visible via API");
+    run("cortex", &r);
+    CHECK(strstr(r.text, "cortex: llm"), "cortex shows current mode");
+    sh_result_free(&r);
+    run("cortex scripted", &r);
+    sh_result_free(&r);
+
+    /* ---- background jobs ---- */
+    run("spawn summarize the workspace", &r);
+    CHECK(r.status == 0 && strstr(r.text, "[job 1]"), "spawn starts job 1");
+    sh_result_free(&r);
+    for (int i = 0; i < 1500 && sh_jobs_alive(sh) > 0; i++) {
+        sh_poll_jobs(sh);
+        usleep(20000);
+    }
+    CHECK(sh_jobs_alive(sh) == 0, "job 1 finished");
+    run("jobs", &r);
+    CHECK(strstr(r.text, "done"), "jobs shows done state");
+    sh_result_free(&r);
+    {
+        json_val *o = json_parse_file("build/test-shell/store/jobs/1.json");
+        CHECK(o != NULL, "job result file exists");
+        if (o) {
+            CHECK_STR_CONTAINS(json_str(json_obj_get(o, "status")), "done",
+                               "job 1 status done");
+            CHECK_STR_CONTAINS(json_str(json_obj_get(o, "final")), "summary.md",
+                               "job 1 final mentions summary.md");
+            json_free(o);
+        }
+    }
+    run("wait 1", &r);
+    CHECK(r.status == 0 && strstr(r.text, "Wrote summary.md"),
+          "wait reports the job's final answer");
+    sh_result_free(&r);
+
+    /* kill: spawn and terminate quickly; retry on the rare race where
+     * the scripted agent finished before the kill landed */
+    int killed = 0;
+    for (int attempt = 0; attempt < 5 && !killed; attempt++) {
+        run("spawn summarize the workspace", &r);
+        long id = 0;
+        if (r.status == 0 && r.text) sscanf(r.text, "[job %ld]", &id);
+        sh_result_free(&r);
+        if (id <= 0) break;
+        char kline[64];
+        snprintf(kline, sizeof kline, "kill %ld", id);
+        run(kline, &r);
+        killed = (r.status == 0);
+        sh_result_free(&r);
+    }
+    CHECK(killed, "kill terminates a running job");
+    run("wait all", &r);
+    CHECK(r.status == 0, "wait all reaps everything");
+    sh_result_free(&r);
+    CHECK(sh_jobs_alive(sh) == 0, "no jobs alive at the end");
+
+    /* ---- audit integrity ---- */
+    {
+        char *data = NULL;
+        size_t len = 0;
+        CHECK(aios_read_file("build/test-shell/store/audit.log", &data, &len,
+                             1u << 20) == AIOS_OK && data,
+              "audit log readable");
+        if (data) {
+            CHECK_STR_CONTAINS(data, "\"tool\":\"calc\"", "audit has calc");
+            CHECK_STR_CONTAINS(data, "\"tool\":\"fs.write\"", "audit has fs.write");
+            free(data);
+        }
+    }
+
+    /* ---- parse errors ---- */
+    run("echo \"abc", &r);
+    CHECK(r.status == 1 && strstr(r.error, "quote"), "unterminated quote");
+    sh_result_free(&r);
+
+    /* ---- exit ---- */
+    run("exit", &r);
+    CHECK(r.status == 0 && strstr(r.text, "bye"), "exit builtin");
+    sh_result_free(&r);
+
+    sh_result_free(&r);
+    sh_free(sh);
+    sh = NULL;
+}
+
+/* ---------------- router unit tests (no shell needed) ---------------- */
+
+#include "aios/types.h"
+
+static void router_tests(void) {
+    tool_reg *tr = tool_reg_create("/tmp", "/tmp/shroute-test", "t", NULL);
+    CHECK(tr != NULL, "router test registry");
+    if (!tr) return;
+    tool_reg_install_default(tr);
+
+    struct { const char *line; sh_route_kind kind; const char *tool; } cases[] = {
+        { "12*(7+5)",              SH_ROUTE_TOOL,  "calc" },
+        { "2^10",                  SH_ROUTE_TOOL,  "calc" },
+        { "read notes.txt",        SH_ROUTE_TOOL,  "fs.read" },
+        { "cat notes.txt",         SH_ROUTE_TOOL,  "fs.read" },
+        { "list files",            SH_ROUTE_TOOL,  "fs.list" },
+        { "ls",                    SH_ROUTE_TOOL,  "fs.list" },
+        { "write hello to out.txt",SH_ROUTE_TOOL,  "fs.write" },
+        { "summarize the workspace", SH_ROUTE_AGENT, NULL },
+        { "analyze the metrics",   SH_ROUTE_AGENT, NULL },
+        { "clean the tmp files",   SH_ROUTE_AGENT, NULL },
+        { "please do the thing",   SH_ROUTE_AGENT, NULL },
+        { "what is an OS",         SH_ROUTE_REPLY, NULL },
+        { "how does memory work",  SH_ROUTE_REPLY, NULL },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        sh_decision d;
+        char err[256] = {0};
+        aios_status st = sh_route("scripted", cases[i].line, tr, &d,
+                                  err, sizeof err);
+        char msg[256];
+        snprintf(msg, sizeof msg, "route '%s' (%s)", cases[i].line, err);
+        CHECK(st == AIOS_OK, msg);
+        CHECK(d.kind == cases[i].kind, msg);
+        if (cases[i].tool && d.kind == SH_ROUTE_TOOL) {
+            CHECK(d.tool && strcmp(d.tool, cases[i].tool) == 0, msg);
+        }
+        if (d.kind == SH_ROUTE_TOOL && strcmp(d.tool, "fs.write") == 0) {
+            CHECK_STR_CONTAINS(json_str(json_obj_get(d.args, "path")),
+                               "out.txt", "routed fs.write path");
+            CHECK_STR_CONTAINS(json_str(json_obj_get(d.args, "content")),
+                               "hello", "routed fs.write content");
+        }
+        sh_decision_free(&d);
+    }
+    tool_reg_free(tr);
+}
+
+#include "aios/types.h"
+
+int main(void) {
+    router_tests();
+    shell_tests();
+    printf("%s: %d checks, %d failed\n",
+           g_failed ? "FAIL" : "PASS", g_checks, g_failed);
+    return g_failed ? 1 : 0;
+}

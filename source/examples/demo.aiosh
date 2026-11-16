@@ -1,0 +1,16 @@
+# aiosh demo — deterministic (scripted cortex), safe to re-run
+version
+set f notes.txt
+echo file is $f
+fs.read $f
+fs.read $f | count
+echo 12*(7+5) | calc
+12*(7+5)
+read notes.txt
+list files
+what can you do
+summarize the workspace
+remember aiosh demo completed a full pipeline
+recall aiosh demo
+emit demo.done '{"ok":true}'
+echo final status $?

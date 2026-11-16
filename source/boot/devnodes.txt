@@ -1,0 +1,5 @@
+# devnodes emitted into the initramfs (no host root needed)
+c 5 1 0600 /dev/console
+c 1 3 0666 /dev/null
+c 5 0 0666 /dev/tty
+c 4 64 0600 /dev/ttyS0
