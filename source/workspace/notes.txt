@@ -1,0 +1,7 @@
+AI-OS design notes (sample workspace file)
+
+The intent layer maps every user utterance to a typed Intent object.
+The scheduler treats agents as first-class processes: each aiproc owns
+a memory context, a tool capability set, and a semantic bus channel.
+Kernel work is limited to Linux; the system services layer is fully
+rewritten in the aios runtime.
