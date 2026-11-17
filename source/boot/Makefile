@@ -175,6 +175,9 @@ $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	     echo "   this file is tracked in git, so raising it is a reviewed commit:"; \
 	     echo "   that is the only form of this guard that can fail in CI"; \
 	 fi; \
+	 echo "   (the cap is toolchain-dependent: a static link against a newer" ; \
+	 echo "    glibc is larger. Pin it from the LARGEST supported toolchain," ; \
+	 echo "    not from the smallest.)" ; \
 	 cap=$$(cat $(BOOT_DIR)/.m10-size-cap); size=$$(stat -c %s $@); \
 	 echo "   v1.1 initramfs: $$size bytes (cap $$cap)"; \
 	 if [ $$size -gt $$cap ]; then \
