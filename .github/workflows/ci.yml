@@ -89,9 +89,21 @@ jobs:
         # Anything else failing is a real regression.
         run: |
           set -o pipefail
-          make test 2>&1 | tee /tmp/test.log
-          echo "--- summary ---"
-          grep -E "^== [0-9]+ passed" /tmp/test.log
+          if make test 2>&1 | tee /tmp/test.log; then
+            echo "--- summary ---"
+            grep -E "^== [0-9]+ passed" /tmp/test.log
+          else
+            # The full log is an artifact, and an artifact is a link a human has
+            # to go and click. Put the failing assertions in the job itself.
+            echo "--- summary ---"
+            grep -E "^== [0-9]+ passed" /tmp/test.log || true
+            echo "--- failures ---"
+            grep -E "^FAIL |^FAIL tests/" /tmp/test.log | head -20 || true
+            while IFS= read -r line; do
+              echo "::error title=make test::$line"
+            done < <(grep -E "^FAIL tests/|^FAIL build/" /tmp/test.log | head -10)
+            exit 1
+          fi
 
       - name: upload logs on failure
         if: failure()
