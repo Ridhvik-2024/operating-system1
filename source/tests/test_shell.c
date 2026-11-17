@@ -327,6 +327,44 @@ static void shell_tests(void) {
 
     sh_result_free(&r);
 
+    /* ---- M2: the law is readable and the gate obeys it ---- */
+    {
+        run("policy", &r);
+        CHECK(r.status == 0, "policy builtin runs");
+        CHECK_STR_CONTAINS(r.text, "law table", "it prints the table");
+        CHECK_STR_CONTAINS(r.text, "binds the human too",
+                           "and says tier 0 binds the human");
+        CHECK_STR_CONTAINS(r.text, "tool:calc", "and lists the AI's capabilities");
+        sh_result_free(&r);
+
+        /* The asymmetry, asked of the evaluator through the shell. */
+        run("policy check delete old.txt", &r);
+        CHECK_STR_CONTAINS(r.text, "NEEDS_HUMAN", "AI delete -> NEEDS_HUMAN");
+        CHECK_STR_CONTAINS(r.text, "as human: ALLOW",
+                           "the same delete from a human is allowed");
+        sh_result_free(&r);
+
+        run("policy check shell ls", &r);
+        CHECK_STR_CONTAINS(r.text, "DENY", "AI shell -> DENY");
+        sh_result_free(&r);
+
+        run("policy check tool calc", &r);
+        CHECK_STR_CONTAINS(r.text, "ALLOW", "AI calc with a capability -> ALLOW");
+        sh_result_free(&r);
+
+        /* M2 enforcement, end to end: the audit log is refused for a HUMAN. */
+        run("fs.write path=audit.log content=faked", &r);
+        CHECK(r.status != 0, "writing the audit log is refused");
+        CHECK_STR_CONTAINS(r.error, "policy", "and the error names policy");
+        CHECK_STR_CONTAINS(r.error, "tier 0", "and the tier");
+        sh_result_free(&r);
+
+        /* ...while an ordinary write still works, in the same shell. */
+        run("fs.write path=ordinary.txt content=fine", &r);
+        CHECK(r.status == 0, "an ordinary write is still allowed");
+        sh_result_free(&r);
+    }
+
     /* ---- exit (last: it makes the shell want to terminate) ---- */
     run("exit", &r);
     CHECK(r.status == 0 && strstr(r.text, "bye"), "exit builtin");

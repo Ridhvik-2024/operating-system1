@@ -331,6 +331,13 @@ static aios_decision step3_sandbox(const aios_action *a,
      * fs-write/delete proposal whose declared set is wide. */
     int requires = (a->kind == ACT_SHELL || a->kind == ACT_FS_DELETE
                     || (a->kind == ACT_FS_WRITE && a->n_declared > 1));
+
+    /* A delete has a more fundamental rule than "was it sandboxed" (tier 1
+     * destructive, which needs a human). If we report the sandbox rule first,
+     * the log says "no sandbox" when the truth is "this needed a human", and
+     * whoever reads it chases the wrong problem. Let the destructive rule
+     * speak. */
+    if (a->kind == ACT_FS_DELETE) return ALLOWD(R_OK, "sandbox deferred to tier 1");
     if (!requires) return ALLOWD(R_OK, "sandbox not required");
 
     if (!ctx->sandbox_executed)
@@ -604,4 +611,17 @@ static const policy_rule RULES[] = {
 
 size_t aios_policy_rule_count(void) {
     return sizeof RULES / sizeof RULES[0];
+}
+
+/* Read-only access for `policy` in the shell. The AI gets no new ability from
+ * this: policy_engine.interface.md says the engine is non-introspectable to
+ * the AI, and it still is - this is a HUMAN-facing view on a compiled-in
+ * constant array. Nothing here can be written, and reading it changes no
+ * verdict. */
+int aios_policy_rule_at(size_t i, const char **law, int *tier, aios_reason *r) {
+    if (i >= sizeof RULES / sizeof RULES[0]) return 0;
+    if (law)  *law  = RULES[i].law;
+    if (tier) *tier = RULES[i].tier;
+    if (r)    *r    = RULES[i].reason;
+    return 1;
 }

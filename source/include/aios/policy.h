@@ -175,6 +175,11 @@ const char *aios_policy_verdict_str(aios_verdict v);
  * rule exists for every reason code (the table and the enum cannot drift). */
 size_t aios_policy_rule_count(void);
 
+/* Read one row of the compiled-in law table (for the `policy` builtin).
+ * Returns 0 past the end. Read-only: there is no way to write a rule, which
+ * is the point. */
+int aios_policy_rule_at(size_t i, const char **law, int *tier, aios_reason *r);
+
 #ifdef __cplusplus
 }
 #endif

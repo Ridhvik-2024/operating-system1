@@ -804,6 +804,81 @@ static const char HELP_TEXT[] =
     "          summarize the workspace\n"
     "          spawn summarize the workspace ; jobs ; wait all\n";
 
+/* `policy` — show the law. Also `policy check <kind> <target>` to ask the
+ * evaluator what it would say, which is how a human (or a debugging engineer)
+ * finds out why something they expected to work was refused.
+ *
+ * There is deliberately no `policy allow` / `policy override`: a writable rule
+ * set is a privilege escalation with a nicer name. Changing the law means
+ * changing the source and shipping an image. */
+static int builtin_policy(sh_shell *sh, sargv *a,
+                          char **text_out, json_val **json_out,
+                          char *err, size_t ecap) {
+    sb b = {0};
+
+    if (a->n >= 2 && strcmp(a->v[1], "check") == 0) {
+        /* policy check <kind> <target> */
+        aios_act_kind kind = ACT_TOOL;
+        const char *target = a->n >= 4 ? a->v[3] : (a->n >= 3 ? a->v[2] : NULL);
+        if (a->n >= 3 && !target) { snprintf(err, ecap, "policy check needs a target"); return 1; }
+        const char *k = a->n >= 4 ? a->v[2] : "tool";
+        if (strcmp(k, "agent") == 0) kind = ACT_AGENT;
+        else if (strcmp(k, "shell") == 0) kind = ACT_SHELL;
+        else if (strcmp(k, "delete") == 0) kind = ACT_FS_DELETE;
+        else if (strcmp(k, "spawn") == 0) kind = ACT_JOB_SPAWN;
+        else if (strcmp(k, "write") == 0) kind = ACT_FS_WRITE;
+
+        aios_action *act = aios_action_new(kind, ORIGIN_AI, target);
+        if (!act) { snprintf(err, ecap, "cannot build a descriptor"); return 1; }
+        aios_action_set_intent(act, "policy check");
+        aios_policy_ctx pctx = aios_policy_ctx_default();
+        pctx.sandbox_executed = (kind == ACT_TOOL || kind == ACT_AGENT);
+        aios_decision d = aios_policy_eval(act, sh->jail, SH_CAPS, SH_N_CAPS,
+                                           &pctx, aios_now_ms());
+        char line[512];
+        snprintf(line, sizeof line, "verdict: %s [%s]\n  %s\n",
+                 aios_policy_verdict_str(d.v), aios_policy_reason_str(d.r), d.why);
+        sb_puts(&b, line);
+        /* now the same thing as a human, which is the interesting comparison */
+        aios_action *h = aios_action_new(kind, ORIGIN_HUMAN, target);
+        if (h) {
+            aios_decision hd = aios_policy_eval(h, sh->jail, NULL, 0, &pctx,
+                                                aios_now_ms());
+            snprintf(line, sizeof line, "as human: %s [%s]\n",
+                     aios_policy_verdict_str(hd.v),
+                     aios_policy_reason_str(hd.r));
+            sb_puts(&b, line);
+            aios_action_free(h);
+        }
+        aios_action_free(act);
+        *text_out = b.s ? b.s : strdup("");
+        return 0;
+    }
+
+    sb_puts(&b, "AI-OS law table (compiled in; no file, no override)\n");
+    sb_puts(&b, "tier 0 = constitutional veto (binds the human too)\n");
+    sb_puts(&b, "tier 1 = critical (machine actions stopped or sent to a human)\n\n");
+    size_t n = aios_policy_rule_count();
+    for (size_t i = 0; i < n; i++) {
+        const char *law = NULL;
+        aios_reason r = R_OK;
+        int tier = 0;
+        if (!aios_policy_rule_at(i, &law, &tier, &r)) continue;
+        char line[512];
+        snprintf(line, sizeof line, "  [%d] %-62.62s (%s)\n",
+                 tier, law ? law : "?", aios_policy_reason_str(r));
+        sb_puts(&b, line);
+    }
+    sb_puts(&b, "\ncapabilities granted to this shell's AI:\n  ");
+    for (int i = 0; i < SH_N_CAPS; i++) {
+        sb_puts(&b, SH_CAPS[i]);
+        sb_puts(&b, i + 1 < SH_N_CAPS ? ", " : "\n");
+    }
+    *text_out = b.s ? b.s : strdup("");
+    (void)json_out;
+    return 0;
+}
+
 static int builtin_version(sh_shell *sh, char **text_out, json_val **json_out) {
     *text_out = strdup("AI-OS " AIOS_VERSION " — aiosh (v1.0)");
     json_val *o = json_new_obj();
@@ -1632,6 +1707,8 @@ static int run_command(sh_shell *sh, scmd *c,
         return 0;
     }
     if (strcmp(c0, "version") == 0) return builtin_version(sh, text_out, json_out);
+    if (strcmp(c0, "policy") == 0)
+        return builtin_policy(sh, a, text_out, json_out, err, ecap);
     if (strcmp(c0, "echo") == 0)    { *text_out = join_args(a->v, a->n, 1); return 0; }
     if (strcmp(c0, "count") == 0)   return builtin_count(a, pipe_text, text_out, json_out, err, ecap);
     if (strcmp(c0, "grep") == 0)    return builtin_grep(a, pipe_text, text_out, err, ecap);

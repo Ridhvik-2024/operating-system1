@@ -276,12 +276,16 @@ static void test_needs_sandbox(void) {
     CHECK(d.r == R_REQUIRES_SANDBOX, "reason is REQUIRES_SANDBOX");
     aios_action_free(h);
 
-    /* a delete likewise */
-    aios_action *del = mk_fs_delete("old.txt", ORIGIN_HUMAN);
-    aios_decision dd = ev(del, JAIL, NULL, 0);
-    CHECK(dd.r == R_REQUIRES_SANDBOX || dd.r == R_DESTRUCTIVE,
-          "delete is gated (sandbox or human)");
-    CHECK(dd.v != VERDICT_ALLOW, "delete is never a bare allow");
+    /* A delete raises TWO rules: it must be sandboxed and it is tier 1
+     * destructive. The verdict must report the more fundamental one, or the
+     * log sends whoever reads it chasing the wrong problem ("no sandbox" when
+     * the truth is "this needed a human"). */
+    aios_action *del = mk_fs_delete("old.txt", ORIGIN_AI);
+    aios_decision dd = ev(del, JAIL, CAPS_ALL_TOOLS, 1);
+    CHECK(dd.r == R_DESTRUCTIVE,
+          "a delete reports DESTRUCTIVE, not the sandbox rule");
+    CHECK(dd.v == VERDICT_NEEDS_HUMAN, "and the verdict says so");
+    CHECK(dd.tier == 1, "tier 1, not an advisory");
     aios_action_free(del);
 }
 
