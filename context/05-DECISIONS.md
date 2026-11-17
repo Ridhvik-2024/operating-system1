@@ -287,3 +287,33 @@ on the path nobody tests with a big input.
 **Cost:** the worker may now buffer 1.2 MB of input.
 **Reverse if:** the payload limit changes — change the one constant, and check
 that it is still larger than the largest thing a tool is allowed to produce.
+
+## D21 — 2026-11-17 — A limit the parent knows is enforced by the parent
+`AIOS_FS_WRITE_MAX` is checked in `tools.c` before a request is built, as well as
+by the worker.
+**Why:** the worker was the only enforcer, so refusing a 1.1 MB write meant
+serialising 1.1 MB, forking, piping it across, and only then hearing "too big".
+On a developer machine that is a few milliseconds. Under QEMU's TCG on a boot with
+other work running it exceeded the call's own 10 s deadline, so a clear refusal
+arrived as a timeout — indistinguishable from a hang, with no explanation. The
+limit is known on both sides; the cheap side should refuse.
+**Cost:** the rule lives in two places, so the words must match. They are one
+constant and a test that compares the message.
+**Reverse if:** the payload can be produced incrementally (a streamed write), in
+which case the worker must enforce it as it goes and the parent's pre-check
+becomes an optimisation rather than the guarantee.
+
+## D22 — 2026-11-17 — Tests must run where the product runs, or they are decoration
+Every test failure in this milestone that mattered in the image was one that had
+passed a hundred times on the host: a fixture needing a compiler that the image
+does not have, fixtures linked against a libc the initramfs does not have, and a
+reliance on `/proc/self/exe` before `/proc` is mounted. There is now a documented
+way to run the whole suite inside the real image (`unshare -r` + `chroot` +
+extracted initramfs), and the boot job is the authority.
+**Why:** the four CI cycles this cost were not caused by hard bugs. They were
+caused by a green tick from an environment where the code was never going to run.
+The same instinct that made M3's guarantee decorative for the agent path.
+**Cost:** the extracted-rootfs run is slower and manual. Worth it for anything
+that touches process spawning, paths, signals or the loader.
+**Reverse if:** never. Add the run to CI as a scripted step when it is cheap
+enough; do not drop it because it is inconvenient.

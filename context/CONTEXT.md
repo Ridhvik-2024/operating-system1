@@ -25,6 +25,12 @@
    capability *issuance* — the grant list is compiled in, so "capability" today
    means "a constant in the binary".
    Do not call the OS "safe" yet; it is **mediated, staged and witnessed**.
+   **Environment is part of the guarantee.** Four CI cycles on M4 were spent on
+   tests that passed on the host and could not run in the image at all (a fixture
+   needing `cc`, fixtures linked against a libc an initramfs does not have, and a
+   `/proc/self/exe` dependency before `/proc` is mounted). If a test touches
+   process spawning, paths, signals or the loader, run it inside the real image:
+   extract the initramfs, `unshare -r`, `chroot`, run `aios-selftest` (D22).
 3. The next milestone is **M5, snapshots and rollback** — the store that makes
    `rollback_available` something other than a hard-wired 0, then M6 (hash
    chain), M7 (origin), M8 (promote/reject UX).
@@ -176,9 +182,9 @@ code**. Treat them as the constitution, not as a spec that was implemented.
   because virtio-gpu's scanout never reached the QEMU surface under `-display none`.
 
 ### 4.10 Tests
-- 15 suites, **993 `CHECK`s** (measured per binary): `action 129, agent 15,
+- 15 suites, **997 `CHECK`s** (measured per binary): `action 129, agent 15,
   aiproc 9, autopilot 61, durable 35, fb 89, json 20, kernel 5, mem 25, policy
-  170, sandbox 26, sembus 15, shell 188, stage 122, effects 84`. In-tree boot logs record
+  170, sandbox 26, sembus 15, shell 188, stage 122, effects 88`. In-tree boot logs record
   **11 passed, 0 failed** — they predate M1's `test_action`, M2's `test_policy`
   M3's `test_stage` and M4's `test_effects`. The same suites run **inside the booted OS**.
 
