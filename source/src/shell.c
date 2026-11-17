@@ -23,12 +23,16 @@
 #include "aios/durable.h"
 #include "aios/policy.h"
 #include "aios/snapshot.h"
+#include "aios/supervisor.h"
 #include "aios/stage.h"
 #include "aios/effects.h"
 #include "shroute.h"
 
 #include <dirent.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 
 #include <ctype.h>
 #include <errno.h>
@@ -1183,10 +1187,140 @@ static int run_tool_stage(sh_shell *sh, const char *name, sargv *a,
  * rollback that silently does not exist is worse than a loud one.
  *
  * Returns true when a snapshot exists afterwards. */
+
+/* ---- M5: asking the supervisor instead of doing it ourselves ---- *
+ *
+ * Rollback power belongs to PID 1 (include/aios/supervisor.h says why). The shell
+ * therefore asks over the socket when the supervisor is there, and only falls
+ * back to doing the work in-process when it is not -- which is the case on a
+ * developer's machine, where there is no PID 1 to ask.
+ *
+ * The fallback is honest about itself: it prints "no supervisor". A shell that
+ * silently used its own copy while claiming the OS handled it would be claiming
+ * a guarantee it did not have.
+ */
+static bool sup_round_trip(const char *req, char *out, size_t cap) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sun_family = AF_UNIX;
+    snprintf(sa.sun_path, sizeof sa.sun_path, "%s", AIOS_SUP_SOCK);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        close(fd);
+        return false;
+    }
+    (void)!write(fd, req, strlen(req));
+
+    size_t n = 0;
+    struct pollfd pfd = { fd, POLLIN, 0 };
+    while (n + 1 < cap) {
+        /* Restore can copy a whole tree; a fixed 5 s would fail on a big store
+         * where the answer is late but correct. */
+        if (poll(&pfd, 1, 30000) <= 0) break;
+        ssize_t r = read(fd, out + n, cap - n - 1);
+        if (r <= 0) break;
+        n += (size_t)r;
+        if (memchr(out, '\n', n)) break;
+    }
+    out[n] = 0;
+    close(fd);
+    return n > 0;
+}
+
+/* Ask PID 1 to put the trees back. The shell still decides WHICH snapshot and
+ * still revokes its own jobs first -- those are the shell's own state, and PID 1
+ * has no business knowing about this shell's job table. What it asks for is the
+ * part that belongs to the OS: moving two trees. */
+static bool sup_restore(const char *which, char *replaced, size_t rcap,
+                        char *err, size_t ecap) {
+    char req[512];
+    snprintf(req, sizeof req, "{\"op\":\"restore\",\"id\":\"%.200s\"}\n", which);
+    char out[4096] = {0};
+    if (!sup_round_trip(req, out, sizeof out)) {
+        snprintf(err, ecap, "the supervisor did not answer");
+        return false;
+    }
+    if (strstr(out, "\"ok\":true") == NULL) {
+        const char *e = strstr(out, "\"error\":\"");
+        snprintf(err, ecap, "%.400s", e ? e + 9 : "supervisor refused");
+        return false;
+    }
+    if (replaced && rcap) {
+        const char *r = strstr(out, "\"replaced\":\"");
+        if (r) {
+            r += 12;
+            size_t n = 0;
+            while (r[n] && r[n] != '"' && n + 1 < rcap) { replaced[n] = r[n]; n++; }
+            replaced[n] = 0;
+        }
+    }
+    return true;
+}
+
+/* Is there a supervisor to ask? A stale socket that nobody is listening on must
+ * count as absent, or every `snap` on a developer machine would try the socket
+ * first and print a connection error. */
+static bool sup_present(void) {
+    /* If the socket file is not there, do not even try to connect: on a
+     * developer's machine there is no supervisor, and every `snap` would pay a
+     * failed connection for nothing.
+     *
+     * If the socket's DIRECTORY exists but the socket does not, the supervisor is
+     * starting right now -- PID 1 forks it before any shell, but a shell started
+     * by hand in the same second can still win the race. Waiting briefly is the
+     * difference between "PID 1 owns rollback" and "PID 1 owns rollback unless you
+     * were quick", which is not a guarantee at all. */
+    if (access(AIOS_SUP_SOCK, F_OK) != 0) {
+        if (access(AIOS_SUP_DIR, F_OK) != 0) return false;
+        bool up = false;
+        for (int i = 0; i < 50 && !up; i++) {          /* up to ~1 s */
+            usleep(20 * 1000);
+            up = access(AIOS_SUP_SOCK, F_OK) == 0;
+        }
+        if (!up) return false;
+    }
+    char out[1024] = {0};
+    if (!sup_round_trip("{\"op\":\"ping\"}\n", out, sizeof out)) return false;
+    return strstr(out, "\"ok\":true") != NULL;
+}
+
+/* Take a snapshot, through PID 1 when it is there. Returns true on success and
+ * fills `id` when the supervisor supplied one. */
+static bool sup_take(const char *label, char *id, size_t icap, char *err, size_t ecap) {
+    char req[512];
+    snprintf(req, sizeof req, "{\"op\":\"snap\",\"label\":\"%.200s\"}\n", label);
+    char out[4096] = {0};
+    if (!sup_round_trip(req, out, sizeof out)) {
+        snprintf(err, ecap, "the supervisor did not answer");
+        return false;
+    }
+    if (strstr(out, "\"ok\":true") == NULL) {
+        const char *e = strstr(out, "\"error\":\"");
+        snprintf(err, ecap, "supervisor refused: %.200s",
+                 e ? e + 9 : "no reason given");
+        return false;
+    }
+    const char *i = strstr(out, "\"id\":\"");
+    if (i && id && icap) {
+        i += 6;
+        size_t n = 0;
+        while (i[n] && i[n] != '"' && n + 1 < icap) { id[n] = i[n]; n++; }
+        id[n] = 0;
+    }
+    return true;
+}
+
 static bool sh_snap_before(sh_shell *sh, const char *why, char *note, size_t ncap) {
     char id[AIOS_SNAP_ID_MAX] = {0};
     char err[256] = {0};
-    bool ok = snap_take(sh->jail, sh->store, why, id, sizeof id, err, sizeof err);
+    /* Ask PID 1 when it is there. It takes the snapshot of the SAME jail and
+     * store, so the answer is identical; what differs is who holds the power. */
+    bool ok;
+    if (sup_present())
+        ok = sup_take(why, id, sizeof id, err, sizeof err);
+    else
+        ok = snap_take(sh->jail, sh->store, why, id, sizeof id, err, sizeof err);
     if (!ok) {
         sembus_pub_kv(sh->bus, "sh.snap.failed",
                       (const char *const[]){ "why", why, "error", err, NULL });
@@ -2223,9 +2357,16 @@ static int builtin_snap(sh_shell *sh, sargv *a, char **text_out,
     if (a->n >= 2 && strcmp(a->v[1], "take") == 0) {
         const char *label = a->n >= 3 ? a->v[2] : "manual";
         char id[AIOS_SNAP_ID_MAX] = {0};
-        if (!snap_take(sh->jail, sh->store, label, id, sizeof id, err, ecap)) {
-            return 1;
-        }
+        /* The explicit verb goes through PID 1 too. It would be a strange OS
+         * where the automatic snapshots are owned by the supervisor and the one a
+         * person asks for is made by the shell -- and the difference would be
+         * invisible until the day it mattered. */
+        bool ok;
+        if (sup_present())
+            ok = sup_take(label, id, sizeof id, err, ecap);
+        else
+            ok = snap_take(sh->jail, sh->store, label, id, sizeof id, err, ecap);
+        if (!ok) return 1;
         char perr[128] = {0};
         (void)snap_prune(sh->store, AIOS_SNAP_KEEP, perr, sizeof perr);
         char line[256];
@@ -2270,8 +2411,13 @@ static int builtin_rollback(sh_shell *sh, sargv *a, char **text_out,
 
     char replaced[600] = {0};
     char rerr[512] = {0};
-    if (!snap_restore(sh->jail, sh->store, si.id,
-                      replaced, sizeof replaced, rerr, sizeof rerr)) {
+    bool restored;
+    if (sup_present())
+        restored = sup_restore(si.id, replaced, sizeof replaced, rerr, sizeof rerr);
+    else
+        restored = snap_restore(sh->jail, sh->store, si.id,
+                                replaced, sizeof replaced, rerr, sizeof rerr);
+    if (!restored) {
         snprintf(err, ecap, "rollback failed: %.400s", rerr);
         sembus_pub_kv(sh->bus, "sh.rollback.failed",
                       (const char *const[]){ "id", si.id, "error", rerr, NULL });

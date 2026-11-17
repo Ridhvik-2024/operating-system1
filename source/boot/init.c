@@ -43,6 +43,7 @@
 #include "aios/types.h"
 #include "aios/ksched.h"
 #include "aios/durable.h"
+#include "aios/supervisor.h"
 #include "aios/fb.h"
 
 static FILE *con;
@@ -405,6 +406,42 @@ int main(void) {
         say("[init] durable: disabled (aios.durable=0) - RAM-only session");
     else
         durable_phase();
+
+    /* M5: the supervisor that owns snapshot/restore.
+     *
+     * It runs as a CHILD of PID 1, not inside the respawn loop: the loop blocks in
+     * waitpid() and a snapshot client would then wait for a child to die before
+     * being answered. Being a child still means PID 1 is the process that created
+     * it, which is the ownership the milestone asks for -- the ability to roll
+     * back is established before any shell exists, and no shell brought it into
+     * being.
+     *
+     * The jail is the same one aiosh will use, including the /workspace-if-there
+     * rule: a supervisor taking snapshots of a different directory than the
+     * shell edits would be the most confusing possible bug. */
+    {
+        /* The image always has /workspace; the check is here so that a future
+         * image without one fails visibly at the supervisor rather than taking
+         * snapshots of a directory that does not exist. */
+        const char *jail = "/workspace";
+        if (access(jail, F_OK) != 0)
+            fprintf(con, "[init] supervisor: warning: jail %s does not exist yet\n", jail);
+        const char *store = sup_default_store();
+        pid_t sv = fork();
+        if (sv == 0) {
+            char serr[256] = {0};
+            /* 0 = serve forever; PID 1 does not want the request cap. */
+            int rc = sup_serve(AIOS_SUP_SOCK, jail, store, 0, serr, sizeof serr);
+            if (rc != 0)
+                fprintf(con, "[init] supervisor: %s\n", serr);
+            _exit(rc == 0 ? 0 : 1);
+        }
+        if (sv > 0)
+            fprintf(con, "[init] supervisor: pid %d serving %s (jail %s)\n",
+                    (int)sv, AIOS_SUP_SOCK, jail);
+        else
+            say("[init] supervisor: could not start (rollback stays in-shell)");
+    }
 
     /* the sandboxed tool worker lives next to the system binaries */
     setenv("AIOS_TOOL_EXEC", "/sbin/tool-exec", 0);
