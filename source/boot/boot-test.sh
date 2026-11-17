@@ -110,8 +110,21 @@ echo "------------------------------------------"
 tail -30 boot/build/boot-test1.log 2>/dev/null
 echo "------------------------------------------"
 
+# A failed boot job whose logs live somewhere a human has to go and click is a
+# failed job nobody diagnoses. Echo the reason into the job itself as an
+# annotation, and quote the selftest lines that failed -- they name the suite and
+# the assertion, which is the whole answer.
+explain() {
+    log=$1; what=$2
+    echo "  MISS $what"
+    grep -E 'SELFTEST .*FAIL|FAIL tests/|Segmentation|No such file' "$log" 2>/dev/null \
+        | sed 's/^/    | /' | head -6
+    [ -n "$GITHUB_ACTIONS" ] && echo "::error title=boot test::missed: $what"
+    fail=1
+}
+
 have1() { grep -q "$1" boot/build/boot-test1.log 2>/dev/null \
-             && echo "  OK   $1" || { echo "  MISS $1"; fail=1; }; }
+             && echo "  OK   $1" || explain boot/build/boot-test1.log "$1"; }
 have1 'AI-OS 1.1.0-m10 (v1.1 desktop)'
 have1 'durable: /dev/vda on /data (ext2)'
 have1 'AIOS-DUR mounted=1'
@@ -129,7 +142,7 @@ tail -30 boot/build/boot-test2.log 2>/dev/null
 echo "------------------------------------------"
 
 have2() { grep -q "$1" boot/build/boot-test2.log 2>/dev/null \
-             && echo "  OK   $1" || { echo "  MISS $1"; fail=1; }; }
+             && echo "  OK   $1" || explain boot/build/boot-test2.log "$1"; }
 have2 'AIOS-DUR mounted=1 jobs=[1-9] mem=[1-9] audit=[1-9]'
 have2 'this is boot #2 for this data disk'
 have2 'journal entries replayed from the previous session'
