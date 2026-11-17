@@ -58,13 +58,26 @@ not.
   every route in `shroute.c` (TOOL and AGENT paths). The worker returns a
   matching *result* document; the host diffs them.
 
-### G3 — Sandbox Result / diff schema: MISSING · **S1**
+### G3 — Sandbox Result / diff schema: **IMPLEMENTED WITHOUT THE KERNEL (M4, 2026-11-17)** · was S1
 - **Claim** (`sandbox_result.schema.md`): host-generated ground truth of what
   actually happened (all observable effects, resources, diffs); compared
   strictly against the descriptor; a mismatch auto-blocks.
-- **Reality**: `tool-exec` returns `{"ok":true,"result":…}`. There is **no
-  effect report, no filesystem diff, no resource accounting, no comparison**.
-  `fs.write` writes the file and reports success.
+- **Reality at audit time**: `tool-exec` returned `{"ok":true,"result":…}`.
+  There was **no effect report, no filesystem diff, no resource accounting, no
+  comparison**. `fs.write` wrote the file and reported success.
+- **Now (M4)**: the worker returns `effects:[{path,op,bytes}]`, `complete` and
+  `usage`; the host parses them, compares against the declaration in both
+  directions, and fails closed on anything undeclared, incomplete or malformed —
+  discarding the staging directory so a lie cannot be laundered into a diff.
+- **And the part that matters**: the card assumed the worker's report was
+  evidence. It is testimony. A swapped `tool-exec` that ignores staging and lies
+  in its `effects` array passes every one of those checks while the file sits in
+  the jail. So the parent also **witnesses** the jail — hashing each declared
+  path before and after — and refuses with `JAIL_MUTATED` when the world moved.
+- **Still missing**: this is a periodic check by a process the worker lives
+  inside, not a kernel invariant. The read-only mount + real diff (L2) is what
+  turns it into one. The witness covers declared paths only; an undeclared write
+  to an unwatched path is caught by testimony or not at all.
 - **Fix**: worker snapshots the jail's mtime/size map before and after (or
   runs the tool with the jail on an overlay upper dir) and returns
   `effects:[{path,op,bytes_before,bytes_after}]` + resource usage; host compares

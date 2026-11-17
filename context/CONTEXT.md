@@ -2,25 +2,32 @@
 
 ## RESUME FROM HERE (read this block first)
 
-1. The OS **works**: 10 milestones, **14 test suites**, a bootable QEMU image with
+1. The OS **works**: 10 milestones, **15 test suites**, a bootable QEMU image with
    our own PID 1, cgroups/eBPF/Landlock, autopilot, a 12 KB micro-LM, durable
    ext2 store, and a framebuffer desktop.
-2. **The constitution is now enforced end to end, and that is recent.** The
-   descriptor (`M1`), the law table (`M2`) and staging (`M3`) are real: an AI
-   write does not land, it is shown as a diff and promoted by a human; tier 0
-   binds the human; destructive machine actions stop at a human. **Before M3 it
-   was all decoration for the agent path** — `src/agent.c` called `tool_exec()`
-   directly and skipped every gate M1 and M2 built. If you take one thing from
-   this file: *a guarantee is only as wide as the number of call sites that
-   honour it, and there was one more call site than anyone had counted.*
-   What is still missing: sandbox-result comparison (G3/M4), snapshots and
-   rollback (G5/M5), hash-chained audit (G8/M6), origin persistence (G6/M7),
-   and capability *issuance* — the grant list is compiled in, so "capability"
-   today means "a constant in the binary".
-   Do not call the OS "safe" yet; it is **mediated and staged**.
-3. The next milestone is **M4, declared-vs-actual** — the worker reports what it
-   actually did and PID 1 compares it with what was claimed, then M5
-   (snapshots/rollback), M6 (hash chain), M7 (origin), M8 (promote/reject UX).
+2. **The constitution is enforced end to end, and that is recent.** Descriptor
+   (`M1`), law table (`M2`), staging (`M3`) and effect verification (`M4`) are
+   real: an AI write does not land, it is shown as a diff and promoted by a
+   human; the worker's account of what it did is checked against what it
+   declared; and the jail itself is hashed before/after, so a lying worker is
+   caught without being believed. Tier 0 binds the human; destructive machine
+   actions stop at a human.
+   **Two lessons cost more than the code:**
+   (a) *Before M3 all of it was decoration for the agent path* — `src/agent.c`
+   called `tool_exec()` directly and skipped every gate M1 and M2 built. A
+   guarantee is only as wide as the number of call sites that honour it, and
+   there was one more call site than anyone had counted.
+   (b) *Before M4 the staging guarantee was enforced by the worker.* A swapped
+   `tool-exec` that ignores staging and lies in its effect report passes every
+   self-reported check. Testimony is what we ask; the witness is what we check.
+   What is still missing: snapshots and rollback (G5/M5), hash-chained audit
+   (G8/M6), origin persistence (G6/M7), kernel-side verification (L2), and
+   capability *issuance* — the grant list is compiled in, so "capability" today
+   means "a constant in the binary".
+   Do not call the OS "safe" yet; it is **mediated, staged and witnessed**.
+3. The next milestone is **M5, snapshots and rollback** — the store that makes
+   `rollback_available` something other than a hard-wired 0, then M6 (hash
+   chain), M7 (origin), M8 (promote/reject UX).
    Underneath it all: namespaces/overlayfs/seccomp-notify
    (`03-LINUX-INTEGRATION.md`, L1→L2). That is **W0-B** of
    `ROADMAP-TO-WINDOWS.md`, the map to desktop parity (W0 base → W1 platform →
@@ -29,7 +36,7 @@
    `CONTEXT.agent.md`. **CI now enforces this** (`.github/workflows/ci.yml`:
    build with `-Werror`, tests on 22.04 + 24.04, and the two-boot QEMU durable
    proof) — a red run is the first thing to read, not a local guess. Host suite
-   is 14/14; the only SKIPs are Landlock/eBPF/cgroup, which need privileges a
+   is 15/15; the only SKIPs are Landlock/eBPF/cgroup, which need privileges a
    runner does not grant (the boot job covers them in-OS).
 5. Do not edit the constitution documents (`os_sys_decided.md` + the four
    contracts). They change only by an explicit new-major-version decision.
@@ -169,11 +176,11 @@ code**. Treat them as the constitution, not as a spec that was implemented.
   because virtio-gpu's scanout never reached the QEMU surface under `-display none`.
 
 ### 4.10 Tests
-- 14 suites, **903 `CHECK`s** (measured per binary): `action 129, agent 15,
+- 15 suites, **993 `CHECK`s** (measured per binary): `action 129, agent 15,
   aiproc 9, autopilot 61, durable 35, fb 89, json 20, kernel 5, mem 25, policy
-  170, sandbox 26, sembus 15, shell 182, stage 122`. In-tree boot logs record
+  170, sandbox 26, sembus 15, shell 188, stage 122, effects 84`. In-tree boot logs record
   **11 passed, 0 failed** — they predate M1's `test_action`, M2's `test_policy`
-  and M3's `test_stage`. The same suites run **inside the booted OS**.
+  M3's `test_stage` and M4's `test_effects`. The same suites run **inside the booted OS**.
 
 ## 5. What is missing — the short list
 

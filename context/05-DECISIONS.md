@@ -245,3 +245,45 @@ fail in CI — each run re-pinned it to whatever the build had just produced. Th
 cap is a tracked number now, and raising it is a reviewed commit.
 **Reverse if:** never for either. A guard whose failure mode is silence, or
 whose threshold is set by the thing it measures, is decoration.
+
+## D18 — 2026-11-17 — A worker's self-report is testimony, not evidence
+`effects` is compared against the declaration, and separately the **parent**
+witnesses the jail (hash of each declared path before/after). A worker that lies
+in its report is caught by the second check; a worker that is merely sloppy is
+caught by the first.
+**Why:** the M4 card treats the worker's effect document as the ground truth.
+It is not — it is written by the same component that might be wrong. I built the
+adversary to prove the check worked and it proved the opposite: a swapped
+`tool-exec` that ignores staging, writes into the jail and reports only the
+declared file passes every rule, because both halves of the comparison come from
+the same liar. M3's whole guarantee was being enforced by the component we trust
+least. Testimony is what we **ask**; the witness is what we **check**.
+**Cost:** a bounded read (hash) of each declared write path, twice per staged
+command. Fine at 1 MiB; if it ever bites, hash metadata and sample content
+rather than dropping the check.
+**Reverse if:** never. When L2 lands and the jail is genuinely read-only to the
+worker, the witness becomes redundant *evidence* rather than the only defence —
+and a redundant check on a trust boundary is worth its microseconds.
+
+## D19 — 2026-11-17 — A test that skips is a test that reports success
+Two fixtures in this milestone failed to compile and the suites still printed
+PASS, because the skip path incremented nothing. Both now `CHECK(built == 0)`.
+**Why:** a test suite whose failure mode is "quietly does less" trains everyone
+to trust a green tick that means nothing. The same instinct is what makes people
+call an OS "mediated" when one call site was never wired (M3's finding).
+**Cost:** fixtures must compile on every platform that runs the suite, or the
+suite fails everywhere. That is the correct trade for a security test.
+**Reverse if:** never. If a fixture is genuinely platform-unavailable, skip it
+with an explicit `SKIP()` that prints — visible in the log, not silent.
+
+## D20 — 2026-11-17 — One limit constant, sized to the largest legitimate payload
+`AIOS_TOOL_REQ_MAX` (1.2 MB) is shared by the parent and the worker and is
+larger than `FS_WRITE_MAX` (1 MiB).
+**Why:** the request cap was 64 KiB in two independent places while the write cap
+was 1 MiB, so the documented write limit was unreachable and a legitimate 100 KB
+write failed as "request too large" with no indication which limit it hit. Two
+constants describing one boundary will always drift; the drift will always land
+on the path nobody tests with a big input.
+**Cost:** the worker may now buffer 1.2 MB of input.
+**Reverse if:** the payload limit changes — change the one constant, and check
+that it is still larger than the largest thing a tool is allowed to produce.

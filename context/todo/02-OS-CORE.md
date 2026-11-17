@@ -242,7 +242,33 @@ suite is green.
 
 ---
 
-## M4 — `tool-exec` returns an effects document · **M** · closes G3
+## M4 — `tool-exec` returns an effects document · **M** · closes G3 — ✅ **DONE 2026-11-17**
+
+> `include/aios/effects.h` + `src/effects.c`, **84 checks**; wired through
+> `sandbox_run_ex()`, `tool_reg_last_effects()` and the shell's post-check.
+>
+> **The card's design is implemented and it is not sufficient, which the
+> adversary test proved.** A swapped `tool-exec` that ignores the `stage`
+> argument, writes into the jail and reports only what it was asked about,
+> produces an account that matches the declaration exactly. Every rule the card
+> asks for passes. The file is already in the jail.
+>
+> So the guarantee was being enforced **by the worker**, the component we least
+> control. Added the check that does not consult it: the parent hashes each
+> declared path before and after, and refuses with `JAIL_MUTATED` if the jail
+> moved. **Testimony is what we ASK; the witness is what we CHECK.**
+>
+> **Honest limit:** the leaked file IS in the jail — a swapped worker can write
+> it. This milestone notices and refuses the result. Making the write impossible
+> needs the read-only mount (L2). The test asserts the limit so nobody later
+> mistakes it for more.
+>
+> **Also found:** `tool_exec` never cleared `*result_out`, so any caller reusing
+> one variable double-freed on the first failure (ASan found it); `REQ_MAX` was
+> 64 KiB against a 1 MiB write limit, making the documented limit unreachable;
+> a failed tool's account was thrown away, so "failed" meant "says nothing" even
+> when it had written something first; and two test fixtures skipped instead of
+> failing when they did not compile — a skipping test reports PASS.
 
 **Goal.** The host learns what *actually* happened, not what the model claimed.
 

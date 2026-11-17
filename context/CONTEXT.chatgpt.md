@@ -57,7 +57,7 @@ and a framebuffer desktop.
 - **Desktop:** double-buffered framebuffer, window manager, raw evdev input, five
   windows (terminal, files, agents, memory, autopilot) and an NL launcher bar on
   the same micro-LM cortex. Every asset has a procedural fallback.
-- **Tests:** 14 suites, 903 checks, run on the host **and inside the booted OS**.
+- **Tests:** 15 suites, 993 checks, run on the host **and inside the booted OS**.
 
 ## The constitution (this is law, quote it back to me)
 
