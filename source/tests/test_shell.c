@@ -86,6 +86,19 @@ static void write_file(const char *path, const char *content) {
     fclose(f);
 }
 
+/* Read a file and compare it byte for byte. A rollback is only a rollback if the
+ * bytes are the old bytes -- a restored file of the right NAME with the wrong
+ * contents is the failure this whole milestone exists to prevent. */
+static bool file_is(const char *path, const char *want) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    char buf[1024];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    return strcmp(buf, want) == 0;
+}
+
 static void shell_tests(void) {
     (void)!system("rm -rf build/test-shell");
     CHECK(aios_mkdirs("build/test-shell/jail") == AIOS_OK, "mkdir jail");
@@ -487,6 +500,94 @@ static void shell_tests(void) {
                   "and nothing was left staged for the human to promote");
             sh_result_free(&r);
         }
+    }
+
+
+    /* ---- M5: snapshot and rollback, as a person types them ---- *
+     *
+     * test_snapshot.c proves the mechanism. This proves the thing the milestone
+     * actually promises: that a human at the prompt can get their workspace back,
+     * and that the shell's own memory does not keep describing the state it just
+     * rolled away from.
+     *
+     * Note what a snapshot does NOT capture: <store>/staging. That is on purpose.
+     * Staged changes are proposals, not state; rolling back should not bring a
+     * rejected proposal back to life, and the test below asserts the staging
+     * directory is still gone afterwards.
+     */
+    {
+        /* Set the state this test will restore to, rather than assuming what
+         * earlier groups left behind. A test that depends on another group's
+         * leftovers passes or fails according to the order it happens to run in. */
+        write_file("build/test-shell/jail/notes.txt", "the original bytes\n");
+        write_file("build/test-shell/jail/metrics.csv", "module,loc\nmem,900\n");
+
+        char before[64] = {0};
+        run("snap take shell-test", &r);
+        CHECK(r.status == 0, "snap take succeeds");
+        CHECK_STR_CONTAINS(r.text, "snapshot", "and says what it did");
+        if (r.text && strstr(r.text, "snapshot")) {
+            sscanf(strstr(r.text, "snapshot") + 9, "%63s", before);
+        }
+        sh_result_free(&r);
+
+        run("snap", &r);
+        CHECK(r.status == 0, "snap lists");
+        CHECK_STR_CONTAINS(r.text, "keeping 5", "and says how many it keeps");
+        CHECK_STR_CONTAINS(r.text, before, "and lists the one just taken");
+        sh_result_free(&r);
+
+        /* Wreck three things, the three ways a workspace gets wrecked: a file
+         * changed, a file invented, a file deleted. */
+        write_file("build/test-shell/jail/notes.txt", "WRECKED\n");
+        write_file("build/test-shell/jail/invented.txt", "not yours\n");
+        (void)!remove("build/test-shell/jail/metrics.csv");
+
+        run("rollback", &r);
+        CHECK(r.status == 0, "rollback succeeds");
+        CHECK_STR_CONTAINS(r.text, "rolled back to", "and says where it went back to");
+        CHECK_STR_CONTAINS(r.text, "the state that was replaced",
+                           "and where the wrecked state went");
+        sh_result_free(&r);
+
+        CHECK(file_is("build/test-shell/jail/notes.txt", "the original bytes\n"),
+              "the changed file has its old bytes back");
+        CHECK(access("build/test-shell/jail/invented.txt", F_OK) != 0,
+              "the invented file is gone");
+        CHECK(access("build/test-shell/jail/metrics.csv", F_OK) == 0,
+              "the deleted file is back");
+
+        /* The shell's memory and tool registry were reopened; a shell that can
+         * still read a file it just rolled away from is worse than one that
+         * refuses, because it looks like the rollback worked. */
+        run("fs.read notes.txt", &r);
+        CHECK(r.status == 0 && strstr(r.text, "the original bytes"),
+              "the shell reads the restored tree, not a cached one");
+        sh_result_free(&r);
+
+        run("rollback nosuchsnapshot", &r);
+        CHECK(r.status != 0, "an unknown id is refused");
+        CHECK_STR_CONTAINS(r.error, "snapshot", "and the error says what was missing");
+        sh_result_free(&r);
+    }
+
+    /* ---- M5: a rollback revokes running jobs ---- *
+     * Restoring a tree an agent is still writing to produces a state that is
+     * neither the old one nor the new one. So jobs stop first, and the shell
+     * says how many.
+     */
+    {
+        run("spawn summarize the workspace", &r);
+        long id = 0;
+        if (r.status == 0 && r.text) sscanf(r.text, "[job %ld]", &id);
+        sh_result_free(&r);
+        CHECK(id > 0, "a job is running to be revoked");
+
+        run("rollback", &r);
+        CHECK(r.status == 0, "rollback with a job running succeeds");
+        CHECK_STR_CONTAINS(r.text, "revoked", "and reports the revocation");
+        sh_result_free(&r);
+        CHECK(sh_jobs_alive(sh) == 0, "no job is left alive afterwards");
     }
 
     /* ---- exit (last: it makes the shell want to terminate) ---- */
