@@ -118,10 +118,18 @@ jobs:
 
       - name: fetch kernel, busybox and modules
         working-directory: source
-        # boot/dl/ holds the kernel + busybox + storage/GPU modules, but NOT the
-        # kernel header tree the LKM builds against (kern-dev), so fetch.sh has
-        # to run in CI. It is idempotent: existing files are reused.
-        run: bash boot/fetch.sh
+        # Everything fetch.sh needs is committed under boot/dl/, including the
+        # 18 MB linux-virt-dev.apk, so this step must work with NO network.
+        # It failed on its first run only because of two bugs in fetch.sh
+        # itself (a sentinel naming a module that never ships, and a versioned
+        # apk filename that did not match the committed one); both are fixed.
+        # Run it offline-first so a regression here fails loudly in CI.
+        run: |
+          if [ -n "$(git status --porcelain boot/dl)" ]; then
+            echo "boot/dl changed unexpectedly: fetch.sh should not modify it"; exit 1
+          fi
+          bash boot/fetch.sh
+          test -f boot/dl/kern-dev/usr/src/linux-headers-6.6.142-0-virt/Makefile
 
       - name: build the image
         working-directory: source

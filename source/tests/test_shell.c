@@ -331,7 +331,9 @@ static void router_tests(void) {
         aios_status st = sh_route("scripted", cases[i].line, tr, &d,
                                   err, sizeof err);
         char msg[256];
-        snprintf(msg, sizeof msg, "route '%s' (%s)", cases[i].line, err);
+        /* A CHECK label, not data: clamp both halves so the label always
+         * fits the buffer (err alone can be 255 bytes). */
+        snprintf(msg, sizeof msg, "route '%.100s' (%.100s)", cases[i].line, err);
         CHECK(st == AIOS_OK, msg);
         CHECK(d.kind == cases[i].kind, msg);
         if (cases[i].tool && d.kind == SH_ROUTE_TOOL) {

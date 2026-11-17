@@ -118,7 +118,10 @@ aios_status agent_run(const agent_cfg *cfg, char *final_out, size_t cap) {
         st = cfg->cx->plan(cfg->cx, obs_json, &act, err, sizeof err);
         free(obs_json);
         if (st != AIOS_OK) {
-            snprintf(last_err, sizeof last_err, "cortex: %s",
+            /* err is caller-sized; last_err is 512. Clamp explicitly so a
+             * long cortex message cannot be reported as a truncation bug. */
+            snprintf(last_err, sizeof last_err, "cortex: %.*s",
+                     (int)sizeof last_err - 9,
                      err[0] ? err : aios_status_str(st));
             last_tool[0] = 0;
             last_ok = false;

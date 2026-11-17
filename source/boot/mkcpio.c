@@ -105,8 +105,17 @@ static void walk(FILE *out, const char *base, const char *arcdir) {
     while ((e = readdir(d)) != NULL) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         char hpath[4096], apath[4096];
-        snprintf(hpath, sizeof hpath, "%s/%s", hostpath, e->d_name);
-        snprintf(apath, sizeof apath, "%s%s%s", arcdir, arcdir[0] ? "/" : "", e->d_name);
+        /* A path that does not fit is a hard error, not a silent truncation
+         * (a truncated path would emit the wrong file into the initramfs). */
+        int hn = snprintf(hpath, sizeof hpath, "%s/%.*s", hostpath,
+                          (int)sizeof hpath - (int)strlen(hostpath) - 2, e->d_name);
+        int an = snprintf(apath, sizeof apath, "%s%s%.*s", arcdir,
+                          arcdir[0] ? "/" : "",
+                          (int)sizeof apath - (int)strlen(arcdir) - 2, e->d_name);
+        if (hn < 0 || (size_t)hn >= sizeof hpath || an < 0 || (size_t)an >= sizeof apath) {
+            fprintf(stderr, "mkcpio: path too long: %s/%s\n", hostpath, e->d_name);
+            exit(1);
+        }
         struct stat st;
         if (lstat(hpath, &st) != 0) { fprintf(stderr, "mkcpio: lstat %s\n", hpath); exit(1); }
         if (S_ISDIR(st.st_mode)) {

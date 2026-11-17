@@ -516,7 +516,13 @@ static int run_agent_fg(sh_shell *sh, const char *goal,
     cortex_free(cx);
     *text_out = xstrdup(final);
     if (st != AIOS_OK) {
-        snprintf(err, ecap, "agent: %s", final[0] ? final : aios_status_str(st));
+        /* Clamp the message into the caller's buffer on purpose: a failed
+         * agent run may carry a 2 KB final state, and err/ecap is whatever
+         * the caller asked for. Truncation is fine here - this is a
+         * human-readable error, and snprintf always terminates. */
+        const char *why = final[0] ? final : aios_status_str(st);
+        size_t room = ecap > 8 ? ecap - 8 : 0;   /* room for "agent: " */
+        snprintf(err, ecap, "agent: %.*s", (int)room, why);
         return 1;
     }
     return 0;
