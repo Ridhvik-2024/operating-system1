@@ -132,3 +132,28 @@ enforcer is theatre).
 **Cost:** the flashy things (browser, audio, hardware) land late.
 **Reverse if:** a sponsor needs hardware support first — then W4-A/W4-B move up
 and W1-D slips, at the cost of a non-persistent system for longer.
+
+## D10 — 2026-11-17 — Trust fields are host-stamped, never parsed
+`aios_action_from_json()` leaves `origin` as `ORIGIN_UNSPECIFIED` (making the
+descriptor invalid until host code stamps it) and only ever *shortens* expiry,
+clamping anything longer to now + 30 s. A descriptor claiming
+`"origin":"human"` is refused for having no host stamp.
+**Why:** origin is the field the audit log trusts. If a model could set it, the
+log would attribute machine actions to humans and M6's hash chain would
+faithfully record a lie. Same for expiry: input may reduce authority, never
+extend it.
+**Cost:** every caller must stamp origin; forgetting is a hard failure rather
+than a silent default (deliberate — a default here would be a vulnerability).
+**Reverse if:** never. If a second trust domain appears (a real second user),
+add an origin value; do not add a parse path.
+
+## D11 — 2026-11-17 — Effects are declared per tool in one table, not inferred
+`aios_action_declare_tool_effects()` is the single place mapping a tool to the
+resources it touches, and it sets `effects_complete` because it enumerated them.
+**Why:** if each call site decided its own effects, the claims would drift and
+the M4 declared-vs-actual diff would be meaningless. One table is auditable by
+reading it.
+**Cost:** a new tool must be added to that function or its effects are unknown
+(which is a mismatch the diff will flag, not a silent pass).
+**Reverse if:** a tool ever needs per-invocation effects that cannot be derived
+from its args — then extend the table, do not move the logic out.

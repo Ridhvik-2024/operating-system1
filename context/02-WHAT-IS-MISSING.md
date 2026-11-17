@@ -26,15 +26,21 @@ statements, each followed by the measured reality.
   Fail closed on unknown action kinds. Wire it in `src/shell.c::exec_tool` and
   in `src/sandbox.c` **before** the worker is spawned.
 
-### G2 — Action Descriptor: MISSING · **S1**
+### G2 — Action Descriptor: **IMPLEMENTED (M1, 2026-11-17)** · was S1
 - **Claim** (`action_descriptor.schema.md`): every AI action is a canonical,
   bounded, reversible-aware descriptor; the unit of sandboxing, policy, audit,
   rollback. Lifecycle: construct → validate → evaluate → sandbox → diff →
   host decision (promote / confirm / block) → immutable log.
-- **Reality**: there is no descriptor type anywhere. Tool calls are
-  `{tool, args}` JSON built ad hoc in `shell.c:400-470` and passed straight to
-  the worker. Effects are **not declared in advance** (no "will read X, will
-  write Y"), so nothing can compare *declared* vs *actual*.
+- **Reality at audit time**: there was no descriptor type anywhere. Tool calls
+  were `{tool, args}` JSON built ad hoc in `shell.c` and passed straight to the
+  worker. Effects were **not declared in advance**, so nothing could compare
+  *declared* vs *actual*.
+- **Now (M1)**: `aios_action` in `include/aios/action.h`; every command in
+  `shell.c` passes through `action_gate()`; the router attaches the descriptor
+  and the *caller* stamps origin (typed = HUMAN, routed = AI). Declared effects
+  are on the record per tool. Still missing: the **comparison** of declared vs
+  actual (that is G3/M4), which is why this fix closes the type's gap, not the
+  whole of G2's claim.
 - **Fix**: struct `aios_action` (kind, target paths, declared writes, resource
   budget, reversibility, expiry, intent hash), validated from JSON, produced by
   every route in `shroute.c` (TOOL and AGENT paths). The worker returns a

@@ -16,7 +16,8 @@ Where a claim in the repo's docs could not be reproduced, it is called out.
 
 Because QEMU is unavailable here, the **in-OS** guarantees are quoted from the
 checked-in serial logs (`boot-test1.log`, `boot-test2.log`, 472/480 lines,
-which show `AIOS-SELFTEST: PASS`, `11 passed, 0 failed`, `AIOS-BOOT-OK
+which show `AIOS-SELFTEST: PASS`, `11 passed, 0 failed` (the log predates
+M1), `AIOS-BOOT-OK
 selftest=PASS`, `boot #2`, GPU stack `18/18`) and were **not** independently
 re-executed. Everything in §2–§5 below *was* re-executed.
 
@@ -90,7 +91,8 @@ there (`glyph has ink`) — that failure is an artifact of the stub, not a code 
 
 ## 5. Test suite, actually run on this host
 
-All 11 suites were built against the fixed tree and executed:
+All 11 suites of that audit were built against the fixed tree and executed
+(11 then; **12** since M1 added `test_action`):
 
 | Suite | Result here | Notes |
 |---|---|---|
@@ -134,7 +136,7 @@ on disk), and natural-language routing works.
 
 | Claim | Reality |
 |---|---|
-| README/INSTALL: `make test` → `== 10 passed, 0 failed ==` | there are **11** suites (CHANGELOG agrees: 11/11); the string is stale |
+| README/INSTALL: `make test` → `== 10 passed, 0 failed ==` | **FIXED** — there are **12** suites now; docs say 12 |
 | `make` works "in seconds" on any machine | fails on glibc ≥ 2.36 (fixed here) and needs Pillow for the font |
 | `docs/ACCEPTANCE-M10.md` cites `scripts/m10-spike.sh`, `scripts/m10-bochs-probe.sh` | **no `scripts/` directory exists** |
 | CHANGELOG cites `download/m10-boot-shots/` | **no `download/` directory exists** |
@@ -153,7 +155,7 @@ find in ten minutes. Fix the strings as you touch the files.
 
 ```bash
 # 1. clean build (after committing font8x16.h, or with Pillow available)
-cd source && make && make test          # expect 11/11
+cd source && make && make test          # expect 12/12
 
 # 2. bootable image
 bash boot/fetch.sh                      # kernel + busybox + modules (~60 MB, once)

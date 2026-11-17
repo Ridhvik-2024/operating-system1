@@ -10,7 +10,27 @@ happened, and how do we undo it.*
 
 ---
 
-## M1 — Action Descriptor (`aios_action`) · **M** · closes G2
+## M1 — Action Descriptor (`aios_action`) · **M** · closes G2 — ✅ **DONE 2026-11-17**
+
+> `include/aios/action.h` + `src/action.c`, `tests/test_action.c` (119 checks).
+> Every command in `shell.c` now passes through `action_gate()`; both the typed
+> (HUMAN) and routed (AI) paths are verified against the running shell, with the
+> descriptor captured on `sh.action.{accept,refused}`.
+>
+> **Three decisions worth carrying into M2–M6:**
+> 1. **Trust fields never come from parsed JSON.** `origin` arrives
+>    `ORIGIN_UNSPECIFIED` and the *caller* stamps it; expiry may be shortened by
+>    input but never extended (clamped to now + 30 s). Proven: a descriptor
+>    claiming `"origin":"human"` is refused for having no host stamp.
+> 2. **`declare_tool_effects()` is the one table of what a tool touches**, next
+>    to the type rather than inferred from tool behaviour. `effects_complete`
+>    distinguishes "touches nothing" from "forgot to declare".
+> 3. **`intent_hash` is an exact hex STRING.** It is 64-bit; JSON numbers are
+>    doubles and silently dropped the low 11 bits — caught by the round-trip
+>    test, would have broken M6 audit correlation.
+>
+> **Deliberately not done:** nothing is *blocked* yet. Validation refuses
+> malformed descriptors; denying legitimate-but-forbidden ones is `M2`.
 
 **Goal.** One type that represents *any* AI-proposed action, before it happens.
 
