@@ -147,7 +147,15 @@ jobs:
         working-directory: source
         # The size guard in boot/Makefile fails the build if the initramfs
         # exceeds the pinned cap (boot/.m10-size-cap).
-        run: make -f boot/Makefile boot-image
+        run: |
+          set +e
+          make -f boot/Makefile boot-image 2>&1 | tee /tmp/build.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::image build failed (rc=$rc)"
+            tail -25 /tmp/build.log
+          fi
+          exit "$rc"
 
       - name: two boots on one disk (M8 durable proof)
         working-directory: source

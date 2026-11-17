@@ -198,6 +198,9 @@ $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	 echo "   v1.1 initramfs: $$size bytes (cap $$cap)"; \
 	 if [ $$size -gt $$cap ]; then \
 	     echo "SIZE-GUARD FAIL: v1.1 image ($$size) exceeds M10 cap ($$cap)"; \
+	     echo "  over by $$((size - cap)) bytes. What grew is found with:"; \
+	     echo "    ls -lS $(STAGE)/sbin $(STAGE)/usr/bin | head"; \
+	     ls -lS $(STAGE)/sbin $(STAGE)/usr/bin 2>/dev/null | head -8; \
 	     exit 1; \
 	 fi; \
 	 echo "   size-guard OK ($$((cap - size)) bytes under cap)"
