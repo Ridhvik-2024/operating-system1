@@ -31,7 +31,8 @@ Read `context/RULES.md` **before** any card. Every card assumes it.
 | `H2` | ~~Add `LICENSE` + `CONTRIBUTING.md`~~ **DONE** | S | was: the repo was unlicensed |
 | `H3` | ~~CI: `make && make test` on a clean runner~~ **DONE** | M | was: the green tests were not enforced |
 | `H4` | ~~Fix stale counts and dead doc paths~~ **DONE** | S | docs now match the tree |
-| `H5` | Boot CI job (`boot-test.sh`) on a qemu-enabled runner | M | the two-boot durable proof is the crown jewel and untested |
+| `H5` | ~~Boot CI job (`boot-test.sh`) on a qemu-enabled runner~~ **DONE** | M | the two-boot durable proof now runs on every push |
+| `H6` | ~~Keep future binaries out of git~~ **DONE** | S | was: 54.4 MB tracked, kernel committed twice |
 
 ## Phase 1 — The mediator (M11, ≈2–3 weeks) — **the real work**
 
@@ -101,7 +102,7 @@ skipping the sandbox in a tool · a new dependency · "just disable the test".
 
 | Phase | Status |
 |---|---|
-| 0 hygiene | `H1` `H2` `H3` `H4` DONE; `H5` (boot CI job written, awaiting a green run) and `H6` (binary hygiene) open |
+| 0 hygiene | **`H1`-`H6` all DONE** — next is `W0-B` (mediator M1) |
 | 1 mediator | not started |
 | 2 OS honesty | not started |
 | 3 Linux underneath | not started |
@@ -118,4 +119,7 @@ skipping the sandbox in a tool · a new dependency · "just disable the test".
 | `H1` | font table committed at `src/font8x16.h`; both Makefiles no longer run Python; `test_fb` now passes on the host (89/89) | 2026-11-17 | `src/font8x16.h`, `Makefile`, `boot/Makefile`, `tools/gen_font.py` |
 | `H2` | Apache-2.0 `LICENSE` + `CONTRIBUTING.md`; `types.h` + README updated | 2026-11-17 | `LICENSE`, `CONTRIBUTING.md` |
 | `H3` | CI (build -Werror, test on 22.04+24.04, boot two-boot proof). Also fixed a real test bug: test_kernel probed `/sbin/aiosh` (image-only) as the "outside" Landlock path, so it failed on every host with ENOENT; now probes `/etc/passwd` and SKIPs explicitly if absent. **Host suite is 11/11 for the first time.** | 2026-11-17 | `.github/workflows/ci.yml`, `tests/test_kernel.c` |
+| `H5` | CI boot job GREEN: fetch.sh works offline, image builds, both QEMU boots verified (31 KB of serial logs uploaded). Fixed 2 fetch.sh bugs (sentinel for a module that never ships; versioned apk name vs committed name) and 4 real `-Wformat-truncation` warnings the `-Os` boot build exposed. | 2026-11-17 | `.github/workflows/ci.yml`, `boot/fetch.sh`, `boot/mkcpio.c`, `src/shell.c`, `src/agent.c`, `tests/test_shell.c` |
 | `H4` | stale suite counts + dead `scripts/`, `download/` paths fixed in BOOT-GUIDE, CHANGELOG, README, UPGRADE, PERFORMANCE, ACCEPTANCE-v1.0/M10, ASSETS.md; `ai_con.md` marked HISTORICAL | 2026-11-17 | `source/*.md`, `source/docs/*.md`, `ai_con.md` |
+| `H5` | CI boot job GREEN: fetch.sh works offline, image builds, both QEMU boots verified (31 KB of serial logs uploaded). Fixed 2 fetch.sh bugs (sentinel for a module that never ships; versioned apk name vs committed name) and 4 real `-Wformat-truncation` warnings the `-Os` boot build exposed. | 2026-11-17 | `.github/workflows/ci.yml`, `boot/fetch.sh`, `boot/mkcpio.c`, `src/shell.c`, `src/agent.c`, `tests/test_shell.c` |
+| `H6` | duplicate kernel + factory `data.img` + stale root initramfs untracked; `tools/make-release-bundle.sh` generates the flat bundle (verified: 21 MB, 11 files); `docs/REPO-LAYOUT.md` with measured counts. Tracked: 54.4 MB -> **31.2 MB**, 179 files. | 2026-11-17 | `docs/REPO-LAYOUT.md`, `tools/make-release-bundle.sh`, `.gitignore` |

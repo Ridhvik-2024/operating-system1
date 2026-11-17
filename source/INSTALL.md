@@ -89,10 +89,21 @@ facts. That is the OS owning memory, not the app.
 ### Release bundle (recommended)
 
 ```bash
-unzip aios-v1.0.zip && cd aios-v1.0
+unzip aios-v1.1.zip && cd aios-bundle
 ./boot-test.sh     # headless two-boot verification (exit 0 = good)
 ./run-qemu.sh      # boot the OS, aiosh is your console
 ```
+
+Working from the git repo instead? The bundle is generated, not committed:
+
+```bash
+bash boot/fetch.sh                            # once: kernel + modules (~60 MB)
+make -f boot/Makefile boot-image
+bash tools/make-release-bundle.sh --zip       # -> dist/aios-v1.1.zip
+```
+
+See [docs/REPO-LAYOUT.md](../docs/REPO-LAYOUT.md) for what is source and what
+is artifact.
 
 Details, the guided tour and the full console transcript:
 [BOOT-GUIDE.md](BOOT-GUIDE.md).
