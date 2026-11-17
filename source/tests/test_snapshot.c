@@ -269,6 +269,7 @@ static void test_ambiguous_prefix(void) {
                     err, sizeof err), "first snapshot");
     CHECK(snap_take(ROOT "/amb/jail", ROOT "/amb/store", "two", b, sizeof b,
                     err, sizeof err), "second snapshot");
+    if (err[0]) printf("      take said: %s\n", err);
 
     /* Find a shared prefix of the two ids. They share the millisecond almost
      * always, which is precisely why guessing would be dangerous. */
@@ -410,6 +411,59 @@ static void test_survives_reboot(void) {
     CHECK(!exists(ROOT "/rb/jail/after.txt"), "the later addition is gone");
 }
 
+/* ---------------- 7b. two takes in the same millisecond ---------------- *
+ *
+ * The id was timestamp+pid, which is unique on an idle desktop and not unique
+ * on a machine that finishes a take inside a single millisecond -- which is what
+ * the image does on its ext2 disk. The second take then reused the first one's
+ * directory, and the failure surfaced three groups later as "an ambiguous id is
+ * not guessed" failing, because there was only one snapshot left to be ambiguous
+ * about.
+ *
+ * This asserts the property directly, so the next time it breaks it says so.
+ */
+static void test_ids_are_unique(void) {
+    /* Ids used to be timestamp+pid. On a host clock that is unique; on a guest
+     * whose clock ticks in 10ms it is not, and the second take then fails to
+     * rename its temp directory onto the first one and reports a bare failure.
+     * The property that matters is that takes never collide, whatever the clock
+     * resolution -- so that is what is asserted. */
+    printf("snapshots taken back to back do not collide\n");
+    rmrf(ROOT "/uniq");
+    mkdirs(ROOT "/uniq/jail");
+    mkdirs(ROOT "/uniq/store");
+    write_file(ROOT "/uniq/jail/f.txt", "u\n");
+
+    char ids[8][AIOS_SNAP_ID_MAX];
+    memset(ids, 0, sizeof ids);
+    bool all_taken = true;
+    for (int i = 0; i < 8; i++) {
+        char err[256] = {0};
+        if (!snap_take(ROOT "/uniq/jail", ROOT "/uniq/store", "same", ids[i],
+                       sizeof ids[i], err, sizeof err)) {
+            all_taken = false;
+            printf("      take %d failed: %s\n", i, err);
+        }
+    }
+    CHECK(all_taken, "eight takes in a row all succeed");
+
+    bool distinct = true;
+    for (int i = 0; i < 8 && distinct; i++)
+        for (int j = i + 1; j < 8; j++)
+            if (strcmp(ids[i], ids[j]) == 0) {
+                printf("      collision: %s == %s\n", ids[i], ids[j]);
+                distinct = false;
+                break;
+            }
+    CHECK(distinct, "and every id is different, even in one millisecond");
+
+    snap_list l;
+    memset(&l, 0, sizeof l);
+    CHECK(snap_list_all(ROOT "/uniq/store", &l, NULL, 0), "the store still opens");
+    CHECK(l.n == 8, "eight snapshots are in the store, not one");
+    snap_list_free(&l);
+}
+
 /* ---------------- 8. the store on a DIFFERENT filesystem ---------------- *
  *
  * This is the arrangement the real image uses and every test here missed: the
@@ -475,6 +529,7 @@ int main(void) {
     test_prune();
     test_failed_restore_is_atomic();
     test_survives_reboot();
+    test_ids_are_unique();
     test_cross_filesystem();
 
     printf("%s: %d checks, %d failed\n",

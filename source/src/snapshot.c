@@ -519,15 +519,29 @@ bool snap_take(const char *jail, const char *store, const char *label,
     memset(&si, 0, sizeof si);
     si.taken_ms = (long long)aios_now_ms();
     if (label && *label) snprintf(si.label, sizeof si.label, "%s", label);
-    /* Timestamp + pid keeps two snapshots in the same millisecond distinct, and
-     * a pid is one of the few things guaranteed to differ between two shells. */
-    snprintf(si.id, sizeof si.id, "%lld-%d", si.taken_ms, (int)getpid());
+    /* Timestamp + pid + sequence. Timestamp+pid looked unique and was not: take
+     * two snapshots in a row and the millisecond is the same and the pid is the
+     * same, so the second one reuses the first one's directory. It passed on a
+     * desktop (a microsecond clock, an idle machine) and failed in the image on
+     * an ext2 disk, where the whole take completes inside one millisecond.
+     *
+     * The sequence is not decoration: it is what makes two takes in the same
+     * millisecond distinct, and a clobbered snapshot is worse than a slow one. */
+    char tmpname[AIOS_SNAP_ID_MAX + 8];
+    for (unsigned seq = 0;; seq++) {
+        snprintf(si.id, sizeof si.id, "%lld-%d-%u", si.taken_ms, (int)getpid(), seq);
+        jpath(final, sizeof final, snaps, si.id);
+        struct stat st;
+        if (lstat(final, &st) != 0) break;
+        if (seq > 999) {
+            set_err(err, ecap, "cannot find a free snapshot id at this millisecond");
+            return false;
+        }
+    }
     snprintf(id_out, id_cap, "%s", si.id);
 
-    char tmpname[AIOS_SNAP_ID_MAX + 8];
     snprintf(tmpname, sizeof tmpname, "%s.tmp", si.id);
     jpath(tmp, sizeof tmp, snaps, tmpname);
-    jpath(final, sizeof final, snaps, si.id);
     rm_rf(tmp);
 
     char jailcopy[PATHBUF], storecopy[PATHBUF];
