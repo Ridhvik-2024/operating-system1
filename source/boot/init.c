@@ -268,7 +268,8 @@ static int durable_phase(void) {
     mkdir("/data", 0755);
 
     /* storage stack: virtio block device + ext2 (depends on mbcache) */
-    const char *mods[] = { "virtio_blk.ko", "mbcache.ko", "ext2.ko" };
+    /* NEGATIVE TEST: sabotage the storage stack on purpose (H5 acceptance). */
+    const char *mods[] = { "nonexistent.ko", "mbcache.ko", "ext2.ko" };
     int loaded = 0, ok_mods = 0;
     for (size_t i = 0; i < sizeof mods / sizeof mods[0]; i++) {
         char mp[64];
