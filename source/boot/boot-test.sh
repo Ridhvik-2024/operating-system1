@@ -117,18 +117,16 @@ echo "------------------------------------------"
 explain() {
     log=$1; what=$2
     echo "  MISS $what"
-    # An annotation is length-limited and single-line, so put the failing
-    # assertion IN it: the log itself is an artifact nobody opens.
-    detail=$(grep -E 'SELFTEST .*(FAIL|PASS)|FAIL tests/|Segmentation|No such file' \
-                  "$log" 2>/dev/null | head -4 | tr '\n' ' ' | tr -s ' ' | cut -c1-400)
-    # Nothing matched: the boot did not get as far as the suite. Report where it
-    # actually stopped instead of guessing.
-    if [ -z "$detail" ]; then
-        detail=$(tail -6 "$log" 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-400)
-    fi
-    [ -n "$detail" ] && echo "    | $detail"
+    # Print the END of the log, not the start: the first four PASS lines say
+    # nothing about where the boot stopped. A previous version did exactly that
+    # and produced an annotation full of successes.
+    echo "  --- last lines of $log ---"
+    grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\]' "$log" 2>/dev/null | tail -12 \
+        | sed 's/^/    | /'
     if [ -n "$GITHUB_ACTIONS" ]; then
-        echo "::error title=boot test::missed: $what ${detail:+-- $detail}"
+        detail=$(grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\]' "$log" 2>/dev/null \
+                 | tail -4 | tr '\n' ' ' | tr -s ' ' | cut -c1-400)
+        echo "::error title=boot test::missed: $what -- $detail"
     fi
     fail=1
 }
