@@ -880,7 +880,7 @@ static int builtin_lm(sh_shell *sh, sargv *a,
         /* join the rest into one line (quoted words kept apart) */
         char line[768] = {0};
         size_t off = 0;
-        for (int i = 2; i < a->n && off < sizeof line - 2; i++) {
+        for (size_t i = 2; i < a->n && off < sizeof line - 2; i++) {
             if (off) line[off++] = ' ';
             size_t l = strlen(a->v[i]);
             if (l > sizeof line - off - 1) l = sizeof line - off - 1;
@@ -899,7 +899,7 @@ static int builtin_lm(sh_shell *sh, sargv *a,
     if (a->n >= 2 && strcmp(a->v[1], "gen") == 0) {
         char prompt[512] = {0};
         size_t off = 0;
-        for (int i = 2; i < a->n && off < sizeof prompt - 2; i++) {
+        for (size_t i = 2; i < a->n && off < sizeof prompt - 2; i++) {
             if (off) prompt[off++] = ' ';
             size_t l = strlen(a->v[i]);
             if (l > sizeof prompt - off - 1) l = sizeof prompt - off - 1;
@@ -1001,7 +1001,7 @@ static int builtin_tune(sh_shell *sh, sargv *a,
         *text_out = strdup(b);
         return 0;
     }
-    for (int i = 1; i < a->n; i++) {
+    for (size_t i = 1; i < a->n; i++) {
         char *eq = strchr(a->v[i], '=');
         if (!eq) {
             snprintf(err, ecap, "tune: expected key=value, got '%s'", a->v[i]);

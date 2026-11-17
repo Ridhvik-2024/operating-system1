@@ -150,8 +150,10 @@ static int load_counter(observer *o, const char *id_path) {
         char tail[768] = {0};
         if (log[0]) {
             size_t l = strlen(log);
-            const char *t = log + (l > 740 ? l - 740 : 0);
-            snprintf(tail, sizeof tail, " [%s]", t);
+            /* keep the tail of the verifier log; %.700s bounds the copy so
+             * the format cannot be truncated (was -Wformat-truncation) */
+            const char *t = log + (l > 700 ? l - 700 : 0);
+            snprintf(tail, sizeof tail, " [%.700s]", t);
         }
         snprintf(o->err, sizeof o->err, "BPF_PROG_LOAD: %s%s",
                  strerror(rc2_errno), tail);

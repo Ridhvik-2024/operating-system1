@@ -23,8 +23,26 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
-#include <linux/sched/types.h>
 #include <sched.h>
+
+/* <linux/sched/types.h> and glibc >= 2.36 both define `struct sched_param`
+ * in the same include order, so including both is a hard compile error on
+ * modern toolchains (seen on gcc 12 / Debian 12, and newer). We only need
+ * `struct sched_attr` for sched_setattr(2), so declare it here exactly as
+ * the kernel does and keep the build toolchain-independent. */
+#ifndef AIOS_HAVE_SCHED_ATTR
+#define AIOS_HAVE_SCHED_ATTR
+struct sched_attr {
+    unsigned int size;
+    unsigned int sched_policy;
+    long long    sched_flags;
+    int          sched_nice;
+    unsigned int sched_priority;
+    unsigned long long sched_runtime;
+    unsigned long long sched_deadline;
+    unsigned long long sched_period;
+};
+#endif
 
 #ifndef SCHED_OTHER
 #define SCHED_OTHER 0
