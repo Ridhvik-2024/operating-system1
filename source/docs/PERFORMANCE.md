@@ -10,7 +10,7 @@ the boot harness logs (TCG emulation, 512 MB, 2 vCPUs).
 | metric | value |
 |---|---|
 | clean build (`make clean && make -j2`, hardening flags on) | **1.9 s** |
-| full test run (10 suites, single-threaded sum) | **3.35 s** |
+| full test run (10 suites at v1.0; **11** since M10 added `test_fb`, single-threaded sum) | **3.35 s** (v1.0 figure) |
 
 Zero-dependency claim holds in practice: no configure step, no
 package installs — clone to running tests in under five seconds.
@@ -81,7 +81,7 @@ phase 1, fresh disk):
 | phase | detail |
 |---|---|
 | kernel + initramfs unpack + init mounts | happens before the banner; the first durable message appears within the first seconds of the serial log |
-| selftest phase (10 suites in-image) | a few seconds under TCG emulation; near-instant on real/accelerated hardware (sum of suites on the host is 3.3 s) |
+| selftest phase (10 suites at v1.0, 11 since M10) | a few seconds under TCG emulation; near-instant on real/accelerated hardware (sum of suites on the host is 3.3 s) |
 | bring-up (micro-LM routing, memory, job spawn, governor) | sub-second: every line is an ms-scale shell operation |
 | total to `AIOS-BOOT-OK selftest=PASS` | well inside the CI phase budget (180 s); the binding cost is TCG emulation of the kernel bring-up, not AI-OS itself |
 

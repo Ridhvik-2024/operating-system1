@@ -77,4 +77,4 @@ the memory carries over.
 3. `dur` → boot count + store counts preserved
 4. `kernel` → registry, cgroup budgets, both eBPF observers
 5. `autopilot` → governor alive, mode from `tune` conf (persisted)
-6. `make test` on the host → `== 10 passed, 0 failed ==`
+6. `make test` on the host → `== 11 passed, 0 failed ==`

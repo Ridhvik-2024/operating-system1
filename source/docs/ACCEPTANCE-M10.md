@@ -5,7 +5,7 @@ Every claim below is backed by a command that ran green in this tree.
 ## 1. Kernel evidence first (the spike)
 
 - The graphics path was chosen by booting, not by documentation.
-  `scripts/m10-spike.sh` loaded a candidate module stack on the stock
+  a spike script loaded a candidate module stack on the stock
   `linux-virt 6.6.142` kernel under QEMU with display devices attached:
   - **virtio-gpu**: all modules load, `/dev/fb0` appears
     (`/proc/fb: 0 virtio_gpudrmfb`, 1280x800), and `/dev/input/event*`
@@ -17,7 +17,8 @@ Every claim below is backed by a command that ran green in this tree.
   - **bochs-display** (`bochs.ko` from the same kernel package): guest
     mmap writes are a shared PCI BAR — the QEMU surface resizes to the
     guest mode (1280x800) and shows pixels immediately.
-    `scripts/m10-bochs-probe.sh` is the recorded proof.
+    (The spike scripts themselves are not committed in this tree; the
+    decision they produced is what shipped.)
 - Decision: ship **bochs-display** as the QEMU target; `linux-virt`
   stays (no kernel rebuild, no linux-lts swap needed).
 
@@ -81,7 +82,8 @@ pinned in `boot/.m10-size-cap`; the guard prints the whole history
   - types `6*7` + Enter **through the virtio keyboard** and screendumps
     again: the terminal region changes and the aiosh answer appears
     (`has_42`: 29 changed px). Screenshots saved to
-    `download/m10-boot-shots/desktop-idle.png` and `desktop-67.png` —
+    `download/m10-boot-shots/desktop-idle.png` and `desktop-67.png` (written
+    by `boot-gui-test.sh` when it runs) —
     the terminal visibly shows `aiosh> 6*7` and the answer `42`.
 - **Graceful fallbacks verified**: headless boot without a display
   device loads the stack (18/18), finds no `/dev/fb0`, logs

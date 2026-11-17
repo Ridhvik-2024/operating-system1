@@ -10,7 +10,7 @@ was executed against the final v1.0 tree at commit
 | check | result |
 |---|---|
 | `make clean && make -j2` | OK — **warning-free** under `-Wall -Wextra -Wshadow -Wformat -Wformat-security -fstack-protector-strong -D_FORTIFY_SOURCE=2` |
-| `make test` | **10/10 suites PASS** |
+| `make test` | **10/10 suites PASS** (10 suites at v1.0; M10 added `test_fb`, so today it is 11/11) |
 
 Per-suite (host run):
 

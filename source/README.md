@@ -358,7 +358,7 @@ the drop-in contract for real artwork). Proof: `boot/boot-gui-test.sh`
 screendumps the desktop through QEMU, pixel-asserts the wallpaper /
 accent bar / five title bars / cursor, then types `6*7` through the
 virtio keyboard — the GUI answers `42` (screenshots in
-`download/m10-boot-shots/`). Acceptance record:
+the script's own `download/m10-boot-shots/`). Acceptance record:
 [docs/ACCEPTANCE-M10.md](docs/ACCEPTANCE-M10.md).
 
 ## Install, upgrade, hardening, performance (M9 / v1.0)

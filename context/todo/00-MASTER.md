@@ -29,8 +29,8 @@ Read `context/RULES.md` **before** any card. Every card assumes it.
 |---|---|---|---|
 | `H1` | ~~Commit the generated `font8x16.h` so `make` needs no Pillow~~ **DONE** | S | was: nobody could build on a clean machine |
 | `H2` | ~~Add `LICENSE` + `CONTRIBUTING.md`~~ **DONE** | S | was: the repo was unlicensed |
-| `H3` | CI: `make && make test` on a clean runner | M | the green tests are not enforced |
-| `H4` | Fix stale counts ("10 suites" → 11) and dead doc paths | S | done partly in this snapshot; finish `docs/`, `CHANGELOG` |
+| `H3` | ~~CI: `make && make test` on a clean runner~~ **DONE** | M | was: the green tests were not enforced |
+| `H4` | ~~Fix stale counts and dead doc paths~~ **DONE** | S | docs now match the tree |
 | `H5` | Boot CI job (`boot-test.sh`) on a qemu-enabled runner | M | the two-boot durable proof is the crown jewel and untested |
 
 ## Phase 1 — The mediator (M11, ≈2–3 weeks) — **the real work**
@@ -101,7 +101,7 @@ skipping the sandbox in a tool · a new dependency · "just disable the test".
 
 | Phase | Status |
 |---|---|
-| 0 hygiene | `H4` partly done (this snapshot); rest open |
+| 0 hygiene | `H1` `H2` `H3` `H4` DONE; `H5` (boot CI job written, awaiting a green run) and `H6` (binary hygiene) open |
 | 1 mediator | not started |
 | 2 OS honesty | not started |
 | 3 Linux underneath | not started |
@@ -117,3 +117,5 @@ skipping the sandbox in a tool · a new dependency · "just disable the test".
 | — | suite count corrected 10 → 11 in README/INSTALL | 2026-11-16 | `source/README.md` |
 | `H1` | font table committed at `src/font8x16.h`; both Makefiles no longer run Python; `test_fb` now passes on the host (89/89) | 2026-11-17 | `src/font8x16.h`, `Makefile`, `boot/Makefile`, `tools/gen_font.py` |
 | `H2` | Apache-2.0 `LICENSE` + `CONTRIBUTING.md`; `types.h` + README updated | 2026-11-17 | `LICENSE`, `CONTRIBUTING.md` |
+| `H3` | CI (build -Werror, test on 22.04+24.04, boot two-boot proof). Also fixed a real test bug: test_kernel probed `/sbin/aiosh` (image-only) as the "outside" Landlock path, so it failed on every host with ENOENT; now probes `/etc/passwd` and SKIPs explicitly if absent. **Host suite is 11/11 for the first time.** | 2026-11-17 | `.github/workflows/ci.yml`, `tests/test_kernel.c` |
+| `H4` | stale suite counts + dead `scripts/`, `download/` paths fixed in BOOT-GUIDE, CHANGELOG, README, UPGRADE, PERFORMANCE, ACCEPTANCE-v1.0/M10, ASSETS.md; `ai_con.md` marked HISTORICAL | 2026-11-17 | `source/*.md`, `source/docs/*.md`, `ai_con.md` |

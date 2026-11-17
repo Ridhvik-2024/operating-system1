@@ -47,7 +47,7 @@ you talk to in it is the same aiosh engine as the serial console:
   boots with a GPU + keyboard, screendumps through the QEMU monitor,
   asserts pixels (gradient, accent bar, five title bars, cursor) and
   types `6*7` through the virtio keyboard — the GUI answers `42`
-  (screenshots in `download/m10-boot-shots/`).
+  (the script writes its screendumps to `download/m10-boot-shots/`).
 - **Fixed for everyone**: `boot/mkcpio.c` no longer uses `ftell(stdout)`
   (glibc 2.41 makes it fail on pipes), which since the sandbox refresh
   emitted a broken 512-byte trailer ("Initramfs unpacking failed:
