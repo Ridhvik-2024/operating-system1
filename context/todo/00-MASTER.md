@@ -21,7 +21,7 @@ Read `context/RULES.md` **before** any card. Every card assumes it.
 
 | ID | Task | Size | Why now |
 |---|---|---|---|
-| `H1` | Commit the generated `font8x16.h` so `make` needs no Pillow | S | **nobody can build on a clean machine today** |
+| `H1` | ~~Commit the generated `font8x16.h` so `make` needs no Pillow~~ **DONE** | S | was: nobody could build on a clean machine |
 | `H2` | Add `LICENSE` + `CONTRIBUTING.md` | S | the repo is unlicensed |
 | `H3` | CI: `make && make test` on a clean runner | M | the green tests are not enforced |
 | `H4` | Fix stale counts ("10 suites" → 11) and dead doc paths | S | done partly in this snapshot; finish `docs/`, `CHANGELOG` |
@@ -109,3 +109,4 @@ skipping the sandbox in a tool · a new dependency · "just disable the test".
 | — | 4 warnings fixed (3× sign-compare `shell.c`, 1× format-truncation `ebpf.c`) | 2026-11-16 | `src/shell.c`, `src/ebpf.c` |
 | — | `.gitignore` added | 2026-11-16 | `.gitignore` |
 | — | suite count corrected 10 → 11 in README/INSTALL | 2026-11-16 | `source/README.md` |
+| `H1` | font table committed at `src/font8x16.h`; both Makefiles no longer run Python; `test_fb` now passes on the host (89/89) | 2026-11-17 | `src/font8x16.h`, `Makefile`, `boot/Makefile`, `tools/gen_font.py` |

@@ -5,7 +5,15 @@ Sizes: **S** ≤ 2 h · **M** ≈ a day · **L** ≈ 2–3 days.
 
 ---
 
-## H1 — Commit the generated font table so `make` works with no Pillow · **S**
+## H1 — Commit the generated font table so `make` works with no Pillow · **S** — ✅ **DONE 2026-11-17**
+
+> Implemented as: `src/font8x16.h` committed (22 KB, deterministic), both
+> Makefiles no longer invoke Python and drop `-Ibuild`/`-I$(BLD)`,
+> `tools/gen_font.py` defaults to `src/font8x16.h`, `INSTALL.md` and
+> `docs/ACCEPTANCE-M10.md` updated. Proof: `make -j4` with `python3` stubbed
+> to fail builds clean; `make test` → 10/11 with `test_fb` **passing** (89/89),
+> the remaining failure being Landlock in this sandbox. The steps below are
+> kept for the record.
 
 **Problem.** `src/fb.c`, `src/win.c`, `src/input.c` include `"font8x16.h"`, which
 is generated into `build/` by `tools/gen_font.py` (requires **Pillow** +

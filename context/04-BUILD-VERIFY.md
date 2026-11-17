@@ -67,7 +67,12 @@ for f in src/*.c apps/*.c: gcc -std=c11 -O2 -Wall -Wextra -Wshadow \
 pre-existing `-Wformat-truncation` warning at line 108 (path join); harmless,
 left alone — fix it with the same `%.*s` pattern when you next touch the packer.
 
-## 4. Second build blocker: the font is generated, not shipped
+## 4. Second build blocker: the font is generated, not shipped — **FIXED 2026-11-17**
+
+> **Status:** fixed. The table now lives at `src/font8x16.h` and is committed;
+> both Makefiles no longer run Python (proved with a `python3` stub that exits
+> 99). `test_fb` passes **89/89** on the host with the real table. The section
+> below is the original finding, kept for the record.
 
 `make` needs `build/font8x16.h` before `fb.c`, `win.c`, `input.c`.
 It is produced by `tools/gen_font.py`, which needs **Pillow**:

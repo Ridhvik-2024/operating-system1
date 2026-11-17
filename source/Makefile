@@ -50,22 +50,16 @@ uninstall:
 $(LIB): $(LIB_OBJS)
 	$(AR) rcs $@ $^
 
-# M10: the generated 8x16 font table (build/font8x16.h) is a prerequisite
-# of fb.c/win.c - render it from DejaVu Sans Mono before compiling them.
-build/font8x16.h: tools/gen_font.py
-	@mkdir -p build
-	python3 tools/gen_font.py $@
-
-src/fb.o src/win.o src/input.o: build/font8x16.h
+# M10: the 8x16 font table lives in src/font8x16.h and is COMMITTED, like
+# src/microlm_weights.h. The generator (tools/gen_font.py) needs Pillow and
+# DejaVu fonts; the build must need neither. Regenerate explicitly with:
+#     python3 tools/gen_font.py src/font8x16.h
 
 src/%.o: src/%.c
-	$(CC) $(CFLAGS) -Iinclude -Ibuild -MMD -c -o $@ $<
+	$(CC) $(CFLAGS) -Iinclude -MMD -c -o $@ $<
 
 %: apps/%.c $(LIB)
-	$(CC) $(CFLAGS) -Iinclude -Ibuild -MMD -o $@ $< $(LIB) $(LDFLAGS)
-
-aios-desktop: apps/aios-desktop.c $(LIB) build/font8x16.h
-	$(CC) $(CFLAGS) -Iinclude -Ibuild -MMD -o $@ apps/aios-desktop.c $(LIB) $(LDFLAGS)
+	$(CC) $(CFLAGS) -Iinclude -MMD -o $@ $< $(LIB) $(LDFLAGS)
 
 tool-exec: src/tool-exec.c $(LIB)
 	$(CC) $(CFLAGS) -Iinclude -MMD -o $@ src/tool-exec.c $(LIB) $(LDFLAGS)

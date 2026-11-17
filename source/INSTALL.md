@@ -11,10 +11,12 @@ OS** (our initramfs on a Linux kernel, in QEMU or a VM).
 ### Requirements
 
 - `cc` (gcc or clang) and `make` — that's it for the runtime itself
-- `python3` — only needed to regenerate the micro-LM weights
-  (`tools/microlm_gen.py`) or rebuild the ext2 data disk
-  (`tools/mkfs_ext2.py`); both are checked into the repo as generated
-  artifacts, so a plain build does not need Python
+- `python3` — **not needed for a plain build**. It is only required to
+  regenerate artifacts, all of which are checked in: the micro-LM weights
+  (`tools/microlm_gen.py` -> `src/microlm_weights.h`), the desktop font table
+  (`tools/gen_font.py` -> `src/font8x16.h`, which additionally needs Pillow and
+  the DejaVu fonts), the ext2 data disk (`tools/mkfs_ext2.py`) and artist PNG
+  conversion (`tools/img2aiosimg.py`, also Pillow)
 - No root, no external libraries — everything is C11 + pthreads
 
 ### Quick install

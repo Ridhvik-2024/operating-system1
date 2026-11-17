@@ -51,16 +51,11 @@ LIB_OBJS := $(patsubst src/%.c,$(BLD)/%.o,$(LIB_SRCS))
 $(LIB): $(LIB_OBJS)
 	ar rcs $@ $^
 
-# M10: generated font table + the two sources that consume it
-$(BLD)/font8x16.h: tools/gen_font.py
-	@mkdir -p $(BLD)
-	python3 tools/gen_font.py $@
-
-$(BLD)/fb.o $(BLD)/win.o $(BLD)/input.o: $(BLD)/font8x16.h
-
+# M10: the 8x16 font table is src/font8x16.h, committed (see the host
+# Makefile). No Python, no Pillow, no DejaVu fonts in the image build.
 $(BLD)/%.o: src/%.c $(wildcard include/aios/*.h) $(wildcard src/*.h)
 	@mkdir -p $(BLD)
-	$(CC) $(CFLAGS) -Iinclude -I$(BLD) -MMD -c -o $@ $<
+	$(CC) $(CFLAGS) -Iinclude -MMD -c -o $@ $<
 
 $(BLD)/aios-init: $(BOOT_DIR)/init.c $(LIB)
 	$(CC) $(CFLAGS) -Iinclude -o $@ $< $(LIB) $(LDFLAGS)

@@ -30,7 +30,7 @@ Every claim below is backed by a command that ran green in this tree.
   `bochs`) -> input (`evdev`, `virtio_input`).
 - `aios-fb` (`src/fb.c`): double buffer, damage-rect merging, 32bpp
   blits, 8x16 glyphs from the generated DejaVu Sans Mono table
-  (`tools/gen_font.py` -> `font8x16.h`), `.aiosimg` loader, procedural
+  (`tools/gen_font.py` -> `src/font8x16.h`, committed), `.aiosimg` loader, procedural
   fallbacks for every ASSETS.md asset (wallpaper, logo, 8 icons,
   cursor).
 - Window core (`src/win.c`): z-order, focus, title bars with close
