@@ -87,7 +87,39 @@ first (build the descriptor, ignore it) with tests, then gate on it in M2.
 
 ---
 
-## M2 — `policy_eval()` — fail-closed law table · **M** · closes G1
+## M2 — `policy_eval()` — fail-closed law table · **M** · closes G1 — ✅ **DONE 2026-11-17**
+
+> `include/aios/policy.h` + `src/policy.c`, **169 checks**; the shell gate now
+> asks policy for **every** command and obeys the verdict. `policy` and
+> `policy check <kind> <target>` make the table readable at the console.
+>
+> **Enforced in the documented order** (policy_engine.interface.md §3), one
+> function per step: schema → tier 0 → sandbox → tier 1 → rollback → advisory →
+> verdict. Tier 0 **binds the human too**: the audit log, the law and PID 1's
+> socket are refused for *every* origin (verified end-to-end).
+>
+> **Purity is real, and making it real found an M1 defect:** the evaluator took
+> `now_ms` as a parameter but `aios_action_is_valid()` read the clock anyway, so
+> "pure" was aspiration. Added `aios_action_is_valid_at()`. A pure function that
+> calls an impure one is just a function that is usually reproducible.
+>
+> **Bugs the tests found (not code review):**
+> 1. Requirements were discarded — steps 5/6 built fresh decisions, so
+>    `needs_rollback` vanished from the final verdict. Now accumulated via
+>    `inherit()`.
+> 2. Policy read only **declared** effects, so a path that *could not be
+>    declared* (a `..` component is refused by M1) left the set empty and
+>    passed. Step 2 now inspects the path the action **carries** as well as the
+>    one it claims.
+> 3. Only `fs.write` was gated; delete/agent had no verdict at all.
+> 4. Reason quality: a delete reported the sandbox rule instead of
+>    `R_DESTRUCTIVE`, sending readers after the wrong problem.
+>
+> **Still not real:** no capability *issuance* (the list is compiled in), no
+> Tier 1 time-bound overrides, no emergency-mode producer, no sandbox-result
+> comparison (M4). `rollback_available` is hard-wired to 0 because no snapshot
+> store exists (M5) — that is why destructive machine actions still stop at a
+> human.
 
 **Goal.** A pure function that turns a descriptor into `ALLOW / DENY /
 NEEDS_HUMAN`, with a machine-readable reason code.

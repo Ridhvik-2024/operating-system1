@@ -77,7 +77,7 @@ AI-OS 1.1.0-m10 (v1.1 desktop)
 [init] durable: this is boot #N for this data disk      <- real persistence
 [init] autopilot governor: pid N (mode balanced)        <- the closed loop
 [init] phase 1/2: AI-OS selftest (M1-M8 unit + integration suite)
-  ... 12 suites ...
+  ... 13 suites ...
 AIOS-SELFTEST: PASS
 [init] phase 2/2: system bring-up via aiosh (AI shell)
 lm: class=bg conf=1.00 (micro-lm)                       <- the OS's own LM

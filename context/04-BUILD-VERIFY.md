@@ -155,7 +155,7 @@ find in ten minutes. Fix the strings as you touch the files.
 
 ```bash
 # 1. clean build (after committing font8x16.h, or with Pillow available)
-cd source && make && make test          # expect 12/12
+cd source && make && make test          # expect 13/13
 
 # 2. bootable image
 bash boot/fetch.sh                      # kernel + busybox + modules (~60 MB, once)

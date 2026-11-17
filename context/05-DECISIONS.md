@@ -157,3 +157,40 @@ reading it.
 (which is a mismatch the diff will flag, not a silent pass).
 **Reverse if:** a tool ever needs per-invocation effects that cannot be derived
 from its args — then extend the table, do not move the logic out.
+
+## D12 — 2026-11-17 — The law is compiled in; there is no law file
+`src/policy.c` holds a `const` table. No file, no env var, no config, no
+override verb (`policy` is read-only; there is deliberately no `policy allow`).
+**Why:** a constitution that a dropped file or an exported variable can edit is
+not a constitution. The only way to change what is permitted is to change the
+source and ship an image — which means the change is reviewed, attributed and
+in the audit trail by construction.
+**Cost:** no per-site policy tuning, no hotfix for a bad rule, no enterprise
+"custom rules" story. Every change is a release.
+**Reverse if:** a genuine multi-tenant product needs per-tenant law — then it
+must become *signed, versioned policy bundles with the signature check in PID 1*,
+never a writable file. Do not start with "just read /etc/policy.conf".
+
+## D13 — 2026-11-17 — Tier 0 binds the human; tier 1 does not
+The audit log, the law itself and PID 1's socket are refused for **every**
+origin, including a human who typed the command. Everything else distinguishes
+human from machine: delete, bulk change and >1 write stop at a human when the
+machine proposes them, and are allowed when a person asks.
+**Why:** the first rule is what keeps the system auditable at all — if anyone
+can edit the log, no other guarantee can be checked. The second is what makes
+origin tagging mean something: if a human's explicit command were gated the same
+way, the gate would be theatre people learn to click through.
+**Cost:** a human cannot repair a corrupt audit log from inside the shell. That
+is intended: repair is an out-of-band, physical act.
+**Reverse if:** never for tier 0. For tier 1, if a deployment needs a policy that
+binds humans too, add a rule with a documented reason — do not widen tier 0.
+
+## D14 — 2026-11-17 — Purity is a parameter, not a promise
+`aios_policy_eval()` takes `now_ms`; it may not read the clock. Making that true
+required splitting `aios_action_is_valid_at()` out of `aios_action_is_valid()`.
+**Why:** "deterministic" and "side-effect free" are testable properties only if
+every input is an argument. A pure function that calls an impure one is a
+function that is usually reproducible, which is worse than one that admits it.
+**Cost:** every caller passes a clock; tests pass 0 to mean "no clock".
+**Reverse if:** never. If a rule genuinely needs wall time (it does not today),
+pass it in.

@@ -103,7 +103,7 @@ skipping the sandbox in a tool · a new dependency · "just disable the test".
 | Phase | Status |
 |---|---|
 | 0 hygiene | **`H1`-`H6` all DONE** |
-| 1 mediator | **`M1` DONE** — next is `M2` (policy table) |
+| 1 mediator | **`M1` + `M2` DONE** — next is `M3` (staging/diff) |
 | 2 OS honesty | not started |
 | 3 Linux underneath | not started |
 | 4 desktop | not started (cards ready) |

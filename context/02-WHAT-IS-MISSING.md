@@ -14,12 +14,21 @@ Measured against that: **the shipped OS violates it today**, because the
 mechanisms it mandates do not exist. These are the constitution-level
 statements, each followed by the measured reality.
 
-### G1 — Policy engine: MISSING · **S1**
+### G1 — Policy engine: **IMPLEMENTED (M2, 2026-11-17)** · was S1
 - **Claim** (`policy_engine.interface.md`): deterministic, side-effect-free,
   fail-closed evaluator of Tier 0/1/2 laws, host-controlled, non-introspectable.
-- **Reality**: `grep -ri "policy"` over `src/` finds only autopilot and scheduler
-  policy. There is **no evaluator, no rule representation, no law file, no
-  verdict type**. Any tool call the shell can parse simply runs.
+- **Reality at audit time**: `grep -ri "policy"` over `src/` found only
+  autopilot and scheduler policy. There was **no evaluator, no rule
+  representation, no verdict type**. Any tool call the shell could parse ran.
+- **Now (M2)**: `aios_policy_eval()` in `src/policy.c` — pure, fail-closed,
+  compiled-in table, evaluated in the documented order, asking for a verdict on
+  every command the shell runs. Tier 0 binds the human. `policy` prints the law
+  and `policy check` explains a verdict, because a gate nobody can explain is
+  one people route around.
+- **Still missing for the claim to be fully true**: capability *issuance* (the
+  grant list is compiled in), Tier 1 time-bound overrides, an emergency-mode
+  producer, and the sandbox-result comparison (G3/M4). Rollback feasibility is
+  reported but nothing can satisfy it until G4/M5.
 - **Fix (smallest honest version)**: `src/policy.c` with a fixed, compiled-in
   rule table (`(action_kind, path_class, class) → ALLOW|DENY|NEEDS_HUMAN`) and
   a `policy_eval(action_descriptor*) → verdict` that is pure and unit-tested.

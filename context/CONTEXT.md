@@ -2,26 +2,29 @@
 
 ## RESUME FROM HERE (read this block first)
 
-1. The OS **works**: 10 milestones, **12 test suites**, a bootable QEMU image with
+1. The OS **works**: 10 milestones, **13 test suites**, a bootable QEMU image with
    our own PID 1, cgroups/eBPF/Landlock, autopilot, a 12 KB micro-LM, durable
    ext2 store, and a framebuffer desktop.
-2. The **constitution is half-built**: the action descriptor exists and gates
-   every command (`M1`, done), but there is still no policy engine, sandbox
-   diff, staging, snapshot, rollback, capability or hash-chained audit (G1,
-   G3–G9 in `02-WHAT-IS-MISSING.md`). A descriptor is a **choke point, not an
-   enforcer**: nothing is *denied* yet, only malformed. Do not describe the OS
-   as "safe" or "governed" until G1 exists.
-3. The next milestone is **M2, `policy_eval()`** — the fail-closed law table
-   that turns the descriptor into a verdict, then staging/diff → promote/
-   rollback → audit (M3–M8), then namespaces/overlayfs/seccomp-notify underneath
-   (`03-LINUX-INTEGRATION.md`, Phase L1→L2). That is
+2. The **constitution now has a spine but no muscles**: the descriptor (`M1`)
+   and the law table (`M2`) exist, and the shell obeys both — tier 0 binds the
+   human, destructive machine actions stop at a human, and every verdict carries
+   a reason. What is still missing: staging/diff (G4/M3), sandbox-result
+   comparison (G3/M4), snapshots and rollback (G5/M5), the hash-chained audit
+   (G8/M6), origin persistence (G6/M7), and capability *issuance* — the grant
+   list is compiled in, so "capability" today means "a constant in the binary".
+   Do not call the OS "safe" or "governed" yet; call it **mediated**.
+3. The next milestone is **M3, staging + diff + promote/discard** — the
+   overlay that makes a write reversible instead of immediate, then M4 (the
+   worker reports what it actually did), M5 (snapshots/rollback), M6 (hash
+   chain), M7 (origin), M8 (the promote/reject UX). Underneath it all:
+   namespaces/overlayfs/seccomp-notify (`03-LINUX-INTEGRATION.md`, L1→L2). That is
    **W0-B** of `ROADMAP-TO-WINDOWS.md`, which is the map to desktop parity
    (W0 base → W1 platform → W2 shell → W3 apps+SDK → W4 hardware → W5 users).
 4. Before coding: confirm `make && make test` is green using the traps in
    `CONTEXT.agent.md`. **CI now enforces this** (`.github/workflows/ci.yml`:
    build with `-Werror`, tests on 22.04 + 24.04, and the two-boot QEMU durable
    proof) — a red run is the first thing to read, not a local guess. Host suite
-   is 12/12; the only SKIPs are Landlock/eBPF/cgroup, which need privileges a
+   is 13/13; the only SKIPs are Landlock/eBPF/cgroup, which need privileges a
    runner does not grant (the boot job covers them in-OS).
 5. Do not edit the constitution documents (`os_sys_decided.md` + the four
    contracts). They change only by an explicit new-major-version decision.
@@ -161,8 +164,8 @@ code**. Treat them as the constitution, not as a spec that was implemented.
   because virtio-gpu's scanout never reached the QEMU surface under `-display none`.
 
 ### 4.10 Tests
-- 12 suites, **592 `CHECK`s** (measured): `action agent aiproc autopilot durable fb json
-  kernel mem sandbox sembus shell`. In-tree boot logs record **11 passed, 0 failed**
+- 13 suites, **774 `CHECK`s** (measured): `action agent aiproc autopilot durable fb json
+  kernel mem policy sandbox sembus shell`. In-tree boot logs record **11 passed, 0 failed**
   (they predate M1's `test_action`)
   (including `test_fb` 89 checks). The same suites run **inside the booted OS**.
 
