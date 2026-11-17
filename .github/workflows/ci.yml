@@ -152,8 +152,11 @@ jobs:
           make -f boot/Makefile boot-image 2>&1 | tee /tmp/build.log
           rc=${PIPESTATUS[0]}
           if [ "$rc" -ne 0 ]; then
-            echo "::error::image build failed (rc=$rc)"
             tail -25 /tmp/build.log
+            # The tail, on ONE line, as an annotation -- the same lesson the boot
+            # proof taught: the answer is in the output, but nobody clicks for it.
+            flat=$(tail -12 /tmp/build.log | tr -s ' \n' '  ' | cut -c1-700)
+            echo "::error::image build failed (rc=$rc) :: $flat"
           fi
           exit "$rc"
 
@@ -171,5 +174,6 @@ jobs:
           path: |
             source/boot/build/*.log
             source/boot/build/data.img
+            /tmp/build.log
           if-no-files-found: ignore
           retention-days: 7
