@@ -114,45 +114,45 @@ echo "------------------------------------------"
 # failed job nobody diagnoses. Echo the reason into the job itself as an
 # annotation, and quote the selftest lines that failed -- they name the suite and
 # the assertion, which is the whole answer.
+# The serial log is CRLF, always ends with blank lines, and interleaves kernel
+# dmesg with our own output. Every previous version of this function tried to be
+# clever about which lines to show; all of them printed nothing, because
+# "the last four non-kernel lines" are blank. Show the plain truth instead.
+meaningful() {
+    tr -d '\r' < "$1" 2>/dev/null \
+        | grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\]' \
+        | grep -vE '^[[:space:]]*$'
+}
+
 explain() {
     log=$1; what=$2
     echo "  MISS $what"
     if [ ! -s "$log" ]; then
         echo "  --- $log is missing or empty ---"
-        echo "::error title=boot test::$what -- $log is missing or empty (qemu never wrote it)"
+        [ -n "$GITHUB_ACTIONS" ] && \
+            echo "::error title=boot test::$what -- $log is missing or empty (qemu never wrote it)"
         fail=1
         return
     fi
-    lines=$(wc -l < "$log" 2>/dev/null)
-    ours=$(grep -vcE '^\[[[:space:]]*[0-9]+\.[0-9]+\]' "$log" 2>/dev/null)
-    lines=${lines:-0}; ours=${ours:-0}
-    # The log we are given is the artifact's copy, which may itself be empty.
-    # Fall back to the one qemu wrote, so a truncated artifact does not hide a
-    # usable log sitting on disk next to it.
-    if [ "$lines" -eq 0 ] 2>/dev/null && [ -s "${log##*/}" ]; then
-        log=${log##*/}
-        lines=$(wc -l < "$log"); ours=$(grep -vcE '^\[[[:space:]]*[0-9]+\.[0-9]+\]' "$log")
-        echo "  --- artifact copy was empty; using $log ($lines lines) ---"
-    fi
-    echo "  --- $log: $lines lines, $ours from our programs ---"
-    if [ "$ours" -le 1 ] 2>/dev/null; then
-        # Only kernel chatter: our init never printed. The interesting line is the
-        # last kernel one, which is usually the panic or the missing device.
-        panic=$(grep -iE 'panic|not found|No such|error|failed' "$log" 2>/dev/null \
-                | tail -2 | tr '\n' ' ' | tr -s ' ' | cut -c1-300)
-        echo "  --- kernel only; tail: ---"
-        tail -4 "$log" | sed 's/^/    | /'
-        if [ -n "$GITHUB_ACTIONS" ]; then
-            echo "::error title=boot test::our init never printed (kernel-only log). ${panic:+Kernel says: $panic}"
-        fi
+
+    total=$(wc -l < "$log" 2>/dev/null); total=${total:-0}
+    ours=$(meaningful "$log" | wc -l); ours=${ours:-0}
+    echo "  --- $log: $total lines, $ours of ours ---"
+
+    # Always show something. Prefer our output; if there is none, show the tail of
+    # the raw log, which is where a panic or a missing device would be.
+    if [ "$ours" -gt 0 ]; then
+        body=$(meaningful "$log" | tail -15)
     else
-        echo "  --- last lines from our programs ---"
-        grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\]' "$log" | tail -12 | sed 's/^/    | /'
-        if [ -n "$GITHUB_ACTIONS" ]; then
-            detail=$(grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\]' "$log" \
-                     | tail -4 | tr '\n' ' ' | tr -s ' ' | cut -c1-400)
-            echo "::error title=boot test::missed: $what -- $detail"
-        fi
+        body=$(tr -d '\r' < "$log" | grep -vE '^[[:space:]]*$' | tail -8)
+    fi
+    printf '%s\n' "$body" | sed 's/^/    | /'
+
+    if [ -n "$GITHUB_ACTIONS" ]; then
+        # One line, and never empty: an annotation that says only "missed:" has
+        # cost four CI cycles on this change alone.
+        flat=$(printf '%s' "$body" | tr '\n' ' ' | tr -s ' ' | cut -c1-500)
+        echo "::error title=boot test::missed $what :: $flat"
     fi
     fail=1
 }
