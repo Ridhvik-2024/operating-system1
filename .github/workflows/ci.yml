@@ -1,0 +1,147 @@
+name: ci
+
+# AI-OS build + test.
+#
+# What this proves, and why it matters: until now the repo's own claim
+# ("make && make test passes") was unenforced, and two real breakages shipped
+# silently - a `struct sched_param` redefinition on glibc >= 2.36 that stopped
+# `make` entirely, and a missing generated font header that needed Pillow.
+#
+# Layers:
+#   build      - compile every translation unit with -Werror (fast, always runs)
+#   test       - build + run all 11 suites on two Ubuntu generations
+#                (24.04 is the glibc 2.36+ machine that caught the sched_param bug)
+#   boot       - build the bootable image and run the two-boot durable proof
+#                (boot-test.sh). Needs ~60 MB of fetched kernel/busybox/modules
+#                and QEMU in TCG mode; ~10 min.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (warnings are errors)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc make
+          gcc --version | head -1
+
+      - name: compile every translation unit
+        working-directory: source
+        # The v1.0 hardening flag set from Makefile, plus -Werror.
+        run: |
+          set -euo pipefail
+          CFLAGS="-std=c11 -O2 -Wall -Wextra -Wshadow -Wformat -Wformat-security \
+                  -fstack-protector-strong -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE -Werror"
+          mkdir -p /tmp/objs
+          n=0
+          for f in src/*.c apps/*.c; do
+            cc $CFLAGS -Iinclude -c -o "/tmp/objs/$(basename "$f" .c).o" "$f"
+            n=$((n + 1))
+          done
+          cc $CFLAGS -Iinclude -c -o /tmp/objs/init.o boot/init.c
+          echo "== $n library/app translation units + boot/init.c: 0 warnings =="
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.04 = older glibc; 24.04 = glibc >= 2.36, where struct sched_param
+        # is defined by both <sched.h> and <linux/sched/types.h>.
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc make
+
+      - name: make
+        working-directory: source
+        run: make -j"$(nproc)"
+
+      - name: make test
+        working-directory: source
+        # KNOWN, DOCUMENTED SKIPS (not failures):
+        #   test_kernel  - Landlock / eBPF / cgroup writes need privileges the
+        #                  GitHub runner does not grant; the suite SKIPs those
+        #                  checks and asserts what it can. It proves the rest
+        #                  inside the booted OS instead (see the boot job).
+        #   test_autopilot - /proc/aios is absent without the kernel module.
+        # Anything else failing is a real regression.
+        run: |
+          set -o pipefail
+          make test 2>&1 | tee /tmp/test.log
+          echo "--- summary ---"
+          grep -E "^== [0-9]+ passed" /tmp/test.log
+
+      - name: upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.os }}
+          path: |
+            source/build/last_test.log
+            /tmp/test.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  boot:
+    name: boot (two-boot durable proof)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc make xz-utils qemu-system-x86 curl python3
+
+      - name: fetch kernel, busybox and modules
+        working-directory: source
+        # boot/dl/ holds the kernel + busybox + storage/GPU modules, but NOT the
+        # kernel header tree the LKM builds against (kern-dev), so fetch.sh has
+        # to run in CI. It is idempotent: existing files are reused.
+        run: bash boot/fetch.sh
+
+      - name: build the image
+        working-directory: source
+        # The size guard in boot/Makefile fails the build if the initramfs
+        # exceeds the pinned cap (boot/.m10-size-cap).
+        run: make -f boot/Makefile boot-image
+
+      - name: two boots on one disk (M8 durable proof)
+        working-directory: source
+        env:
+          AIOS_BOOT_TIMEOUT: "420"   # TCG, not KVM: give it room
+        run: bash boot/boot-test.sh
+
+      - name: upload serial logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serial-logs
+          path: |
+            source/boot/build/*.log
+            source/boot/build/data.img
+          if-no-files-found: ignore
+          retention-days: 7

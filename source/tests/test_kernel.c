@@ -200,6 +200,14 @@ static void run(void) {
         (void)!system("mkdir -p build/ll-jail");
         FILE *f = fopen("build/ll-jail/inside.txt", "w");
         if (f) { fputs("in", f); fclose(f); }
+        /* The outside path must EXIST and be outside the jail, or the kernel
+         * answers ENOENT before any LSM gets a say - which is not a denial.
+         * /etc/passwd exists on every Linux host and in the image; the old
+         * code used /sbin/aiosh, which only exists inside the image, so this
+         * check failed on every host for the wrong reason. */
+        if (access("/etc/passwd", R_OK) != 0) {
+            SKIP("landlock: no outside file to probe (/etc/passwd missing)");
+        } else {
         pid_t p = fork();
         if (p == 0) {
             if (chdir("build") != 0) _exit(3);
@@ -210,7 +218,7 @@ static void run(void) {
             int ok_in = (fd >= 0);
             int in_err = errno;
             if (fd >= 0) close(fd);
-            int fd2 = open("/sbin/aiosh", O_RDONLY); /* outside: must fail */
+            int fd2 = open("/etc/passwd", O_RDONLY); /* outside: must fail */
             int out_err = errno;
             int blocked_out = (fd2 < 0 && (errno == EACCES || errno == EPERM));
             if (fd2 >= 0) close(fd2);
@@ -225,6 +233,7 @@ static void run(void) {
         } else {
             CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0,
                   "landlock: jail readable, /etc/passwd blocked");
+        }
         }
     }
 
