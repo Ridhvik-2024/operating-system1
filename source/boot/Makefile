@@ -28,7 +28,19 @@ LIB_SRCS  := src/json.c src/types.c src/aiproc.c src/sembus.c \
 	     src/microlm.c src/autopilot.c src/durable.c \
 	     src/fb.c src/win.c src/input.c
 LIB       := boot/build/libaios.a
-TEST_BINS := $(patsubst tests/%.c,boot/build/%,$(wildcard tests/test_*.c))
+# Host-only tests: they need /dev/shm or a compiler, or they would have to write
+# outside the image to test anything. Excluded from the IMAGE (not from
+# `make test`, where they run) so the size guard buys product, not harness.
+#
+# test_supervisor is the interesting one: it starts a supervisor of its own. In
+# the image PID 1 already serves that socket, and the suite's request budget and
+# socket path would fight it -- so the image skips it and the host runs it.
+# An exclusion has to be argued for, which is why it is named here and not a
+# wildcard.
+HOST_ONLY_TESTS := test_supervisor
+TEST_BINS := $(patsubst tests/%.c,boot/build/%,$(filter-out \
+              $(addprefix tests/,$(addsuffix .c,$(HOST_ONLY_TESTS))), \
+              $(wildcard tests/test_*.c)))
 # The M4 adversary ships with the image: test_shell and test_effects run inside
 # the booted system, and the image has no compiler to build it there.
 FIXTURE_BINS := boot/build/liar-worker boot/build/deaf-worker
