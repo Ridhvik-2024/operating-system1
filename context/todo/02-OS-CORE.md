@@ -12,7 +12,7 @@ happened, and how do we undo it.*
 
 ## M1 — Action Descriptor (`aios_action`) · **M** · closes G2 — ✅ **DONE 2026-11-17**
 
-> `include/aios/action.h` + `src/action.c`, `tests/test_action.c` (119 checks).
+> `include/aios/action.h` + `src/action.c`, `tests/test_action.c` (129 checks).
 > Every command in `shell.c` now passes through `action_gate()`; both the typed
 > (HUMAN) and routed (AI) paths are verified against the running shell, with the
 > descriptor captured on `sh.action.{accept,refused}`.
@@ -31,6 +31,13 @@ happened, and how do we undo it.*
 >
 > **Deliberately not done:** nothing is *blocked* yet. Validation refuses
 > malformed descriptors; denying legitimate-but-forbidden ones is `M2`.
+>
+> **Hardening found by probing it afterwards:** a path too long to record was
+> silently truncated into the declared effect (the record then named a
+> different resource than the one touched) and a failed declaration was
+> ignored. Both now fail closed - refuse, with the reason. `effects_complete`
+> means UNKNOWN when 0, which is why the refusal lives at the call site and not
+> in `is_valid()` (agents cannot enumerate effects until they plan).
 
 **Goal.** One type that represents *any* AI-proposed action, before it happens.
 

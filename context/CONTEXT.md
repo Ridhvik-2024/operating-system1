@@ -161,7 +161,7 @@ code**. Treat them as the constitution, not as a spec that was implemented.
   because virtio-gpu's scanout never reached the QEMU surface under `-display none`.
 
 ### 4.10 Tests
-- 12 suites, **579 `CHECK`s** (measured): `action agent aiproc autopilot durable fb json
+- 12 suites, **592 `CHECK`s** (measured): `action agent aiproc autopilot durable fb json
   kernel mem sandbox sembus shell`. In-tree boot logs record **11 passed, 0 failed**
   (they predate M1's `test_action`)
   (including `test_fb` 89 checks). The same suites run **inside the booted OS**.
