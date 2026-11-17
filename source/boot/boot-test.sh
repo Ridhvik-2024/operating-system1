@@ -150,9 +150,13 @@ explain() {
 
     # The lines that answer the question, wherever they are in the log. Booting
     # is chatty by design, so "the last fifteen lines" lands after the answer.
+    # Two lines per thing that matters: the SELFTEST verdict AND the assertions
+    # it printed underneath. A suite that fails says why on the lines after its
+    # name, and those lines are the whole answer -- dropping them because they do
+    # not match /SELFTEST/ is how this took three cycles.
     marks=$(tr -d '\r' < "$log" 2>/dev/null \
-            | grep -E 'SELFTEST|selftest|phase [0-9]|AIOS-BOOT-OK|AIOS-DUR|panic|BUG:' \
-            | grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\] SELFTEST' | head -12)
+            | grep -E 'SELFTEST|selftest|^ +FAIL |phase [0-9]|AIOS-BOOT-OK|AIOS-DUR|panic|BUG:' \
+            | grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\] SELFTEST' | head -20)
     if [ -n "$marks" ]; then
         echo "  --- selftest / phase markers ---"
         printf '%s\n' "$marks" | sed 's/^/    | /'
