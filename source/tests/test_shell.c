@@ -290,12 +290,48 @@ static void shell_tests(void) {
     CHECK(r.status == 1 && strstr(r.error, "quote"), "unterminated quote");
     sh_result_free(&r);
 
-    /* ---- exit ---- */
+    /* M1: a command whose effects cannot be declared must be REFUSED, and the
+     * file must not appear in the jail. This is the fail-closed path: before
+     * M1, an over-long path was truncated into the declared effect (naming a
+     * different resource than the one touched) and the write went ahead. */
+    {
+        char *longline = (char *)malloc(1024);
+        if (longline) {
+            /* width on %d pads with SPACES, not zeros - build the path by
+             * hand so it is a single long token, not 700 spaces */
+            memset(longline, 0, 1024);
+            /* "fs.write path=" is 14 bytes - copying 15 would include its
+             * NUL and leave the path empty (which fails for the wrong
+             * reason: the tool sees a missing path, not a long one). */
+            memcpy(longline, "fs.write path=", 14);
+            memset(longline + 14, 'a', 700);
+            strcpy(longline + 14 + 700, " content=x");
+            run(longline, &r);
+            CHECK(r.status != 0, "over-long path is refused");
+            CHECK(strstr(r.error ? r.error : "", "refused") != NULL,
+                  "the refusal says so");
+            sh_result_free(&r);
+            /* and nothing was written: the jail has no 700-char name */
+            FILE *jf = NULL;
+            char cmd[600];
+            snprintf(cmd, sizeof cmd,
+                     "ls build/test-shell/jail | awk '{print length($0)}' "
+                     "| sort -rn | head -1");
+            char best[32] = {0};
+            jf = popen(cmd, "r");
+            if (jf) { if (fgets(best, sizeof best, jf)) { } pclose(jf); }
+            CHECK(atoi(best) < 700, "no over-long file was created in the jail");
+            free(longline);
+        }
+    }
+
+    sh_result_free(&r);
+
+    /* ---- exit (last: it makes the shell want to terminate) ---- */
     run("exit", &r);
     CHECK(r.status == 0 && strstr(r.text, "bye"), "exit builtin");
     sh_result_free(&r);
 
-    sh_result_free(&r);
     sh_free(sh);
     sh = NULL;
 }

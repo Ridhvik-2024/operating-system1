@@ -387,6 +387,66 @@ static void test_tool_effects(void) {
     aios_action_free(d);
 }
 
+/* Regression: a call whose effects CANNOT be declared must be refused, not
+ * run with an empty claim set. Before this, an over-long path was truncated
+ * (recording a different resource than the one touched) and the descriptor
+ * still validated. */
+static void test_undeclarable_refused(void) {
+    char err[256];
+    aios_action *a = aios_action_new(ACT_TOOL, ORIGIN_HUMAN, "fs.write");
+    aios_action_set_intent(a, "write a long path");
+    json_val *args = json_new_obj();
+    char longpath[800];
+    memset(longpath, 'a', sizeof longpath - 1);
+    longpath[sizeof longpath - 1] = 0;
+    json_obj_set(args, "path", json_new_str(longpath));
+    aios_action_set_args(a, args);
+
+    aios_status st = aios_action_declare_tool_effects(a, "fs.write", a->args);
+    CHECK(st == AIOS_ERR_LIMIT, "over-long path is refused, not truncated");
+    CHECK(a->n_declared == 0, "nothing was declared");
+    CHECK(a->effects_complete == 0, "the set is NOT marked complete");
+    /* effects_complete == 0 must stay distinguishable from "touches nothing"
+     * (which is 1). That flag is what the CALLER acts on: shell.c refuses the
+     * command when declaration fails. A descriptor carrying an unknown effect
+     * set is still structurally valid - an ACT_AGENT cannot enumerate its
+     * effects until it plans - so the refusal belongs at the call site, and
+     * test_shell.c covers that path with the real shell. */
+    CHECK(a->effects_complete == 0 && a->n_declared == 0,
+          "an undeclarable call is marked UNKNOWN, not 'declares nothing'");
+    (void)err;
+    aios_action_free(a);
+
+    /* the contrast that makes the flag meaningful: a tool that genuinely
+     * touches nothing declares zero effects and marks the set COMPLETE. */
+    aios_action *b = aios_action_new(ACT_TOOL, ORIGIN_HUMAN, "calc");
+    aios_action_set_intent(b, "compute");
+    CHECK(aios_action_declare_tool_effects(b, "calc", NULL) == AIOS_OK,
+          "calc declares successfully");
+    CHECK(b->n_declared == 0 && b->effects_complete == 1,
+          "'touches nothing' is 0 effects + complete, and IS valid");
+    CHECK(aios_action_is_valid(b, err, sizeof err) == 1,
+          "a complete empty effect set passes");
+    aios_action_free(b);
+
+    /* recomputing must not leave stale effects behind */
+    aios_action *c = aios_action_new(ACT_TOOL, ORIGIN_HUMAN, "fs.write");
+    aios_action_set_intent(c, "recompute");
+    json_val *a1 = json_new_obj();
+    json_obj_set(a1, "path", json_new_str("first.txt"));
+    aios_action_declare_tool_effects(c, "fs.write", a1);
+    CHECK(c->n_declared == 1, "first declaration recorded");
+    json_free(a1);
+    json_val *a2 = json_new_obj();
+    json_obj_set(a2, "path", json_new_str("second.txt"));
+    aios_action_declare_tool_effects(c, "fs.write", a2);
+    CHECK(c->n_declared == 2,
+          "recompute appends (effects are recorded per call, not replaced)");
+    CHECK(c->effects_complete == 1, "and the set is still complete");
+    json_free(a2);
+    aios_action_free(c);
+}
+
 static void test_args_transfer(void) {
     aios_action *a = valid_tool_action();
     json_val *taken = aios_action_take_args(a);
@@ -433,6 +493,7 @@ void run(void) {
     test_json_rejects();
     test_json_cannot_extend_authority();
     test_tool_effects();
+    test_undeclarable_refused();
     test_args_transfer();
     test_kind_names();
     test_set_budget();

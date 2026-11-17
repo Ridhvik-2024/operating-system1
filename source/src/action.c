@@ -161,32 +161,47 @@ aios_status aios_action_add_effect(aios_action *a, const char *effect) {
  * Note what these are NOT: they are not permissions. A tool that touches
  * nothing declares nothing and still runs; a tool that touches a path
  * declares it and is then held to it by the M4 diff. */
+/* Declare one "verb:path" effect for a path taken from tool args.
+ *
+ * The path comes from the call, NOT from the wrapper: an over-long path must
+ * be declared as accurately as the field allows or refused. It must never be
+ * silently truncated, because then the record would name a DIFFERENT resource
+ * from the one that gets touched - exactly the lie this type exists to catch.
+ * An over-long path is therefore AIOS_ERR_LIMIT (refuse, do not round). */
+static aios_status declare_path_effect(aios_action *a, const char *verb,
+                                       const char *path) {
+    if (!path || !*path) return AIOS_OK;         /* nothing to declare */
+    size_t need = strlen(verb) + 1 + strlen(path);
+    if (need > AIOS_ACTION_MAX_EFFECT) return AIOS_ERR_LIMIT;
+    char eff[AIOS_ACTION_MAX_EFFECT + 1];
+    snprintf(eff, sizeof eff, "%s:%s", verb, path);
+    return aios_action_add_effect(a, eff);
+}
+
 aios_status aios_action_declare_tool_effects(aios_action *a, const char *tool,
                                              const json_val *args) {
     if (!a || !tool) return AIOS_ERR_ARG;
+    /* Never trust a previous claim to stand: recompute from scratch so that
+     * calling this twice cannot leave stale effects from the first call. */
+    a->effects_complete = 0;
 
     aios_status st = AIOS_OK;
+    const char *p = args ? json_str(json_obj_get(args, "path")) : NULL;
+
     if (strcmp(tool, "fs.read") == 0 || strcmp(tool, "fs.list") == 0) {
-        const char *p = args ? json_str(json_obj_get(args, "path")) : NULL;
-        if (p && *p) {
-            char eff[AIOS_ACTION_MAX_EFFECT];
-            snprintf(eff, sizeof eff, "read:%.500s", p);
-            st = aios_action_add_effect(a, eff);
-        }
+        st = declare_path_effect(a, "read", p);
     } else if (strcmp(tool, "fs.write") == 0) {
-        const char *p = args ? json_str(json_obj_get(args, "path")) : NULL;
-        if (p && *p) {
-            char eff[AIOS_ACTION_MAX_EFFECT];
-            snprintf(eff, sizeof eff, "write:%.500s", p);
-            st = aios_action_add_effect(a, eff);
-        }
+        st = declare_path_effect(a, "write", p);
     }
     /* calc, memory.search, proc.info, selftest.*: no filesystem effect.
      * memory.search reads the store, which the host already owns - it is not
      * an effect on the user's reality. */
 
-    /* We looked at the tool and enumerated everything it can touch, so the
-     * set is complete by construction. */
+    /* The set is complete only if we actually managed to record every effect
+     * we found. On failure we leave effects_complete = 0, which makes the
+     * descriptor INVALID - the gate refuses it. Failing closed matters more
+     * than running the tool: a call whose effects could not be declared is a
+     * call nothing can later check. */
     if (st == AIOS_OK) a->effects_complete = 1;
     return st;
 }
@@ -277,6 +292,13 @@ int aios_action_is_valid(const aios_action *a, char *err, size_t ecap) {
     }
     if (a->n_declared > 0 && !a->effects_complete)
         FAIL("effects declared but the set is not marked complete");
+    /* NOTE: effects_complete == 0 with zero effects is NOT an error here.
+     * An ACT_AGENT proposal genuinely cannot enumerate its effects until it
+     * plans (that is M3/M4's job), and a descriptor parsed from JSON has not
+     * been through declare_tool_effects() yet. Treating "nobody looked" as
+     * "touches nothing" would be worse than treating it as unknown - so the
+     * flag stays meaningful as UNKNOWN, and the CALLER is responsible for
+     * honouring a failed declaration (see the check in shell.c). */
 
     /* 7. an AI action must carry the hash of the human intent it serves.
      *    A human action need not: the human IS the intent. */

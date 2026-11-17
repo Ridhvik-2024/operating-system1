@@ -559,7 +559,19 @@ static int run_tool_stage(sh_shell *sh, const char *name, sargv *a,
     }
     aios_action_set_intent(act, raw_line ? raw_line : name);
     aios_action_set_args(act, args);
-    aios_action_declare_tool_effects(act, name, act->args);
+    /* If the effects CANNOT be declared (e.g. a path too long to record), we
+     * must not run the call: nothing downstream could then verify what it
+     * touched. Refusing is the fail-closed choice, and the reason is stated
+     * rather than a tool silently executing undeclared. */
+    if (aios_action_declare_tool_effects(act, name, act->args) != AIOS_OK) {
+        stage_text_of(NULL, NULL, text_out);
+        *json_out = NULL;
+        snprintf(err, ecap,
+                 "action refused: effects of %s cannot be declared "
+                 "(path too long to record)", name);
+        aios_action_free(act);
+        return 1;
+    }
     int rc = exec_tool_action(sh, act, text_out, json_out, err, ecap);
     aios_action_free(act);
     return rc;
@@ -1621,7 +1633,20 @@ static int run_command(sh_shell *sh, scmd *c,
         sh_decision_free(&dec);
         return 1;
     }
-    if (act) aios_action_stamp_origin(act, ORIGIN_AI);
+    if (act) {
+        aios_action_stamp_origin(act, ORIGIN_AI);
+        /* The router already attempted declaration; if it failed, drop the
+         * proposal rather than execute something unexaminable. */
+        if (act->n_declared == 0 && act->effects_complete == 0
+            && dec.kind == SH_ROUTE_TOOL) {
+            snprintf(err, ecap,
+                     "action refused: effects of %s cannot be declared",
+                     act->target ? act->target : "?");
+            aios_action_free(act);
+            sh_decision_free(&dec);
+            return 1;
+        }
+    }
 
     switch (dec.kind) {
     case SH_ROUTE_TOOL:
