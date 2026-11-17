@@ -153,8 +153,19 @@ resources it touches, and it sets `effects_complete` because it enumerated them.
 **Why:** if each call site decided its own effects, the claims would drift and
 the M4 declared-vs-actual diff would be meaningless. One table is auditable by
 reading it.
+**Fail closed on the failure path too:** `effects_complete` is set to 1 *only*
+when the enumeration succeeded (`st == AIOS_OK`). If any single effect cannot be
+declared — a path with a `..` component, say — it stays 0, and the shell refuses
+the whole action rather than running it with a partial claim.
 **Cost:** a new tool must be added to that function or its effects are unknown
 (which is a mismatch the diff will flag, not a silent pass).
+**Learned the hard way (M2):** "declared nothing" and "declares nothing truthfully"
+are the same value of `n_declared`, so a policy that inspects only declared
+effects sees a clean, empty set for an action that *could not be declared at
+all*. M1's refusal at the call site is what makes that safe; policy's step 2
+independently inspects the path the action carries, so two independent things
+must be wrong before such an action passes. Never collapse those two cases into
+one boolean.
 **Reverse if:** a tool ever needs per-invocation effects that cannot be derived
 from its args — then extend the table, do not move the logic out.
 
