@@ -117,9 +117,14 @@ echo "------------------------------------------"
 explain() {
     log=$1; what=$2
     echo "  MISS $what"
-    grep -E 'SELFTEST .*FAIL|FAIL tests/|Segmentation|No such file' "$log" 2>/dev/null \
-        | sed 's/^/    | /' | head -6
-    [ -n "$GITHUB_ACTIONS" ] && echo "::error title=boot test::missed: $what"
+    # An annotation is length-limited and single-line, so put the failing
+    # assertion IN it: the log itself is an artifact nobody opens.
+    detail=$(grep -E 'SELFTEST .*FAIL|FAIL tests/|Segmentation|No such file|Trace|assert' \
+                  "$log" 2>/dev/null | head -4 | tr '\n' ' ' | tr -s ' ' | cut -c1-400)
+    [ -n "$detail" ] && echo "    | $detail"
+    if [ -n "$GITHUB_ACTIONS" ]; then
+        echo "::error title=boot test::missed: $what ${detail:+-- $detail}"
+    fi
     fail=1
 }
 
