@@ -67,6 +67,19 @@ static bool jpath(char *out, size_t cap, const char *a, const char *b) {
     return true;
 }
 
+
+/* A path NEXT TO `path`, named `path` + suffix -- e.g. "/a/jail" + ".restore"
+ * is "/a/jail.restore", a sibling, not "/a/jail/.restore" which is a child and
+ * therefore dragged along when the parent is renamed. */
+static bool sibling_path(char *out, size_t cap, const char *path, const char *suffix) {
+    if (!out || cap == 0 || !path || !suffix) return false;
+    size_t lp = strlen(path), ls = strlen(suffix);
+    if (lp + ls + 1 > cap) return false;
+    memcpy(out, path, lp);
+    memcpy(out + lp, suffix, ls + 1);
+    return true;
+}
+
 static void fsync_dir(const char *path) {
     char buf[PATHBUF];
     if (strlen(path) >= sizeof buf) return;
@@ -719,9 +732,22 @@ bool snap_restore(const char *jail, const char *store, const char *id_or_prefix,
     /* Copy out first, into siblings of the targets so the later renames are on
      * one filesystem and therefore atomic. If anything fails here the live trees
      * have not been touched. */
+    /* The staging copies MUST be siblings of their targets. They used to be,
+     * and then the image put the workspace on the ext2 side disk while the
+     * snapshot ran from the initramfs: rename() of a directory across two
+     * filesystems answers EXDEV, and the error -- "cannot move the current jail
+     * aside: Invalid cross-device link" -- reads like a permissions problem
+     * rather than a layout one.
+     *
+     * Siblings make each put-into-place an atomic rename on one filesystem.
+     * `jail` and `store` are absolute by contract, so the parent directory is
+     * well defined. */
     char jrestore[PATHBUF], srestore[PATHBUF];
-    snprintf(jrestore, sizeof jrestore, "%s.restore.%d", jail, (int)getpid());
-    snprintf(srestore, sizeof srestore, "%s.restore.%d", store, (int)getpid());
+    if (!sibling_path(jrestore, sizeof jrestore, jail, ".restore") ||
+        !sibling_path(srestore, sizeof srestore, store, ".restore")) {
+        set_err(err, ecap, "jail or store path too long");
+        return false;
+    }
     rm_rf(jrestore);
     rm_rf(srestore);
 
@@ -744,9 +770,33 @@ bool snap_restore(const char *jail, const char *store, const char *id_or_prefix,
      * rare, and "the thing I just undid is still recoverable" is worth more than
      * the milliseconds. An 8 MiB disk is the real constraint, and prune is the
      * answer to that, not skipping the backup. */
+    /* The replaced state goes NEXT TO the store, not inside it. Inside would put
+     * it on the store's filesystem, and the jail's backup has to be on the
+     * JAIL's filesystem or the rename that preserves it answers EXDEV. Keeping
+     * both backups as siblings of their targets means each is on the same
+     * filesystem as the thing it protects, which is the only arrangement where
+     * "the current state is preserved" is a rename rather than a copy that can
+     * fail half-way. */
     char replaced[PATHBUF];
-    snprintf(replaced, sizeof replaced, "%s/snapshots/.replaced/%lld-%d",
-             store, (long long)aios_now_ms(), (int)getpid());
+    if (!sibling_path(replaced, sizeof replaced, store, ".replaced")) {
+        set_err(err, ecap, "store path too long");
+        rm_rf(jrestore);
+        rm_rf(srestore);
+        return false;
+    }
+    {
+        char stamp[48];
+        snprintf(stamp, sizeof stamp, "%lld-%d",
+                 (long long)aios_now_ms(), (int)getpid());
+        char stamped[PATHBUF];
+        if (!sibling_path(stamped, sizeof stamped, replaced, stamp)) {
+            set_err(err, ecap, "replaced-state path too long");
+            rm_rf(jrestore);
+            rm_rf(srestore);
+            return false;
+        }
+        snprintf(replaced, sizeof replaced, "%s", stamped);
+    }
     if (aios_mkdirs(replaced) != AIOS_OK) {
         set_err(err, ecap, "cannot create %.400s: %s", replaced, strerror(errno));
         rm_rf(jrestore);
@@ -781,7 +831,10 @@ bool snap_restore(const char *jail, const char *store, const char *id_or_prefix,
     /* Now swap. Both replacements happen after both copies exist, so a failure
      * before this point has not touched the live trees at all. */
     char trashjail[PATHBUF], trashstore[PATHBUF];
-    if (!jpath(trashjail, sizeof trashjail, replaced, "old-jail") ||
+    /* Sibling of the JAIL, not under `replaced`: the move of the live jail has
+     * to be a rename on the jail's own filesystem. This is the same EXDEV that
+     * the image's data disk caused, one level deeper. */
+    if (!sibling_path(trashjail, sizeof trashjail, jail, ".old") ||
         !jpath(trashstore, sizeof trashstore, replaced, "old-store")) {
         set_err(err, ecap, "replaced-state path too long");
         rm_rf(jrestore);
@@ -831,7 +884,23 @@ bool snap_restore(const char *jail, const char *store, const char *id_or_prefix,
         return false;
     }
     rm_rf(srestore);
-    rm_rf(trashjail);
+    /* The preserved old jail is moved into the place `replaced_at` promises.
+     * Leaving it as <jail>.old would mean the path we report does not contain
+     * what we said it contains -- and a backup nobody can find is not a backup.
+     * That move IS allowed to be a copy: it is housekeeping after the restore
+     * has already succeeded. */
+    {
+        char kept[PATHBUF];
+        if (jpath(kept, sizeof kept, replaced, "old-jail")) {
+            /* A failure here is not a restore failure: the restore already
+             * happened. It is a lost convenience copy, and the honest thing is to
+             * leave the original in place rather than delete it. */
+            bool kept_ok = copy_tree(trashjail, kept, NULL, NULL, NULL, NULL, 0);
+            if (kept_ok) rm_rf(trashjail);
+        } else {
+            rm_rf(trashjail);
+        }
+    }
     (void)trashstore;
     (void)storeaside;
     return true;

@@ -410,6 +410,59 @@ static void test_survives_reboot(void) {
     CHECK(!exists(ROOT "/rb/jail/after.txt"), "the later addition is gone");
 }
 
+/* ---------------- 8. the store on a DIFFERENT filesystem ---------------- *
+ *
+ * This is the arrangement the real image uses and every test here missed: the
+ * jail lives on the ext2 side disk (/data) and the store can be on the
+ * initramfs, or vice versa. rename() answers EXDEV across filesystems, and the
+ * error reads like a permissions problem.
+ *
+ * /dev/shm is a different filesystem from the source tree on Linux, which makes
+ * this reproducible without root. Where it is not available (or is the same
+ * filesystem) the test says so instead of pretending it ran.
+ */
+static void test_cross_filesystem(void) {
+    printf("store on a different filesystem from the jail\n");
+    const char *jail = ROOT "/xf-jail";
+    const char *store = "/dev/shm/aios-test-snap-xf";
+
+    struct stat a, b;
+    bool have_shm = (stat("/dev/shm", &b) == 0);
+    if (!have_shm) { SKIP("no /dev/shm"); return; }
+    mkdirs(ROOT);
+    if (stat(ROOT, &a) != 0) { SKIP("no test root"); return; }
+    if (a.st_dev == b.st_dev) { SKIP("/dev/shm is the same filesystem"); return; }
+
+    char cmd[512];
+    snprintf(cmd, sizeof cmd, "rm -rf %s", store);
+    (void)!system(cmd);
+    snprintf(cmd, sizeof cmd, "rm -rf %s", jail);
+    (void)!system(cmd);
+    mkdirs(jail);
+    snprintf(cmd, sizeof cmd, "mkdir -p %s", store);
+    (void)!system(cmd);
+
+    write_file(ROOT "/xf-jail/f.txt", "on the data disk\n");
+    CHECK(1, "the two filesystems are different");
+
+    char err[512] = {0};
+    char id[AIOS_SNAP_ID_MAX] = {0};
+    CHECK(snap_take(jail, store, "cross-fs", id, sizeof id, err, sizeof err),
+          "snapshot taken with the store on another filesystem");
+    if (err[0]) printf("      take said: %s\n", err);
+
+    write_file(ROOT "/xf-jail/f.txt", "changed\n");
+    char rerr[512] = {0};
+    CHECK(snap_restore(jail, store, id, NULL, 0, rerr, sizeof rerr),
+          "restore works across filesystems (no EXDEV)");
+    if (rerr[0]) printf("      restore said: %s\n", rerr);
+    CHECK(file_is(ROOT "/xf-jail/f.txt", "on the data disk\n"),
+          "and the old content is back");
+
+    snprintf(cmd, sizeof cmd, "rm -rf %s", store);
+    (void)!system(cmd);
+}
+
 int main(void) {
     printf("== test_snapshot ==\n");
     rmrf(ROOT);
@@ -422,6 +475,7 @@ int main(void) {
     test_prune();
     test_failed_restore_is_atomic();
     test_survives_reboot();
+    test_cross_filesystem();
 
     printf("%s: %d checks, %d failed\n",
            g_failed ? "FAIL" : "PASS", g_checks, g_failed);
