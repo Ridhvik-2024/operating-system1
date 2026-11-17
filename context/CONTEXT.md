@@ -15,7 +15,11 @@
    **W0-B** of `ROADMAP-TO-WINDOWS.md`, which is the map to desktop parity
    (W0 base → W1 platform → W2 shell → W3 apps+SDK → W4 hardware → W5 users).
 4. Before coding: confirm `make && make test` is green using the traps in
-   `CONTEXT.agent.md` (font header, `tool-exec` discovery, glibc `sched_param`).
+   `CONTEXT.agent.md`. **CI now enforces this** (`.github/workflows/ci.yml`:
+   build with `-Werror`, tests on 22.04 + 24.04, and the two-boot QEMU durable
+   proof) — a red run is the first thing to read, not a local guess. Host suite
+   is 11/11; the only SKIPs are Landlock/eBPF/cgroup, which need privileges a
+   runner does not grant (the boot job covers them in-OS).
 5. Do not edit the constitution documents (`os_sys_decided.md` + the four
    contracts). They change only by an explicit new-major-version decision.
 

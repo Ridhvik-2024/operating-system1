@@ -42,7 +42,7 @@ context/
 ├── 05-DECISIONS.md            decision log + 5 open conflicts to resolve
 ├── todo/                      the task lists
 │   ├── 00-MASTER.md           phase plan + index + progress tracker
-│   ├── 01-HYGIENE.md          build/git/docs/CI (H1–H6)
+│   ├── 01-HYGIENE.md          build/git/docs/CI (H1–H6) — all DONE
 │   ├── 02-OS-CORE.md          the mediator M11 (M1–M8) — needs judgement
 │   ├── 03-GUI-TASKS.md        desktop + UI cards → **give these to ChatGPT**
 │   ├── 04-SMALL-TASKS.md      tiny drop-in cards (≤1 h) → ChatGPT too
@@ -51,6 +51,12 @@ context/
 │   └── 07-FREE-TODO-FORMAT.md your own scratch list
 └── prompts/                   named prompts (00-README lists them)
 ```
+
+**Hygiene (H1–H6) is complete.** A clean clone builds with no Python; CI runs
+build (`-Werror`) + tests on two Ubuntu generations + the two-boot QEMU durable
+proof; the repo is Apache-2.0; the docs match the tree; and there is exactly one
+copy of every binary — 31.2 MiB tracked, documented in
+[`../docs/REPO-LAYOUT.md`](../docs/REPO-LAYOUT.md).
 
 ## Delegating a task to ChatGPT (30 seconds)
 
