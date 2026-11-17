@@ -29,6 +29,9 @@ LIB_SRCS  := src/json.c src/types.c src/aiproc.c src/sembus.c \
 	     src/fb.c src/win.c src/input.c
 LIB       := boot/build/libaios.a
 TEST_BINS := $(patsubst tests/%.c,boot/build/%,$(wildcard tests/test_*.c))
+# The M4 adversary ships with the image: test_shell and test_effects run inside
+# the booted system, and the image has no compiler to build it there.
+FIXTURE_BINS := boot/build/liar-worker
 
 BOOT_DIR  := boot
 BLD       := boot/build
@@ -100,9 +103,15 @@ $(BLD)/assets/%.aiosimg: desktop/assets/%.png tools/img2aiosimg.py
 	@mkdir -p $(BLD)/assets
 	python3 tools/img2aiosimg.py $< $@
 
+# A test fixture, built by the same toolchain as everything else and installed
+# next to the tests it belongs to.
+boot/build/liar-worker: tests/fixtures/liar-worker.c
+	@mkdir -p $(BLD)
+	$(CC) $(CFLAGS) -o $@ $<
+
 $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	   $(BLD)/aios-memctl $(BLD)/tool-exec $(BLD)/aios-governor \
-	   $(BLD)/aios-desktop $(TEST_BINS) \
+	   $(BLD)/aios-desktop $(TEST_BINS) $(FIXTURE_BINS) \
 	   $(BOOT_DIR)/aios-selftest.sh $(BOOT_DIR)/boot.aiosh \
 	   $(BOOT_DIR)/devnodes.txt $(KERNEL) $(BUSYBOX) $(BLD)/aios_intent.ko \
 	   $(MODULES) $(GPUMODS) $(ASSETS)
@@ -151,6 +160,7 @@ $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	@install -s -m 0755 $(BLD)/aios-desktop $(STAGE)/sbin/aios-desktop
 	@install -m 0644 $(MODULES) $(STAGE)/lib/modules/
 	@install -s -m 0755 $(TEST_BINS)      $(STAGE)/usr/lib/aios/tests/
+	@install -s -m 0755 $(FIXTURE_BINS)  $(STAGE)/usr/lib/aios/tests/
 	@install -m 0755 $(BOOT_DIR)/aios-selftest.sh $(STAGE)/usr/bin/aios-selftest
 	@install -m 0644 $(BOOT_DIR)/boot.aiosh $(STAGE)/etc/aios/boot.aiosh
 	@mkdir -p $(STAGE)/usr/lib/aios/gpu $(STAGE)/usr/lib/aios/assets

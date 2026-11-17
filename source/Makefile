@@ -66,11 +66,18 @@ src/%.o: src/%.c
 tool-exec: src/tool-exec.c $(LIB)
 	$(CC) $(CFLAGS) -Iinclude -MMD -o $@ src/tool-exec.c $(LIB) $(LDFLAGS)
 
+# The adversary worker is a normal build target, not a string a test compiles at
+# runtime: the booted image has no compiler, and a fixture that cannot build
+# there is a fixture that silently stops testing the target that matters most.
+build/liar-worker: tests/fixtures/liar-worker.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ $<
+
 build/tests/%: tests/%.c $(LIB) tests/t.h
 	@mkdir -p build/tests
 	$(CC) $(CFLAGS) -Iinclude -MMD -o $@ $< $(LIB) $(LDFLAGS)
 
-test: $(LIB) $(TEST_BINS) tool-exec
+test: $(LIB) $(TEST_BINS) tool-exec build/liar-worker
 	@pass=0; fail=0; \
 	for t in $(TEST_BINS); do \
 	  if ./$$t >build/last_test.log 2>&1; then pass=$$((pass+1)); \

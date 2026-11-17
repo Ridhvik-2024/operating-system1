@@ -237,17 +237,34 @@ static void test_worker_protocol(void) {
     tool_reg_clear_effects(tr);
     st = tool_exec(tr, "fs.write", args, &res, err, sizeof err);
     json_free(res);
+    if (st != AIOS_OK) {
+        /* The most likely cause is that the worker is not where the sandbox
+         * looks (AIOS_TOOL_EXEC, or beside the binary). Say so, rather than
+         * letting five later assertions fail for a reason that has nothing to
+         * do with what they are testing. */
+        printf("      fs.write failed: %s\n", err[0] ? err : "(no message)");
+    }
     CHECK(st == AIOS_OK, "fs.write succeeds");
 
     const json_val *eff = tool_reg_last_effects(tr);
     CHECK(eff != NULL, "the worker returned an effects document");
+    if (!eff) {
+        /* CHECK does not abort, so carrying on here would dereference NULL and
+         * crash the whole suite -- hiding every later test behind a segfault
+         * instead of reporting one failure. Leave, loudly. */
+        CHECK(0, "no effects document: the worker did not run, so stop here");
+        tool_reg_free(tr);
+        mem_close(mem);
+        return;
+    }
     CHECK(tool_reg_last_complete(tr) == 1, "and says it is complete");
     CHECK(json_arr_len(eff) == 1, "with exactly one effect");
     json_val *e0 = json_arr_get(eff, 0);
-    CHECK(strcmp(json_str(json_obj_get(e0, "path")), "out/e.txt") == 0,
+    CHECK(e0 && strcmp(json_str(json_obj_get(e0, "path")), "out/e.txt") == 0,
           "naming the path it wrote");
-    CHECK(strcmp(json_str(json_obj_get(e0, "op")), "write") == 0, "with the write verb");
-    CHECK(json_num(json_obj_get(e0, "bytes")) == 5.0, "and the right byte count");
+    CHECK(e0 && strcmp(json_str(json_obj_get(e0, "op")), "write") == 0,
+          "with the write verb");
+    CHECK(e0 && json_num(json_obj_get(e0, "bytes")) == 5.0, "and the right byte count");
 
     /* a read */
     const char *rargs = "{\"path\":\"seed.txt\"}";
@@ -258,7 +275,8 @@ static void test_worker_protocol(void) {
     CHECK(st == AIOS_OK, "fs.read succeeds");
     eff = tool_reg_last_effects(tr);
     CHECK(eff && json_arr_len(eff) == 1, "one read effect");
-    CHECK(strcmp(json_str(json_obj_get(json_arr_get(eff, 0), "op")), "read") == 0,
+    CHECK(eff && json_arr_len(eff) == 1 &&
+          strcmp(json_str(json_obj_get(json_arr_get(eff, 0), "op")), "read") == 0,
           "with the read verb");
 
     /* a listing is accounted for too */
@@ -270,7 +288,8 @@ static void test_worker_protocol(void) {
     CHECK(st == AIOS_OK, "fs.list succeeds");
     eff = tool_reg_last_effects(tr);
     CHECK(eff && json_arr_len(eff) == 1, "a listing is one effect");
-    CHECK(strcmp(json_str(json_obj_get(json_arr_get(eff, 0), "op")), "list") == 0,
+    CHECK(eff && json_arr_len(eff) == 1 &&
+          strcmp(json_str(json_obj_get(json_arr_get(eff, 0), "op")), "list") == 0,
           "recorded as a list");
 
     /* a FAILED tool still reports: it may have written before it errored */
@@ -486,37 +505,47 @@ static void test_lying_worker_is_caught(void) {
     fputs(SRC, f);
     fclose(f);
 
-    if (system("cc -O2 -o build/test-liar-worker build/test-liar-src.c 2>/dev/null") != 0) {
-        CHECK(1, "the adversary fixture did not compile (skipped)");
-        return;
-    }
-    CHECK(access("build/test-liar-worker", X_OK) == 0, "the adversary fixture built");
-
-    /* Absolute, because the worker chdir()s into the jail before writing and
-     * the sandbox resolves the path with access() from the parent's cwd: a
-     * relative path happens to work, an absolute one always does. */
-    char worker_root[400];
-    if (!getcwd(worker_root, sizeof worker_root)) {
-        CHECK(1, "cannot resolve the working directory (skipped)");
-        return;
-    }
+    /* Never compiled at runtime: see tests/fixtures/liar-worker.c for why.
+     * Look for it beside this executable first (that is where the image
+     * installs it), then in the source tree's build/ for a local `make test`. */
     char worker_path[512];
-    int wn = snprintf(worker_path, sizeof worker_path, "%s/build/test-liar-worker",
-                      worker_root);
-    if (wn < 0 || (size_t)wn >= sizeof worker_path) {
-        CHECK(1, "fixture path too long (skipped)");
-        return;
+    char worker_root[400];
+    worker_path[0] = 0;
+    worker_root[0] = 0;
+
+    /* beside the executable: /usr/lib/aios/tests/liar-worker */
+    ssize_t en = readlink("/proc/self/exe", worker_root, sizeof worker_root - 1);
+    if (en > 0) {
+        worker_root[en] = 0;
+        char *slash = strrchr(worker_root, '/');
+        if (slash) {
+            *slash = 0;
+            snprintf(worker_path, sizeof worker_path, "%s/liar-worker", worker_root);
+        }
     }
+    if (worker_path[0] == 0 || access(worker_path, X_OK) != 0) {
+        if (!getcwd(worker_root, sizeof worker_root)) {
+            CHECK(1, "cannot resolve the working directory (skipped)");
+            return;
+        }
+        snprintf(worker_path, sizeof worker_path, "%s/build/liar-worker", worker_root);
+    }
+    CHECK(access(worker_path, X_OK) == 0,
+          "the adversary worker is available (it ships with the tests)");
     setenv("AIOS_TOOL_EXEC", worker_path, 1);
     CHECK(access(worker_path, X_OK) == 0, "the adversary is reachable by absolute path");
 
-    /* Absolute jail and store. The worker chdir()s into the jail, so a
+    /* Absolute jail and store, rooted at the cwd (worker_root may now be the
+     * executable's directory, which is not writable in the image). The worker
+     * chdir()s into the jail, so a
      * relative jail would mean "relative to wherever the worker was started",
      * and the fixture's writes would land in the test runner's directory --
      * which is precisely how a real escape would look from the outside. */
     char jail_abs[512], store_abs[512];
-    int jn = snprintf(jail_abs, sizeof jail_abs, "%s/build/test-liar-jail", worker_root);
-    int sn2 = snprintf(store_abs, sizeof store_abs, "%s/build/test-liar-store", worker_root);
+    char cwd[400];
+    if (!getcwd(cwd, sizeof cwd)) { CHECK(1, "no cwd (skipped)"); return; }
+    int jn = snprintf(jail_abs, sizeof jail_abs, "%s/build/test-liar-jail", cwd);
+    int sn2 = snprintf(store_abs, sizeof store_abs, "%s/build/test-liar-store", cwd);
     if (jn < 0 || (size_t)jn >= sizeof jail_abs ||
         sn2 < 0 || (size_t)sn2 >= sizeof store_abs) {
         CHECK(1, "fixture paths too long (skipped)");

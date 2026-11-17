@@ -54,3 +54,6 @@ source/.aios-store/
 __pycache__/
 *.pyc
 .venv/
+
+# test fixtures write into their own build/ dirs; never into the source tree
+/x.txt
