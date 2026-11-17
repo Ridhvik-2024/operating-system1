@@ -154,16 +154,19 @@ explain() {
     # it printed underneath. A suite that fails says why on the lines after its
     # name, and those lines are the whole answer -- dropping them because they do
     # not match /SELFTEST/ is how this took three cycles.
+    # Print the LAST lines of the log, always. Every previous version of this
+    # tried to grep for what it expected to see; when the expectation was wrong
+    # the annotation showed the build-up and nothing else, and the answer sat
+    # just past the end of the window.
+    echo "  --- last 12 lines from our programs ---"
+    tr -d '\r' < "$log" 2>/dev/null \
+        | grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\]' \
+        | grep -vE '^[[:space:]]*$' \
+        | tail -12 | sed 's/^/    | /'
     marks=$(tr -d '\r' < "$log" 2>/dev/null \
-            | grep -E 'SELFTEST|selftest|^ +FAIL |phase [0-9]|AIOS-BOOT-OK|AIOS-DUR|panic|BUG:|rollback|snapshot|bootproof|wrote ' \
-            | grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\] SELFTEST' | head -20)
-    if [ -n "$marks" ]; then
-        echo "  --- selftest / phase markers ---"
-        printf '%s\n' "$marks" | sed 's/^/    | /'
-    else
-        echo "  --- no selftest or phase marker in the log at all ---"
-        marks="NO SELFTEST OR PHASE MARKER IN LOG ($total lines, $ours ours)"
-    fi
+            | grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\]' \
+            | grep -vE '^[[:space:]]*$' \
+            | tail -8)
 
     if [ -n "$GITHUB_ACTIONS" ]; then
         # One line, and never empty: an annotation that says only "missed:" has
