@@ -168,10 +168,22 @@ explain() {
             | grep -vE '^[[:space:]]*$' \
             | tail -8)
 
+    # The tail shows where the boot ENDED; the failure is usually earlier. Name
+    # any failing suite explicitly, because "selftest=FAIL" with no suite named
+    # is a puzzle, and the answer is always one line further up the log.
+    fails=$(tr -d '\r' < "$log" 2>/dev/null \
+            | grep -E 'SELFTEST test_[a-z]+: FAIL|^ +FAIL tests/' \
+            | head -6 | tr '\n' ' ' | tr -s ' ')
+    if [ -n "$fails" ]; then
+        echo "  --- failing suites ---"
+        printf '%s\n' "$fails" | fold -w 120 | sed 's/^/    | /'
+    fi
+
     if [ -n "$GITHUB_ACTIONS" ]; then
         # One line, and never empty: an annotation that says only "missed:" has
         # cost CI cycles on this change alone.
-        flat=$(printf '%s' "$marks" | tr '\n' ' ' | tr -s ' ' | cut -c1-600)
+        flat="$fails $marks"
+        flat=$(printf '%s' "$flat" | tr '\n' ' ' | tr -s ' ' | cut -c1-600)
         echo "::error title=boot test::missed $what :: $flat"
     fi
     fail=1
