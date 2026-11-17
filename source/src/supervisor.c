@@ -149,12 +149,18 @@ bool sup_handle_line(const char *req, const char *jail, const char *store,
             n = l.n;
             snap_list_free(&l);
         }
+        /* ping reports WHAT it is serving, not just that it is alive. A client
+         * that cannot see the jail and store in the answer has no way to tell
+         * "the supervisor for my trees" from "a supervisor for someone else's",
+         * and would take its snapshots of the wrong directory. */
         char head[512];
         snprintf(head, sizeof head,
                  "{\"ok\":true,\"pid\":%d,\"uid\":%d,\"snapshots\":%zu,\"store\":",
                  (int)getpid(), (int)getuid(), n);
         bput(&b, head);
         bput_json_str(&b, store);
+        bput(&b, ",\"jail\":");
+        bput_json_str(&b, jail);
         bput(&b, "}");
         json_free(o);
         return true;

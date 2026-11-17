@@ -1261,7 +1261,7 @@ static bool sup_restore(const char *which, char *replaced, size_t rcap,
 /* Is there a supervisor to ask? A stale socket that nobody is listening on must
  * count as absent, or every `snap` on a developer machine would try the socket
  * first and print a connection error. */
-static bool sup_present(void) {
+static bool sup_present(const sh_shell *sh) {
     /* If the socket file is not there, do not even try to connect: on a
      * developer's machine there is no supervisor, and every `snap` would pay a
      * failed connection for nothing.
@@ -1280,9 +1280,26 @@ static bool sup_present(void) {
         }
         if (!up) return false;
     }
-    char out[1024] = {0};
+    char out[2048] = {0};
     if (!sup_round_trip("{\"op\":\"ping\"}\n", out, sizeof out)) return false;
-    return strstr(out, "\"ok\":true") != NULL;
+    if (strstr(out, "\"ok\":true") == NULL) return false;
+
+    /* It answered -- but is it serving MY trees? In the image PID 1 serves
+     * /workspace and /data/aios/store. The test suite points a shell at a scratch
+     * jail and store, and asking PID 1 to snapshot those would write the snapshot
+     * into /data/aios/store and then fail to find it in the scratch store. The
+     * user-visible symptom was "snap taken" followed by a listing that did not
+     * contain it.
+     *
+     * Comparing the store is the honest test: two shells can share a store and
+     * jail and be the same trees; a different store is not this shell's state. */
+    const char *sp = strstr(out, "\"store\":\"");
+    if (!sp) return false;
+    sp += 9;
+    size_t n = 0;
+    while (sp[n] && sp[n] != '"') n++;
+    if (n != strlen(sh->store) || strncmp(sp, sh->store, n) != 0) return false;
+    return true;
 }
 
 /* Take a snapshot, through PID 1 when it is there. Returns true on success and
@@ -1317,7 +1334,7 @@ static bool sh_snap_before(sh_shell *sh, const char *why, char *note, size_t nca
     /* Ask PID 1 when it is there. It takes the snapshot of the SAME jail and
      * store, so the answer is identical; what differs is who holds the power. */
     bool ok;
-    if (sup_present())
+    if (sup_present(sh))
         ok = sup_take(why, id, sizeof id, err, sizeof err);
     else
         ok = snap_take(sh->jail, sh->store, why, id, sizeof id, err, sizeof err);
@@ -2362,7 +2379,7 @@ static int builtin_snap(sh_shell *sh, sargv *a, char **text_out,
          * person asks for is made by the shell -- and the difference would be
          * invisible until the day it mattered. */
         bool ok;
-        if (sup_present())
+        if (sup_present(sh))
             ok = sup_take(label, id, sizeof id, err, ecap);
         else
             ok = snap_take(sh->jail, sh->store, label, id, sizeof id, err, ecap);
@@ -2412,7 +2429,7 @@ static int builtin_rollback(sh_shell *sh, sargv *a, char **text_out,
     char replaced[600] = {0};
     char rerr[512] = {0};
     bool restored;
-    if (sup_present())
+    if (sup_present(sh))
         restored = sup_restore(si.id, replaced, sizeof replaced, rerr, sizeof rerr);
     else
         restored = snap_restore(sh->jail, sh->store, si.id,

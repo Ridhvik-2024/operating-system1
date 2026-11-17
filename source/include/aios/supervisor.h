@@ -25,7 +25,14 @@
  *   connection closes.
  *
  *     -> {"op":"ping"}
- *     <- {"ok":true,"pid":1,"uid":0,"snapshots":3,"store":"/data/aios/store"}
+ *     <- {"ok":true,"pid":1,"uid":0,"snapshots":3,
+ *         "store":"/data/aios/store","jail":"/workspace"}
+ *
+ *   ping reports the trees it serves because a client must be able to refuse a
+ *   supervisor that is serving someone else's. In the image PID 1 serves
+ *   /workspace; the test suite runs its shell against a scratch jail and store,
+ *   and asking PID 1 to snapshot those would put the snapshot in the wrong
+ *   place -- which is exactly what happened the first time this shipped.
  *
  *     -> {"op":"snap","label":"before an agent run"}
  *     <- {"ok":true,"id":"1794...-676-0"}

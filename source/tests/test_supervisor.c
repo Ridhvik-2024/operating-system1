@@ -126,6 +126,28 @@ static void test_label_escaping(void) {
     }
 }
 
+/* ---------------- 2b. ping says which trees it serves ---------------- */
+
+static void test_ping_reports_trees(void) {
+    printf("ping reports the jail and store it is serving\n");
+    rmrf(ROOT);
+    mkdirs(ROOT "/jail");
+    mkdirs(ROOT "/store");
+
+    char out[8192];
+    CHECK(ask("{\"op\":\"ping\"}", out, sizeof out), "ping is answered");
+    CHECK_STR_CONTAINS(out, "\"jail\":", "and names the jail it serves");
+    CHECK_STR_CONTAINS(out, ROOT "/jail", "which is the one it was given");
+    CHECK_STR_CONTAINS(out, "\"store\":", "and the store");
+    CHECK_STR_CONTAINS(out, ROOT "/store", "which is the one it was given");
+    /* Why this matters: in the image PID 1 serves /workspace and
+     * /data/aios/store, while the test suite runs a shell against a scratch jail
+     * and store. Without these two fields the shell cannot tell the difference,
+     * asks PID 1 to snapshot somebody else's trees, and then cannot find the
+     * snapshot in its own store -- reported as "snap taken" followed by a listing
+     * that does not contain it. */
+}
+
 /* ---------------- 3. snap / list / restore over the protocol ---------------- */
 
 static void test_round_trip(void) {
@@ -313,6 +335,7 @@ int main(void) {
 
     test_protocol_errors();
     test_label_escaping();
+    test_ping_reports_trees();
     test_round_trip();
     test_live_socket();
     test_socket_permissions();
