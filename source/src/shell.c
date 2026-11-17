@@ -2349,6 +2349,31 @@ static int builtin_dur(sh_shell *sh, sargv *a, char **text_out,
     snprintf(line, sizeof line, "\n  jobs:       %zu spawned / %zu journal records",
              spawns, jrecs);
     sb_puts(&b, line);
+
+    /* M5: rollback is only real if a person can SEE it is available. A durable
+     * store with no snapshots is one where `rollback` will refuse, and the shell
+     * should say so here rather than at the moment someone needs it. */
+    {
+        snap_list sl;
+        memset(&sl, 0, sizeof sl);
+        if (snap_list_all(sh->store, &sl, NULL, 0)) {
+            if (sl.n == 0) {
+                snprintf(line, sizeof line,
+                         "\n  snapshots:  none yet — `snap take <label>` "
+                         "before a risky change");
+            } else {
+                const snap_info *newest = &sl.items[0];
+                snprintf(line, sizeof line,
+                         "\n  snapshots:  %zu (keeping %d), newest %.48s \"%.48s\" "
+                         "— `rollback` undoes it",
+                         sl.n, AIOS_SNAP_KEEP, newest->id, newest->label);
+            }
+            sb_puts(&b, line);
+            snap_list_free(&sl);
+        } else {
+            sb_puts(&b, "\n  snapshots:  cannot be listed");
+        }
+    }
     if (apn > 0) {
         snprintf(line, sizeof line, "\n  autopilot:  %zu adjustments (last: %.200s)",
                  apn, lastap);
