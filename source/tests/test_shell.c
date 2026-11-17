@@ -339,11 +339,39 @@ static void router_tests(void) {
         if (cases[i].tool && d.kind == SH_ROUTE_TOOL) {
             CHECK(d.tool && strcmp(d.tool, cases[i].tool) == 0, msg);
         }
+        /* M1: every routed non-REPLY decision carries a descriptor, and the
+         * args now live in it (sh_route transfers ownership out of the
+         * decision). A routed line is an AI decision, so origin must arrive
+         * UNSPECIFIED for the caller to stamp. */
+        if (d.kind != SH_ROUTE_REPLY) {
+            CHECK(d.action != NULL, "router built an action descriptor");
+            if (d.action) {
+                CHECK(d.action->origin == ORIGIN_UNSPECIFIED,
+                      "router leaves origin for the caller to stamp");
+                CHECK(d.action->intent_hash != 0,
+                      "descriptor carries the human intent hash");
+                CHECK(aios_action_is_valid(d.action, NULL, 0) == 0,
+                      "an unstamped descriptor is invalid until the caller stamps");
+                aios_action_stamp_origin(d.action, ORIGIN_AI);
+                CHECK(aios_action_is_valid(d.action, NULL, 0) == 1,
+                      "stamping AI makes it valid");
+            }
+        } else {
+            CHECK(d.action == NULL, "REPLY proposes no action");
+        }
         if (d.kind == SH_ROUTE_TOOL && strcmp(d.tool, "fs.write") == 0) {
-            CHECK_STR_CONTAINS(json_str(json_obj_get(d.args, "path")),
+            /* args moved into the descriptor; the decision's pointer is NULL */
+            CHECK(d.args == NULL, "args transferred out of the decision");
+            json_val *args = d.action ? d.action->args : NULL;
+            CHECK(args != NULL, "descriptor carries the routed args");
+            CHECK_STR_CONTAINS(json_str(json_obj_get(args, "path")),
                                "out.txt", "routed fs.write path");
-            CHECK_STR_CONTAINS(json_str(json_obj_get(d.args, "content")),
+            CHECK_STR_CONTAINS(json_str(json_obj_get(args, "content")),
                                "hello", "routed fs.write content");
+            /* and the effect the action claims is on the record */
+            CHECK(d.action && d.action->n_declared == 1
+                  && strcmp(d.action->declared[0], "write:out.txt") == 0,
+                  "router declared the write effect for the routed tool");
         }
         sh_decision_free(&d);
     }

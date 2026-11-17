@@ -4,6 +4,7 @@
 #ifndef AIOS_SHROUTE_H
 #define AIOS_SHROUTE_H
 
+#include "aios/action.h"
 #include "aios/tools.h"
 
 typedef enum {
@@ -25,7 +26,22 @@ typedef struct {
                              running the agent in the foreground     */
     int      urgent;      /* SH_ROUTE_AGENT: urgent/interactive wording;
                              stays foreground, noted for the journal */
+
+    /* M1: the descriptor this decision proposes. Built here because this is
+     * the only code that knows what was asked for; the origin is stamped by
+     * the CALLER (a routed line is an AI decision, an explicit command is a
+     * human one), so a decision leaves here with origin UNSPECIFIED and the
+     * action is invalid until the caller says who is accountable.
+     *
+     * Ownership: sh_decision_to_action() transfers it out. sh_decision_free()
+     * frees whatever is left, so a caller that ignores the descriptor cannot
+     * leak it. */
+    aios_action *action;
 } sh_decision;
+
+/* Transfer the router's descriptor to the caller (NULL if it built none).
+ * The returned action has origin UNSPECIFIED: stamp it before use. */
+aios_action *sh_decision_to_action(sh_decision *d);
 
 void sh_decision_free(sh_decision *d);
 

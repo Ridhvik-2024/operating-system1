@@ -398,6 +398,45 @@ static void stage_text_of(const char *tool, json_val *v, char **text_out) {
     *text_out = j ? j : strdup("");
 }
 
+/* ---- M1 gate ----------------------------------------------------------
+ * The single place where a proposal stops being a proposal.
+ *
+ * M2 will put policy_eval() here; M3/M4 will put the stage-and-diff around
+ * the call; M6 will hash the record into the audit chain. Today it exists to
+ * make ONE thing true, which is the whole point of M1: no tool call can be
+ * constructed anywhere in this file without first having been a validated,
+ * origin-stamped, effect-declared aios_action.
+ *
+ * Note what is NOT here: no execution, no permission. The descriptor does not
+ * get to decide anything; the host code below decides, having read it.
+ * --------------------------------------------------------------------- */
+static int action_gate(sh_shell *sh, const aios_action *act,
+                       char *err, size_t ecap) {
+    char why[256];
+    if (!aios_action_is_valid(act, why, sizeof why)) {
+        snprintf(err, ecap, "action refused: %s", why);
+        /* Publish the refusal: a blocked action is evidence, and the shell
+         * bus is where the desktop and the journal already listen. */
+        sembus_pub_kv(sh->bus, "sh.action.refused",
+                      (const char *const[]){
+                          "kind", aios_action_kind_name(act ? act->kind : ACT__COUNT),
+                          "target", (act && act->target) ? act->target : "",
+                          "why", why, NULL});
+        return 1;
+    }
+    return 0;
+}
+
+/* Build (and publish) the record of an action we accepted. The audit chain
+ * proper is M6; this is the descriptor being made observable NOW so that the
+ * later milestones have something to chain. */
+static void action_accept(sh_shell *sh, const aios_action *act) {
+    char *j = aios_action_to_json(act);
+    if (!j) return;
+    sembus_pub(sh->bus, "sh.action.accept", j);
+    free(j);
+}
+
 /* args is consumed on every path (tool_exec contract). */
 static int exec_tool(sh_shell *sh, const char *name, json_val *args,
                      char **text_out, json_val **json_out,
@@ -414,10 +453,38 @@ static int exec_tool(sh_shell *sh, const char *name, json_val *args,
     return 0;
 }
 
+/* Execute a tool THROUGH its descriptor.
+ *
+ * `act` is borrowed: the caller keeps ownership and frees it after the call,
+ * so the refusal text and any later milestone can still see it. The args are
+ * transferred out of the descriptor here, because tool_exec's contract is
+ * that args is consumed on every path.
+ *
+ * This is the ONLY way a tool runs. Command execution, argv parsing and the
+ * intent router all end up here (run_command -> run_tool_stage /
+ * SH_ROUTE_TOOL -> exec_tool_action). */
+static int exec_tool_action(sh_shell *sh, aios_action *act,
+                            char **text_out, json_val **json_out,
+                            char *err, size_t ecap) {
+    if (action_gate(sh, act, err, ecap) != 0) {
+        stage_text_of(NULL, NULL, text_out);
+        *json_out = NULL;
+        return 1;
+    }
+    action_accept(sh, act);
+    return exec_tool(sh, act->target, aios_action_take_args(act),
+                     text_out, json_out, err, ecap);
+}
+
 /* Build tool args from argv (key=value / {json} / positional shorthand),
- * then inject piped input where the tool wants it. */
+ * then inject piped input where the tool wants it.
+ *
+ * ORIGIN_HUMAN: the human typed the tool name and the arguments. Nothing was
+ * inferred, so a human is accountable for what runs. (A natural-language line
+ * that the ROUTER turns into a tool is ORIGIN_AI - see run_command's router
+ * branch - because there the machine chose the tool.) */
 static int run_tool_stage(sh_shell *sh, const char *name, sargv *a,
-                          const char *pipe_text,
+                          const char *raw_line, const char *pipe_text,
                           char **text_out, json_val **json_out,
                           char *err, size_t ecap) {
     json_val *args = json_new_obj();
@@ -481,13 +548,36 @@ static int run_tool_stage(sh_shell *sh, const char *name, sargv *a,
             json_obj_set(args, "query", json_new_str(pipe_text));
         }
     }
-    return exec_tool(sh, name, args, text_out, json_out, err, ecap);
+    /* M1: wrap the explicitly-typed command in a descriptor and validate it
+     * before anything executes. The descriptor carries the effects the tool
+     * implies, so the claim is on the record even when a human asked. */
+    aios_action *act = aios_action_new(ACT_TOOL, ORIGIN_HUMAN, name);
+    if (!act) {
+        json_free(args);
+        snprintf(err, ecap, "oom (descriptor)");
+        return 1;
+    }
+    aios_action_set_intent(act, raw_line ? raw_line : name);
+    aios_action_set_args(act, args);
+    aios_action_declare_tool_effects(act, name, act->args);
+    int rc = exec_tool_action(sh, act, text_out, json_out, err, ecap);
+    aios_action_free(act);
+    return rc;
 }
 
 /* ---------------- agent execution ---------------- */
 
-static int run_agent_fg(sh_shell *sh, const char *goal,
+/* `goal` is the descriptor's target; the descriptor itself carries the
+ * intent hash and origin that M6 will log and M2 will evaluate. An agent
+ * cannot be started without one. */
+static int run_agent_fg(sh_shell *sh, const aios_action *act,
                         char **text_out, char *err, size_t ecap) {
+    if (action_gate(sh, act, err, ecap) != 0) {
+        *text_out = strdup("");
+        return 1;
+    }
+    action_accept(sh, act);
+    const char *goal = act->target;
     cortex *cx = strcmp(sh->cortex_mode, "llm") == 0
                  ? cortex_llm_create(NULL)
                  : cortex_scripted_create(goal);
@@ -1484,7 +1574,18 @@ static int run_command(sh_shell *sh, scmd *c,
     if (strcmp(c0, "agent") == 0) {
         char *goal = join_args(a->v, a->n, 1);
         if (!*goal) { free(goal); snprintf(err, ecap, "agent needs a goal"); return 1; }
-        int rc = run_agent_fg(sh, goal, text_out, err, ecap);
+        /* The human typed `agent <goal>`: they chose the goal, so they are
+         * accountable for it. Still a descriptor - an agent always has one. */
+        aios_action *act = aios_action_new(ACT_AGENT, ORIGIN_HUMAN, goal);
+        int rc;
+        if (!act) {
+            snprintf(err, ecap, "oom (descriptor)");
+            rc = 1;
+        } else {
+            aios_action_set_intent(act, c->raw ? c->raw : goal);
+            rc = run_agent_fg(sh, act, text_out, err, ecap);
+            aios_action_free(act);
+        }
         free(goal);
         return rc;
     }
@@ -1496,30 +1597,51 @@ static int run_command(sh_shell *sh, scmd *c,
 
     /* ---- registered tools (M4 registry) ---- */
     if (tool_reg_find(sh->tools, c0))
-        return run_tool_stage(sh, c0, a, pipe_text, text_out, json_out, err, ecap);
+        return run_tool_stage(sh, c0, a, c->raw, pipe_text, text_out, json_out,
+                              err, ecap);
 
-    /* ---- natural language: the intent router ---- */
+    /* ---- natural language: the intent router ----
+     *
+     * THIS IS THE AI PATH. The human wrote prose; the machine chose the tool
+     * and its arguments. So the descriptor's origin is ORIGIN_AI, and the
+     * descriptor already carries the hash of the human line that prompted it
+     * (built in sh_route). If a human could get ORIGIN_HUMAN by typing
+     * prose, origin tagging would be a formality. */
     sh_decision dec;
     aios_status rst = sh_route(sh->cortex_mode, c->raw ? c->raw : c0,
                                sh->tools, &dec, err, ecap);
     if (rst != AIOS_OK) return 1;
     int rc = 0;
+
+    aios_action *act = sh_decision_to_action(&dec);
+    if (!act && dec.kind != SH_ROUTE_REPLY) {
+        /* A routed tool/agent with no descriptor is a bug, not a fallback:
+         * refuse rather than run something nothing validated. */
+        snprintf(err, ecap, "router produced no action descriptor");
+        sh_decision_free(&dec);
+        return 1;
+    }
+    if (act) aios_action_stamp_origin(act, ORIGIN_AI);
+
     switch (dec.kind) {
     case SH_ROUTE_TOOL:
-        rc = exec_tool(sh, dec.tool, dec.args ? dec.args : json_new_obj(),
-                       text_out, json_out, err, ecap);
-        dec.args = NULL; /* consumed by exec_tool */
+        if (act) rc = exec_tool_action(sh, act, text_out, json_out, err, ecap);
         break;
     case SH_ROUTE_AGENT:
         /* M7: background wording -> the agents cgroup, not the console */
-        rc = dec.bg
-             ? spawn_job(sh, dec.goal ? dec.goal : "", text_out, err, ecap)
-             : run_agent_fg(sh, dec.goal ? dec.goal : "", text_out, err, ecap);
+        if (dec.bg) {
+            /* A background job is its own proposal kind: it outlives the
+             * command that asked for it, so it is gated as ACT_JOB_SPAWN. */
+            rc = spawn_job(sh, dec.goal ? dec.goal : "", text_out, err, ecap);
+        } else if (act) {
+            rc = run_agent_fg(sh, act, text_out, err, ecap);
+        }
         break;
     case SH_ROUTE_REPLY:
         *text_out = xstrdup(dec.text);
         break;
     }
+    if (act) aios_action_free(act);
     sh_decision_free(&dec);
     return rc;
 }
