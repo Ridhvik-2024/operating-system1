@@ -502,6 +502,14 @@ static void test_deaf_worker_does_not_kill_the_parent(void) {
     req[n + len] = 0;
     size_t req_len = (size_t)n + len;
 
+    /* Whatever the caller had, the call must hand it back unchanged. Asserting
+     * SIG_DFL specifically is wrong: a supervisor may legitimately ignore
+     * SIGPIPE itself (CI's job shell does), and "restored" means restored, not
+     * "reset to the default". */
+    struct sigaction before, cur;
+    memset(&before, 0, sizeof before);
+    bool have_before = (sigaction(SIGPIPE, NULL, &before) == 0);
+
     sandbox_result r;
     char err[256] = {0};
     /* Reaching this line at all is most of the assertion: the previous version
@@ -514,12 +522,12 @@ static void test_deaf_worker_does_not_kill_the_parent(void) {
     free(req);
     unsetenv("AIOS_TOOL_EXEC");
 
-    /* SIGPIPE must be back to normal for everyone else: this function is a
-     * library call, not the process's owner. */
-    struct sigaction cur;
+    /* SIGPIPE must be handed back as it was: this is a library call, not the
+     * process's owner. */
+    memset(&cur, 0, sizeof cur);
     CHECK(sigaction(SIGPIPE, NULL, &cur) == 0, "SIGPIPE disposition is readable");
-    CHECK(cur.sa_handler == SIG_DFL,
-          "and the caller's SIGPIPE disposition is restored");
+    CHECK(have_before && cur.sa_handler == before.sa_handler,
+          "and the caller's SIGPIPE disposition is exactly what it was before");
 }
 
 /* ---- 6. the adversary ----
