@@ -240,7 +240,8 @@ const char *aios_action_origin_name(aios_origin o) {
 
 /* -------------------------------------------------------------- validate */
 
-int aios_action_is_valid(const aios_action *a, char *err, size_t ecap) {
+int aios_action_is_valid_at(const aios_action *a, double now_ms,
+                            char *err, size_t ecap) {
     if (err && ecap) err[0] = 0;
     /* Every failure path goes through FAIL so the reason is never empty. */
 #define FAIL(...) do { if (err && ecap) snprintf(err, ecap, __VA_ARGS__); \
@@ -270,9 +271,13 @@ int aios_action_is_valid(const aios_action *a, char *err, size_t ecap) {
         FAIL("budget_ms %.0f exceeds the %d ms cap", a->budget_ms,
              (int)AIOS_ACTION_MAX_BUDGET_MS);
 
-    /* 5. expiry: a descriptor is a short-lived token, not a standing grant */
-    if (!(a->expires_ms > aios_now_ms())) FAIL("descriptor expired");
-    if (a->expires_ms > aios_now_ms() + AIOS_ACTION_MAX_LIFETIME_MS)
+    /* 5. expiry: a descriptor is a short-lived token, not a standing grant.
+     *    now_ms <= 0 means the caller has no clock (pure evaluation); the
+     *    relative ceiling is still enforced, only the absolute comparison is
+     *    skipped. */
+    if (now_ms > 0 && !(a->expires_ms > now_ms))
+        FAIL("descriptor expired");
+    if (now_ms > 0 && a->expires_ms > now_ms + AIOS_ACTION_MAX_LIFETIME_MS)
         FAIL("expiry too far in the future (max %d ms ahead)",
              (int)AIOS_ACTION_MAX_LIFETIME_MS);
 
@@ -311,6 +316,10 @@ int aios_action_is_valid(const aios_action *a, char *err, size_t ecap) {
 
     return 1;
 #undef FAIL
+}
+
+int aios_action_is_valid(const aios_action *a, char *err, size_t ecap) {
+    return aios_action_is_valid_at(a, aios_now_ms(), err, ecap);
 }
 
 /* ------------------------------------------------------------------- JSON */

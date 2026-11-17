@@ -21,6 +21,7 @@
 #include "aios/microlm.h"
 #include "aios/autopilot.h"
 #include "aios/durable.h"
+#include "aios/policy.h"
 #include "shroute.h"
 
 #include <ctype.h>
@@ -110,6 +111,8 @@ struct sh_shell {
     char      jail[512];
     char      store[512];
     char      cortex_mode[16];
+    int       last_needs_sandbox;    /* M2: host requirements from the verdict */
+    int       last_needs_rollback;
 
     char *var_name[SH_MAX_VARS];
     char *var_val[SH_MAX_VARS];
@@ -410,13 +413,30 @@ static void stage_text_of(const char *tool, json_val *v, char **text_out) {
  * Note what is NOT here: no execution, no permission. The descriptor does not
  * get to decide anything; the host code below decides, having read it.
  * --------------------------------------------------------------------- */
+/* Capabilities this shell holds. Compiled in, not configurable, for the same
+ * reason the law table is: an environment variable that grants capabilities
+ * is a privilege escalation with extra steps.
+ *
+ * HUMAN commands need no capability (the human is the authority). Everything
+ * the MACHINE originates does, which is why the AI path can only use tools
+ * listed here. fs.write is deliberately included and act:FS_DELETE is
+ * deliberately NOT: the interesting part of M2 is not the deny, it is the
+ * small, boring, auditable list of what is actually granted. */
+static const char *SH_CAPS[] = {
+    "tool:calc", "tool:fs.read", "tool:fs.list", "tool:fs.write",
+    "tool:memory.search", "tool:proc.info", "tool:selftest.sleep",
+    "agent:run",
+};
+
+#define SH_N_CAPS ((int)(sizeof SH_CAPS / sizeof SH_CAPS[0]))
+
 static int action_gate(sh_shell *sh, const aios_action *act,
                        char *err, size_t ecap) {
     char why[256];
+
+    /* ---- M1: is this even a proposal? ---- */
     if (!aios_action_is_valid(act, why, sizeof why)) {
         snprintf(err, ecap, "action refused: %s", why);
-        /* Publish the refusal: a blocked action is evidence, and the shell
-         * bus is where the desktop and the journal already listen. */
         sembus_pub_kv(sh->bus, "sh.action.refused",
                       (const char *const[]){
                           "kind", aios_action_kind_name(act ? act->kind : ACT__COUNT),
@@ -424,6 +444,58 @@ static int action_gate(sh_shell *sh, const aios_action *act,
                           "why", why, NULL});
         return 1;
     }
+
+    /* ---- M2: is it permitted? ----
+     * The verdict comes from a pure function that cannot consult the model,
+     * cannot read the clock, and has no override path. Note what this code
+     * cannot do: it cannot reason about the action, soften the verdict, or ask
+     * the AI for justification. It reads a decision and obeys it. */
+    aios_policy_ctx pctx = aios_policy_ctx_default();
+    /* The sandbox is where the tool will actually run (the worker process),
+     * so for a tool action it is performed rather than pending. A shell or
+     * delete is not simulated yet - that is M3/M4, and until then those stay
+     * denied instead of being waved through. */
+    pctx.sandbox_executed = (act->kind == ACT_TOOL || act->kind == ACT_AGENT);
+    /* No snapshot store exists yet (M5). Saying so is what makes the
+     * rollback rule bite instead of pretending. */
+    pctx.rollback_available = 0;
+
+    aios_decision d = aios_policy_eval(act, sh->jail, SH_CAPS, SH_N_CAPS,
+                                       &pctx, aios_now_ms());
+
+    char *act_json = aios_action_to_json(act);
+    if (d.v != VERDICT_ALLOW) {
+        snprintf(err, ecap, "action refused by policy [%s]: %s",
+                 aios_policy_reason_str(d.r), d.why);
+        sembus_pub_kv(sh->bus, "sh.action.refused",
+                      (const char *const[]){
+                          "kind", aios_action_kind_name(act->kind),
+                          "target", act->target ? act->target : "",
+                          "verdict", aios_policy_verdict_str(d.v),
+                          "reason", aios_policy_reason_str(d.r),
+                          "why", d.why, NULL});
+        /* The refusal is logged as a record, not just printed: a denied
+         * action is the most interesting thing in an audit trail. */
+        sembus_pub_kv(sh->bus, "sh.action.log",
+                      (const char *const[]){
+                          "verdict", aios_policy_verdict_str(d.v),
+                          "reason", aios_policy_reason_str(d.r),
+                          "action", act_json ? act_json : "", NULL});
+        free(act_json);
+        return 1;
+    }
+
+    sembus_pub_kv(sh->bus, "sh.action.log",
+                  (const char *const[]){
+                      "verdict", "ALLOW",
+                      "reason", aios_policy_reason_str(d.r),
+                      "action", act_json ? act_json : "", NULL});
+    free(act_json);
+
+    /* Requirements the host must honour before this is real. Both are
+     * reported so the M3/M5 work has a consumer rather than a comment. */
+    if (d.needs_sandbox) sh->last_needs_sandbox = 1;
+    if (d.needs_rollback) sh->last_needs_rollback = 1;
     return 0;
 }
 

@@ -152,7 +152,15 @@ const char *aios_action_origin_name(aios_origin o);
 
 /* 1 = valid, 0 = invalid with a human-readable reason in err.
  * Deliberately re-checks EVERYTHING: expiry against now, budget caps, effect
- * verbs, the origin stamp, and the AI-needs-an-intent rule. */
+ * verbs, the origin stamp, and the AI-needs-an-intent rule.
+ *
+ * aios_action_is_valid() uses the real clock. aios_action_is_valid_at() takes
+ * the clock as a parameter and is what a PURE caller uses: reading the clock
+ * inside a supposedly deterministic evaluator is how "same input, same
+ * output" quietly stops being true. now_ms <= 0 means "no clock available,
+ * skip the expiry comparison". */
+int aios_action_is_valid_at(const aios_action *a, double now_ms,
+                            char *err, size_t ecap);
 int aios_action_is_valid(const aios_action *a, char *err, size_t ecap);
 
 /* Serialize (owned string, caller frees). Includes every trusted field so the
