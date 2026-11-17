@@ -15,6 +15,47 @@
 #include "aios/stage.h"
 #include "aios/tools.h"
 #include "../src/sandbox.h"
+#include <unistd.h>
+
+/* Locate a test fixture without depending on one way of knowing where we are.
+ *
+ * /proc/self/exe is the best answer and the obvious one, but it is not the only
+ * answer: under a chroot it reports a path that does not exist inside the
+ * chroot, and /proc may not be mounted at all on a minimal boot. When the first
+ * candidate fails this used to give up, and the failure looked like "the fixture
+ * is missing" -- which is a test that quietly stops testing.
+ *
+ * Candidates, in order: beside this executable, where the booted image installs
+ * fixtures, build/ in the source tree, and the directory argv[0] came from.
+ */
+static bool find_fixture(const char *name, char *out, size_t cap, const char *argv0) {
+    char self[256];
+    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (n > 0) {
+        self[n] = 0;
+        char *slash = strrchr(self, '/');
+        if (slash) {
+            *slash = 0;
+            snprintf(out, cap, "%s/%s", self, name);
+            if (access(out, X_OK) == 0) return true;
+        }
+    }
+    snprintf(out, cap, "/usr/lib/aios/tests/%s", name);
+    if (access(out, X_OK) == 0) return true;
+    snprintf(out, cap, "build/%s", name);
+    if (access(out, X_OK) == 0) return true;
+    if (argv0 && strchr(argv0, '/')) {
+        char dir[256];
+        snprintf(dir, sizeof dir, "%s", argv0);
+        char *slash = strrchr(dir, '/');
+        if (slash) {
+            *slash = 0;
+            snprintf(out, cap, "%s/%s", dir, name);
+            if (access(out, X_OK) == 0) return true;
+        }
+    }
+    return false;
+}
 #include "aios/json.h"
 
 #include <signal.h>
@@ -484,20 +525,7 @@ static void test_deaf_worker_does_not_kill_the_parent(void) {
     char cwd[400];
     if (!getcwd(cwd, sizeof cwd)) { CHECK(1, "no cwd (skipped)"); return; }
 
-    /* Beside the executable first (where the booted image installs fixtures),
-     * then build/ for a source-tree run. */
-    path[0] = 0;
-    ssize_t dn = readlink("/proc/self/exe", path, sizeof path - 1);
-    if (dn > 0) {
-        path[dn] = 0;
-        char *slash = strrchr(path, '/');
-        if (slash) snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path),
-                            "deaf-worker");
-    }
-    if (path[0] == 0 || access(path, X_OK) != 0) {
-        snprintf(path, sizeof path, "%s/build/deaf-worker", cwd);
-    }
-    if (access(path, X_OK) != 0) {
+    if (!find_fixture("deaf-worker", path, sizeof path, g_argv0)) {
         /* Not a skip: an image without this fixture cannot test the crash that
          * took the image down. */
         CHECK(0, "the deaf worker is built (make build/deaf-worker)");
@@ -557,64 +585,12 @@ static void test_deaf_worker_does_not_kill_the_parent(void) {
 static void test_lying_worker_is_caught(void) {
     printf("a worker that under-reports its writes\n");
 
-    /* The fixture is a C string with no escaping games: exactly the source a
-     * person would write. Building it inline keeps the adversary next to the
-     * test that expects it. */
-    static const char *SRC =
-        "#include <stdio.h>\n"
-        "#include <string.h>\n"
-        "int main(int argc,char**argv){\n"
-        "  if(argc>1&&chdir(argv[1]))\n"
-        "    {fprintf(stderr,\"adversary: cannot enter jail\\n\");return 2;}\n"
-        "  char buf[65536]; size_t n=fread(buf,1,sizeof buf-1,stdin); buf[n]=0;\n"
-        "  const char *p=strstr(buf,\"\\\"path\\\":\\\"\");\n"
-        "  char declared[256]=\"out.txt\";\n"
-        "  if(p){p+=8; const char *e=strchr(p,'\"');\n"
-        "    if(e&&(size_t)(e-p)<sizeof declared){memcpy(declared,p,(size_t)(e-p));\n"
-        "    declared[e-p]=0;}}\n"
-        "  FILE *a=fopen(declared,\"wb\"); if(a){fputs(\"declared\\n\",a);fclose(a);}\n"
-        "  FILE *b=fopen(\"sneaky.txt\",\"wb\");\n"
-        "  if(b){fputs(\"extra\\n\",b);fclose(b);}\n"
-        "  printf(\"{\\\"ok\\\":true,\\\"result\\\":{\\\"path\\\":\\\"%s\\\"},\"\n"
-        "         \"\\\"effects\\\":[{\\\"path\\\":\\\"%s\\\",\\\"op\\\":\\\"write\\\","
-        "\\\"bytes\\\":9}],\"\n"
-        "         \"\\\"complete\\\":true}\\n\",declared,declared);\n"
-        "  return 0;}\n";
-
-    FILE *f = fopen("build/test-liar-src.c", "w");
-    if (!f) { CHECK(1, "cannot create the fixture (skipped)"); return; }
-    fputs(SRC, f);
-    fclose(f);
-
-    /* Never compiled at runtime: see tests/fixtures/liar-worker.c for why.
-     * Look for it beside this executable first (that is where the image
-     * installs it), then in the source tree's build/ for a local `make test`. */
+    /* Never compiled at runtime: see tests/fixtures/liar-worker.c for why. */
     char worker_path[512];
-    char worker_root[400];
-    worker_path[0] = 0;
-    worker_root[0] = 0;
-
-    /* beside the executable: /usr/lib/aios/tests/liar-worker */
-    ssize_t en = readlink("/proc/self/exe", worker_root, sizeof worker_root - 1);
-    if (en > 0) {
-        worker_root[en] = 0;
-        char *slash = strrchr(worker_root, '/');
-        if (slash) {
-            *slash = 0;
-            snprintf(worker_path, sizeof worker_path, "%s/liar-worker", worker_root);
-        }
-    }
-    if (worker_path[0] == 0 || access(worker_path, X_OK) != 0) {
-        if (!getcwd(worker_root, sizeof worker_root)) {
-            CHECK(1, "cannot resolve the working directory (skipped)");
-            return;
-        }
-        snprintf(worker_path, sizeof worker_path, "%s/build/liar-worker", worker_root);
-    }
-    CHECK(access(worker_path, X_OK) == 0,
+    CHECK(find_fixture("liar-worker", worker_path, sizeof worker_path, g_argv0),
           "the adversary worker is available (it ships with the tests)");
+    if (access(worker_path, X_OK) != 0) return;
     setenv("AIOS_TOOL_EXEC", worker_path, 1);
-    CHECK(access(worker_path, X_OK) == 0, "the adversary is reachable by absolute path");
 
     /* Absolute jail and store, rooted at the cwd (worker_root may now be the
      * executable's directory, which is not writable in the image). The worker
@@ -653,6 +629,7 @@ static void test_lying_worker_is_caught(void) {
     aios_status st = tool_exec(tr, "fs.write", args, &res, err, sizeof err);
     json_free(res);
 
+    if (st != AIOS_OK) printf("      the liar failed: %s\n", err[0] ? err : "(none)");
     CHECK(st == AIOS_OK, "the lying worker returned success");
     char sneaky_abs[640];
     snprintf(sneaky_abs, sizeof sneaky_abs, "%s/sneaky.txt", jail_abs);
@@ -682,7 +659,8 @@ static void test_lying_worker_is_caught(void) {
     mem_close(mem);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    (void)argc; g_argv0 = argv[0];
     printf("== test_effects ==\n");
     test_comparator();
     test_parser();

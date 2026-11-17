@@ -23,7 +23,14 @@ for t in /usr/lib/aios/tests/test_*; do
         [ -z "$(echo "$out" | grep -E '^FAIL')" ] && \
             echo "$out" | tail -6 | sed 's/^/      /'
         # One line for the CI annotation, which is length-limited.
-        f=$(echo "$out" | grep -E '^FAIL' | head -4 | tr '\n' ' ' | tr -s ' ')
+        # One line for the annotation. Uses only tools this image actually
+        # links, and degrades to the multi-line form if a formatter is missing --
+        # a diagnostic that cannot run is how this went a round trip too long.
+        if command -v tr >/dev/null 2>&1; then
+            f=$(echo "$out" | grep -E '^FAIL' | head -4 | tr '\n' ' ' | tr -s ' ')
+        else
+            f=$(echo "$out" | grep -E '^FAIL' | head -2)
+        fi
         [ -n "$GITHUB_ACTIONS" ] && [ -n "$f" ] && \
             echo "::error title=selftest $name::$f"
         fail=$((fail + 1))

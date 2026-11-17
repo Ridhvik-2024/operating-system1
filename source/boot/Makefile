@@ -105,13 +105,14 @@ $(BLD)/assets/%.aiosimg: desktop/assets/%.png tools/img2aiosimg.py
 
 # A test fixture, built by the same toolchain as everything else and installed
 # next to the tests it belongs to.
-boot/build/liar-worker: tests/fixtures/liar-worker.c
+# Fixtures get the SAME link flags as everything else in the image. A fixture
+# linked dynamically cannot run in an initramfs that has no libc: the shell says
+# "not found", which reads like a missing file rather than a missing loader, and
+# the suite that uses it fails with status 127 for a reason that has nothing to do
+# with what it is testing.
+boot/build/%: tests/fixtures/%.c
 	@mkdir -p $(BLD)
-	$(CC) $(CFLAGS) -o $@ $<
-
-boot/build/deaf-worker: tests/fixtures/deaf-worker.c
-	@mkdir -p $(BLD)
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
 $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	   $(BLD)/aios-memctl $(BLD)/tool-exec $(BLD)/aios-governor \
@@ -152,6 +153,7 @@ $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	@ln -sf busybox $(STAGE)/bin/sort
 	@ln -sf busybox $(STAGE)/bin/uniq
 	@ln -sf busybox $(STAGE)/bin/dirname
+	@ln -sf busybox $(STAGE)/bin/tr
 	@ln -sf busybox $(STAGE)/bin/touch
 	@ln -sf busybox $(STAGE)/bin/sleep
 	@ln -sf busybox $(STAGE)/bin/true

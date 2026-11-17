@@ -7,6 +7,8 @@
 #include <string.h>
 
 static int g_checks = 0;
+/* argv[0] as invoked: the only thing a shell knows about where we live. */
+__attribute__((unused)) static const char *g_argv0 = "";
 static int g_failed = 0;
 __attribute__((unused)) static int g_skips = 0;
 
@@ -37,7 +39,8 @@ __attribute__((unused)) static int g_skips = 0;
     } while (0)
 
 #define TEST_MAIN()                                             \
-    int main(void) {                                            \
+    int main(int argc, char **argv) {                           \
+        (void)argc; g_argv0 = argv[0];                          \
         run();                                                  \
         (void)g_skips;                                          \
         if (g_skips)                                            \

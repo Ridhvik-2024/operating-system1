@@ -14,6 +14,49 @@
 #include <string.h>
 #include <unistd.h>
 
+/* Locate a test fixture without depending on one way of knowing where we are.
+ *
+ * /proc/self/exe is the best answer and the obvious one, but it is not the only
+ * answer: under a chroot it reports a path that does not exist inside the
+ * chroot, and /proc may not be mounted at all on a minimal boot. When the first
+ * candidate fails this used to give up, and the failure looked like "the fixture
+ * is missing" -- a test that quietly stops testing.
+ */
+static bool find_fixture(const char *name, char *out, size_t cap, const char *argv0) {
+    char self[256];
+    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (n > 0) {
+        self[n] = 0;
+        char *slash = strrchr(self, '/');
+        if (slash) {
+            *slash = 0;
+            snprintf(out, cap, "%s/%s", self, name);
+            if (access(out, X_OK) == 0) return true;
+        }
+    }
+
+    /* Where the booted image installs fixtures, by convention. */
+    snprintf(out, cap, "/usr/lib/aios/tests/%s", name);
+    if (access(out, X_OK) == 0) return true;
+
+    /* The source tree, for `make test`. */
+    snprintf(out, cap, "build/%s", name);
+    if (access(out, X_OK) == 0) return true;
+
+    /* The directory argv[0] was invoked from, which is all a shell knows. */
+    if (argv0 && strchr(argv0, '/')) {
+        char dir[256];
+        snprintf(dir, sizeof dir, "%s", argv0);
+        char *slash = strrchr(dir, '/');
+        if (slash) {
+            *slash = 0;
+            snprintf(out, cap, "%s/%s", dir, name);
+            if (access(out, X_OK) == 0) return true;
+        }
+    }
+    return false;
+}
+
 static sh_shell *sh = NULL;
 
 static void run(const char *line, sh_result *r) {
@@ -410,22 +453,9 @@ static void shell_tests(void) {
      * its fixture failed to build and the failure was treated as a skip.
      */
     {
-        /* Beside this executable first (that is where the booted image installs
-         * it), then the source tree's build/ for a local `make test`. */
         char liar[512];
-        liar[0] = 0;
-        ssize_t en = readlink("/proc/self/exe", liar, sizeof liar - 1);
-        if (en > 0) {
-            liar[en] = 0;
-            char *slash = strrchr(liar, '/');
-            if (slash) snprintf(slash + 1, sizeof liar - (size_t)(slash + 1 - liar),
-                                "liar-worker");
-        }
-        if (liar[0] == 0 || access(liar, X_OK) != 0) {
-            if (!getcwd(liar, sizeof liar)) liar[0] = 0;
-            size_t ll = strlen(liar);
-            snprintf(liar + ll, sizeof liar - ll, "/build/liar-worker");
-        }
+        CHECK(find_fixture("liar-worker", liar, sizeof liar, g_argv0),
+              "the adversary worker is built (make build/liar-worker)");
 
         /* If the fixture is missing, this must FAIL: a security test that
          * quietly does nothing is worse than no test, because it is believed. */
@@ -548,7 +578,9 @@ static void router_tests(void) {
 
 #include "aios/types.h"
 
-int main(void) {
+
+int main(int argc, char **argv) {
+    (void)argc; g_argv0 = argv[0];
     router_tests();
     shell_tests();
     printf("%s: %d checks, %d failed\n",
