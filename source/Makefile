@@ -7,8 +7,8 @@ LDFLAGS  = -pthread -lm
 AR      ?= ar
 
 LIB_SRCS  := src/json.c src/types.c src/aiproc.c src/sembus.c \
-	     src/mem.c src/tools.c src/sandbox.c src/agent.c src/cortex.c \
-	     src/shell.c src/shroute.c src/ksched.c src/ebpf.c src/hardening.c \
+	     src/action.c src/mem.c src/tools.c src/sandbox.c src/agent.c \
+	     src/cortex.c src/shell.c src/shroute.c src/ksched.c src/ebpf.c src/hardening.c \
 	     src/microlm.c src/autopilot.c src/durable.c \
 	     src/fb.c src/win.c src/input.c
 LIB_OBJS  := $(LIB_SRCS:.c=.o)
