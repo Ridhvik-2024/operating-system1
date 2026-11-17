@@ -22,6 +22,7 @@ LDFLAGS := -static -pthread -lm -Wl,--gc-sections
 
 LIB_SRCS  := src/json.c src/types.c src/aiproc.c src/sembus.c \
 	     src/action.c src/policy.c src/mem.c src/tools.c src/sandbox.c \
+	     src/stage.c \
 	     src/agent.c \
 	     src/cortex.c src/shell.c src/shroute.c src/ksched.c src/ebpf.c src/hardening.c \
 	     src/microlm.c src/autopilot.c src/durable.c \
@@ -170,7 +171,9 @@ $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	@echo "   in boot/.m10-size-cap"
 	@if [ ! -f $(BOOT_DIR)/.m10-size-cap ]; then \
 	     s=$$(stat -c %s $@); echo $$((s + 131072)) > $(BOOT_DIR)/.m10-size-cap; \
-	     echo "   cap pinned: $$((s + 131072)) (first M10 build + 128KB)"; \
+	     echo "   cap pinned: $$((s + 131072)) (first build + 128KB headroom)"; \
+	     echo "   this file is tracked in git, so raising it is a reviewed commit:"; \
+	     echo "   that is the only form of this guard that can fail in CI"; \
 	 fi; \
 	 cap=$$(cat $(BOOT_DIR)/.m10-size-cap); size=$$(stat -c %s $@); \
 	 echo "   v1.1 initramfs: $$size bytes (cap $$cap)"; \

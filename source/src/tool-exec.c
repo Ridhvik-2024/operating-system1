@@ -35,6 +35,11 @@
 #define FS_READ_MAX  (256u * 1024)
 #define FS_WRITE_MAX (1024u * 1024)
 
+/* Set from the request envelope before any tool runs. Default: a human
+ * invocation, which writes through to the jail. */
+static int  g_origin_ai = 0;
+static char g_stage[1024];
+
 /* ---------------- calc: recursive-descent evaluator ----------------
  * Grammar (C-style precedence):
  *   expr   := term  (('+'|'-') term)*
@@ -181,6 +186,18 @@ static json_val *tool_fs_read(json_val *args, char *err, size_t ecap) {
     return res;
 }
 
+/* M3: where a write actually goes.
+ *
+ * `g_origin_ai` and `g_stage` come from the request envelope, not the
+ * environment (see tools.h for why). The invariant this function exists to
+ * enforce:
+ *
+ *     if the origin is AI, a write either lands in staging or it fails.
+ *     It never falls back to the jail.
+ *
+ * That last clause is the whole point. A staging layer that silently writes
+ * through when its directory is missing is worse than no staging layer,
+ * because everything upstream believes the write is pending review. */
 static json_val *tool_fs_write(json_val *args, char *err, size_t ecap) {
     const char *path = json_str(json_obj_get(args, "path"));
     const char *content = json_str(json_obj_get(args, "content"));
@@ -188,25 +205,62 @@ static json_val *tool_fs_write(json_val *args, char *err, size_t ecap) {
         snprintf(err, ecap, "fs.write needs {\"path\":rel,\"content\":str}");
         return NULL;
     }
+
+    char dest[2048];
+    if (g_origin_ai) {
+        if (!g_stage[0]) {
+            snprintf(err, ecap, "an AI write was refused: no staging directory "
+                                "was supplied (a machine write may never land "
+                                "directly)");
+            return NULL;
+        }
+        /* jail-relative containment inside the staging dir, again: the parent
+         * validated this, and we do not trust the parent.
+         *
+         * realpath() writes up to PATH_MAX bytes, so it gets its own
+         * PATH_MAX-sized buffer. Handing it `dest` (2048) overflowed the stack
+         * the first time this ran. */
+        char stageabs[PATH_MAX];
+        if (!realpath(g_stage, stageabs)) {
+            snprintf(err, ecap, "an AI write was refused: staging dir %.120s "
+                                "does not exist", g_stage);
+            return NULL;
+        }
+        size_t alen = strlen(stageabs);
+        size_t plen = strlen(path);
+        if (alen + plen + 8 >= sizeof dest) {
+            snprintf(err, ecap, "an AI write was refused: staged path too long");
+            return NULL;
+        }
+        memcpy(dest, stageabs, alen);
+        memcpy(dest + alen, "/upper/", 7);
+        memcpy(dest + alen + 7, path, plen + 1);
+    } else {
+        snprintf(dest, sizeof dest, "%s", path);
+    }
     size_t clen = strlen(content);
     if (clen > FS_WRITE_MAX) {
         snprintf(err, ecap, "content exceeds 1MB write limit");
         return NULL;
     }
     /* create parent directories so agents can write new paths */
-    char dirbuf[1024];
-    snprintf(dirbuf, sizeof dirbuf, "%s", path);
+    char dirbuf[2048];
+    if (strlen(dest) >= sizeof dirbuf) {
+        snprintf(err, ecap, "fs.write: path too long");
+        return NULL;
+    }
+    memcpy(dirbuf, dest, strlen(dest) + 1);
     char *slash = strrchr(dirbuf, '/');
     if (slash && slash != dirbuf) {
         *slash = 0;
         if (aios_mkdirs(dirbuf) != AIOS_OK) {
-            snprintf(err, ecap, "fs.write: cannot create directory %.80s", dirbuf);
+            snprintf(err, ecap, "fs.write: cannot create directory %.200s", dirbuf);
             return NULL;
         }
     }
-    FILE *f = fopen(path, "wb");
+    FILE *f = fopen(dest, "wb");
     if (!f) {
-        snprintf(err, ecap, "fs.write: cannot open %s (%s)", path, strerror(errno));
+        snprintf(err, ecap, "fs.write: cannot open %.200s (%s)", dest, strerror(errno));
         return NULL;
     }
     bool ok = fwrite(content, 1, clen, f) == clen;
@@ -218,6 +272,7 @@ static json_val *tool_fs_write(json_val *args, char *err, size_t ecap) {
     json_val *res = json_new_obj();
     json_obj_set(res, "path", json_new_str(path));
     json_obj_set(res, "bytes", json_new_num((double)clen));
+    json_obj_set(res, "staged", json_new_bool(g_origin_ai));
     return res;
 }
 
@@ -361,6 +416,13 @@ int main(int argc, char **argv) {
         json_obj_set(resp, "error", json_new_str("unparsable request"));
     } else {
         const char *tool = json_str(json_obj_get(req, "tool"));
+        /* M3 envelope: the parent states the origin and the staging dir. */
+        const char *origin = json_str(json_obj_get(req, "origin"));
+        const char *stage_dir = json_str(json_obj_get(req, "stage"));
+        g_origin_ai = origin && strcmp(origin, "ai") == 0;
+        g_stage[0] = 0;
+        if (stage_dir && *stage_dir && strlen(stage_dir) < sizeof g_stage)
+            memcpy(g_stage, stage_dir, strlen(stage_dir) + 1);
         json_val *args = json_obj_take(req, "args");
         if (!args) args = json_new_obj();
         json_val *result = NULL;

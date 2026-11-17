@@ -204,8 +204,31 @@ aios_status agent_run(const agent_cfg *cfg, char *final_out, size_t cap) {
             free(args_json);
             continue;
         }
-        st = tool_exec(cfg->tools, act.tool, act.args, &result,
-                       err, sizeof err);
+        /* Mediation. The loop does not get to call tools on its own authority:
+         * the guardian sees the tool and its args first, and can refuse or
+         * redirect. Without one, nothing here would ever have been gated.
+         *
+         * A refusal is reported as a tool failure rather than aborting the
+         * loop: the planner then sees why in its own history and can choose a
+         * different route. Silently retrying is prevented by the duplicate
+         * check above; failing the whole run would make a single refused step
+         * kill an otherwise productive agent. */
+        bool refused = false;
+        if (cfg->guard.check) {
+            char gerr[512] = {0};
+            if (cfg->guard.check(cfg->guard.ud, act.tool, act.args,
+                                 gerr, sizeof gerr) != 0) {
+                snprintf(err, sizeof err, "%.400s", gerr[0] ? gerr : "refused");
+                refused = true;
+            }
+        }
+        if (refused) {
+            st = AIOS_ERR_TOOL;
+            result = NULL;
+        } else {
+            st = tool_exec(cfg->tools, act.tool, act.args, &result,
+                           err, sizeof err);
+        }
         act.args = NULL; /* consumed by tool_exec */
         snprintf(last_tool, sizeof last_tool, "%s", act.tool);
         last_ok = (st == AIOS_OK);

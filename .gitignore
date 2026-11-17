@@ -30,7 +30,10 @@ source/boot/module/modules.order
 source/boot/module/*.mod.c
 source/boot/module/*.mod
 source/boot/module/.*.cmd
-source/boot/.m10-size-cap
+# NOTE: source/boot/.m10-size-cap is deliberately NOT ignored. A size cap that
+# is regenerated on every fresh checkout ("first build + 128KB") can never fail
+# in CI: each run re-pins it to whatever the build just produced. The cap is a
+# tracked, reviewable number; raising it is a commit.
 
 # ---- release bundle: GENERATED, never committed ----
 # The repo keeps exactly one copy of each binary (source/boot/dl/). The flat

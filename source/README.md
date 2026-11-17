@@ -98,7 +98,7 @@ aios/
 ```bash
 make          # builds libaios.a, tool-exec, aiosh, aios-governor,
               # aios-demo, aios-memctl
-make test     # builds and runs all tests (13 suites)
+make test     # builds and runs all tests (14 suites)
 make install  # PREFIX=/usr/local (DESTDIR-aware); see INSTALL.md
 ```
 
@@ -136,7 +136,7 @@ Linux 6.6.142-0-virt base | system services layer: AI-native ...
 [init] durable: this is boot #2 for this data disk
 [init] autopilot governor: pid 433 (mode balanced)
 [init] phase 1/2: AI-OS selftest (M1-M8 unit + integration suite)
-  ... 13 suites ...
+  ... 14 suites ...
 AIOS-SELFTEST: PASS
 AIOS-BOOT-OK selftest=PASS
 
@@ -318,7 +318,7 @@ PASS build/tests/test_kernel       ( 4 checks, 5 env-skipped on the host;
 PASS build/tests/test_autopilot    (61 checks, 3 env-skipped)
 PASS build/tests/test_durable      (35 checks, 1 env-skipped)
 PASS build/tests/test_fb           (89 checks)
-== 13 passed, 0 failed ==
+== 14 passed, 0 failed ==
 ```
 
 The sandbox suite proves: arithmetic evaluation, fs round-trips inside the

@@ -8,6 +8,7 @@ AR      ?= ar
 
 LIB_SRCS  := src/json.c src/types.c src/aiproc.c src/sembus.c \
 	     src/action.c src/policy.c src/mem.c src/tools.c src/sandbox.c \
+	     src/stage.c \
 	     src/agent.c \
 	     src/cortex.c src/shell.c src/shroute.c src/ksched.c src/ebpf.c src/hardening.c \
 	     src/microlm.c src/autopilot.c src/durable.c \

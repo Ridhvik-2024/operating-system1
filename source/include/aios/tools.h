@@ -54,6 +54,17 @@ void tool_reg_install_default(tool_reg *tr);
 /* Wall-clock budget for sandboxed tool calls (default 10s, min 0.5s). */
 void tool_set_sandbox_timeout(double seconds);
 
+/* M3: redirect machine-originated writes into `stage_dir` for the next call.
+ * The directory travels in the request JSON as an argument, never in the
+ * environment: env vars are inherited by everything the worker spawns, so the
+ * staging location would leak into any process a tool starts. Pass NULL to
+ * clear (a human's write goes straight to the jail).
+ *
+ * With staging set, the worker treats the action as AI-originated and refuses
+ * to write at all if the directory is missing -- an AI write must never fall
+ * back to writing reality directly. */
+void tool_reg_set_staging(tool_reg *tr, const char *stage_dir);
+
 #ifdef __cplusplus
 }
 #endif

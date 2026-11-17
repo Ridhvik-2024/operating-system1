@@ -22,7 +22,11 @@
 #include "aios/autopilot.h"
 #include "aios/durable.h"
 #include "aios/policy.h"
+#include "aios/stage.h"
 #include "shroute.h"
+
+#include <dirent.h>
+#include <sys/stat.h>
 
 #include <ctype.h>
 #include <errno.h>
@@ -113,6 +117,12 @@ struct sh_shell {
     char      cortex_mode[16];
     int       last_needs_sandbox;    /* M2: host requirements from the verdict */
     int       last_needs_rollback;
+
+    /* M3: a machine-originated write lands here instead of the jail. NULL means
+     * the tool layer writes directly (a human typed the command, or the caller
+     * opted out). Set up per command, torn down after it. */
+    char      stage_dir[512];
+    int       stage_live;
 
     char *var_name[SH_MAX_VARS];
     char *var_val[SH_MAX_VARS];
@@ -525,6 +535,171 @@ static int exec_tool(sh_shell *sh, const char *name, json_val *args,
     return 0;
 }
 
+/* ---- M3: staging for machine-originated writes ----
+ *
+ * The rule: if an AI chose the action, its writes do not land. They go to a
+ * staging directory, are shown as a diff, and land only on `promote`. A human's
+ * own `fs.write` still writes directly -- gating a person's explicit command
+ * behind a second confirmation is theatre, and people learn to click through
+ * theatre.
+ *
+ * The staged directory is passed to the worker as an ARGUMENT, not an env var:
+ * an environment variable is inherited by everything the worker spawns, so it
+ * would leak the staging location into any process the tool starts.
+ */
+static bool sh_stage_begin(sh_shell *sh, aios_action *act, char *err, size_t ecap) {
+    if (!sh || !act) return false;
+    stage_session s;
+    if (!stage_begin(sh->jail, sh->store, act->intent_hash, 0, &s, err, ecap)) {
+        sh->stage_live = 0;
+        sh->stage_dir[0] = 0;
+        return false;
+    }
+    snprintf(sh->stage_dir, sizeof sh->stage_dir, "%s", s.dir);
+    sh->stage_live = 1;
+
+    /* Pre-note every declared write so the diff has rows even if the worker
+     * never gets the chance to note its own. The note is idempotent. */
+    for (int i = 0; i < act->n_declared; i++) {
+        const char *eff = act->declared[i];       /* "write:a/b.txt" */
+        if (!eff || strncmp(eff, "write:", 6) != 0) continue;
+        const char *p = eff + 6;
+        if (*p) stage_note(&s, p, STAGE_OP_ADD, err, ecap);
+    }
+    stage_end(&s);
+    return true;
+}
+
+static void sh_stage_drop(sh_shell *sh) {
+    if (!sh) return;
+    sh->stage_live = 0;
+    sh->stage_dir[0] = 0;
+}
+
+/* After a staged tool run: turn the session into a diff for the human. */
+static int sh_stage_report(sh_shell *sh, char **text_out, char *err, size_t ecap) {
+    stage_session s;
+    if (!stage_open(sh->stage_dir, &s, err, ecap)) {
+        sh_stage_drop(sh);
+        *text_out = strdup("(staged, but the session could not be reopened)\n");
+        return 0;
+    }
+    stage_diff d;
+    int rc = 0;
+    if (stage_diff_compute(&s, &d, err, ecap)) {
+        char *body = stage_diff_text(&d);
+        char *msg = NULL;
+        if (asprintf(&msg,
+                     "%s"
+                     "  nothing was written to the jail.\n"
+                     "  promote            apply it\n"
+                     "  discard            throw it away\n",
+                     body ? body : "") < 0)
+            msg = NULL;
+        free(body);
+        *text_out = msg ? msg : strdup("(staged)\n");
+        stage_diff_free(&d);
+    } else {
+        *text_out = strdup("(staged, but the diff could not be computed)\n");
+        rc = 0;
+    }
+    stage_end(&s);
+    return rc;
+}
+
+/* ---- the guardian: how the agent loop reaches policy and staging ----
+ *
+ * The agent loop used to call tool_exec() directly. That made it the one place
+ * an action ran with no descriptor, no verdict and no staging -- and the agent
+ * is precisely the component most likely to act unsupervised, so this was the
+ * largest hole in the constitution, not a detail.
+ *
+ * Every step now builds a real descriptor and asks the same two questions the
+ * shell asks: is this permitted, and does it land here or in staging?
+ */
+typedef struct {
+    sh_shell *sh;
+    const char *goal;      /* the agent's goal, for the intent hash */
+    size_t    n_staged;
+    int       n_refused;
+} sh_guard_ctx;
+
+static int sh_agent_guard(void *ud, const char *tool, json_val *args,
+                          char *err, size_t ecap) {
+    sh_guard_ctx *g = (sh_guard_ctx *)ud;
+    if (!g || !g->sh) return 1;
+    sh_shell *sh = g->sh;
+
+    const char *path = json_str(json_obj_get(args, "path"));
+    aios_act_kind kind = ACT_TOOL;
+    if (strcmp(tool, "fs.write") == 0) kind = ACT_FS_WRITE;
+    else if (strcmp(tool, "fs.read") == 0 || strcmp(tool, "fs.list") == 0 ||
+             strcmp(tool, "calc") == 0 || strcmp(tool, "memory.search") == 0 ||
+             strcmp(tool, "proc.info") == 0)
+        kind = ACT_TOOL;
+
+    /* An AI action. There is no path from the agent loop to a human-origin
+     * descriptor: the origin is not a parameter the planner can choose. */
+    /* The target must be the TOOL for a tool action, not the path: the gate
+     * looks up `target` among the shell's capabilities, so `fs.write` has to
+     * appear there for the capability rule to be decided. The path travels in
+     * args, and policy step 2 also inspects it directly. */
+    aios_action *act = aios_action_new(kind, ORIGIN_AI, tool);
+    if (!act) {
+        snprintf(err, ecap, "cannot build a descriptor for %s", tool);
+        return 1;
+    }
+
+    /* An AI action must carry an intent hash, and M1 refuses one that does
+     * not. A fresh descriptor has none, so without this the guardian would
+     * refuse every single step -- fail-closed, but useless. The intent is the
+     * agent's goal plus the tool, which is what a reviewer would want to see
+     * in the audit record. */
+    char intent[256];
+    snprintf(intent, sizeof intent, "%.180s -> %s", g->goal ? g->goal : "", tool);
+    aios_action_set_intent(act, intent);
+    (void)path;
+
+    int rc = 0;
+    if (kind == ACT_FS_WRITE && path) {
+        /* Declare the effects on the action itself, so policy sees exactly the
+         * descriptor a typed command would produce. This also gives step 2d a
+         * `path` to inspect even when the effect could not be declared. */
+        /* The action carries the path so M1 can validate it and policy step 2
+         * can inspect it; the content stays with the planner's args, which are
+         * what actually reach the tool. */
+        json_val *probe = json_new_obj();
+        json_obj_set(probe, "path", json_new_str(path));
+        json_obj_set(probe, "content", json_new_str(""));
+        aios_action_set_args(act, probe);
+        aios_action_declare_tool_effects(act, tool, probe);
+    }
+
+    if (action_gate(sh, act, err, ecap) != 0) {
+        g->n_refused++;
+        aios_action_free(act);
+        return 1;
+    }
+    action_accept(sh, act);
+
+    /* An AI write is staged, not applied. This is the same rule the typed
+     * path follows; the difference is that here the human never saw the
+     * command, so the diff afterwards is the only place they can catch it. */
+    if (kind == ACT_FS_WRITE) {
+        if (!sh->stage_live) {
+            if (!sh_stage_begin(sh, act, err, ecap)) {
+                aios_action_free(act);
+                return 1;
+            }
+        }
+        tool_reg_set_staging(sh->tools, sh->stage_dir);
+        g->n_staged++;
+    }
+
+    aios_action_free(act);
+    return rc;
+}
+
 /* Execute a tool THROUGH its descriptor.
  *
  * `act` is borrowed: the caller keeps ownership and frees it after the call,
@@ -544,8 +719,33 @@ static int exec_tool_action(sh_shell *sh, aios_action *act,
         return 1;
     }
     action_accept(sh, act);
-    return exec_tool(sh, act->target, aios_action_take_args(act),
-                     text_out, json_out, err, ecap);
+
+    /* M3: an AI write is intercepted before it can reach the jail. */
+    bool staged = false;
+    if (act->origin == ORIGIN_AI && strcmp(act->target, "fs.write") == 0) {
+        if (!sh_stage_begin(sh, act, err, ecap)) {
+            stage_text_of(NULL, NULL, text_out);
+            *json_out = NULL;
+            return 1;
+        }
+        staged = true;
+    }
+
+    /* Tell the tool layer where an AI write must go. Cleared on every path so
+     * one staged command cannot redirect the next one. */
+    tool_reg_set_staging(sh->tools, staged ? sh->stage_dir : NULL);
+    int rc = exec_tool(sh, act->target, aios_action_take_args(act),
+                       text_out, json_out, err, ecap);
+    tool_reg_set_staging(sh->tools, NULL);
+    if (staged) {
+        /* The worker wrote into the staging dir (it was told where). Replace
+         * the raw tool text with the diff the human needs to decide. */
+        free(*text_out);
+        char *msg = NULL;
+        rc = sh_stage_report(sh, &msg, err, ecap);
+        *text_out = msg;
+    }
+    return rc;
 }
 
 /* Build tool args from argv (key=value / {json} / positional shorthand),
@@ -674,9 +874,11 @@ static int run_agent_fg(sh_shell *sh, const aios_action *act,
     sembus_pub_kv(sh->bus, "sh.agent.start",
                   (const char *const[]){"agent", "sh", "goal", goal,
                                         "cortex", sh->cortex_mode, NULL});
+    sh_guard_ctx gctx = { .sh = sh, .goal = goal, .n_staged = 0, .n_refused = 0 };
     agent_cfg cfg = {
         .name = "sh", .goal = goal, .cx = cx,
-        .tools = sh->tools, .mem = sh->mem, .max_steps = 10
+        .tools = sh->tools, .mem = sh->mem, .max_steps = 10,
+        .guard = { .check = sh_agent_guard, .ud = &gctx }
     };
     char final[2048] = {0};
     aios_status st = agent_run(&cfg, final, sizeof final);
@@ -688,7 +890,25 @@ static int run_agent_fg(sh_shell *sh, const aios_action *act,
                                                     : aios_status_str(st),
                                         "ms", msbuf, NULL});
     cortex_free(cx);
-    *text_out = xstrdup(final);
+
+    /* If the agent tried to write, what the human needs is the diff, not the
+     * agent's summary of it. The summary is optimistic by construction. */
+    if (sh->stage_live) {
+        char *diff = NULL;
+        sh_stage_report(sh, &diff, err, ecap);
+        if (diff) {
+            char *msg = NULL;
+            if (asprintf(&msg, "%s\n%s", final, diff) < 0) msg = NULL;
+            free(diff);
+            *text_out = msg ? msg : xstrdup(final);
+        } else {
+            *text_out = xstrdup(final);
+        }
+        sh->stage_live = 0;
+        sh->stage_dir[0] = 0;
+    } else {
+        *text_out = xstrdup(final);
+    }
     if (st != AIOS_OK) {
         /* Clamp the message into the caller's buffer on purpose: a failed
          * agent run may carry a 2 KB final state, and err/ecap is whatever
@@ -875,6 +1095,129 @@ static int builtin_policy(sh_shell *sh, sargv *a,
         sb_puts(&b, i + 1 < SH_N_CAPS ? ", " : "\n");
     }
     *text_out = b.s ? b.s : strdup("");
+    (void)json_out;
+    return 0;
+}
+
+/* ---- M3: the human half of staging ---- */
+
+/* Find the most recent staging session in the store. `promote` with no argument
+ * means "the thing I was just shown", which is what a human will type. */
+static bool sh_latest_stage(sh_shell *sh, char *out, size_t ocap) {
+    char staging[600];
+    snprintf(staging, sizeof staging, "%s/staging", sh->store);
+    DIR *d = opendir(staging);
+    if (!d) return false;
+
+    char best[512] = {0};
+    long long best_mtime = -1;
+    /* `staging` may be up to 600 bytes and `best` is 512: we copy only what
+     * fits and refuse a session dir we could not name completely. */
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char dir[700];
+        int dn = snprintf(dir, sizeof dir, "%s/%s", staging, de->d_name);
+        if (dn < 0 || (size_t)dn >= sizeof dir) continue;
+        if (stage_manifest_state(dir) == STAGE_MANIFEST_NONE) continue;
+        if (stage_manifest_state(dir) == STAGE_MANIFEST_DONE) continue;
+        struct stat sst;
+        if (stat(dir, &sst) != 0 || !S_ISDIR(sst.st_mode)) continue;
+        if ((long long)sst.st_mtime >= best_mtime) {
+            best_mtime = (long long)sst.st_mtime;
+            if (strlen(dir) < sizeof best) memcpy(best, dir, strlen(dir) + 1);
+        }
+    }
+    closedir(d);
+    if (!best[0] || strlen(best) >= ocap) return false;
+    memcpy(out, best, strlen(best) + 1);
+    return true;
+}
+
+static int builtin_staged(sh_shell *sh, char **text_out, json_val **json_out,
+                          char *err, size_t ecap) {
+    char dir[600];
+    if (sh->stage_live && sh->stage_dir[0]) {
+        if (strlen(sh->stage_dir) >= sizeof dir) { *text_out = strdup(""); return 1; }
+        memcpy(dir, sh->stage_dir, strlen(sh->stage_dir) + 1);
+    } else if (!sh_latest_stage(sh, dir, sizeof dir)) {
+        *text_out = strdup("nothing is staged\n");
+        (void)json_out;
+        return 0;
+    }
+    stage_session s;
+    if (!stage_open(dir, &s, err, ecap)) return 1;
+    stage_diff d;
+    if (!stage_diff_compute(&s, &d, err, ecap)) { stage_end(&s); return 1; }
+    char *body = stage_diff_text(&d);
+    *text_out = body;
+    stage_diff_free(&d);
+    stage_end(&s);
+    (void)json_out;
+    return 0;
+}
+
+static int builtin_promote(sh_shell *sh, sargv *a, char **text_out,
+                           json_val **json_out, char *err, size_t ecap) {
+    char dir[600];
+    if (a->n >= 2) {
+        snprintf(dir, sizeof dir, "%s", a->v[1]);
+    } else if (!sh_latest_stage(sh, dir, sizeof dir)) {
+        snprintf(err, ecap, "nothing is staged to promote");
+        return 1;
+    }
+    stage_session s;
+    if (!stage_open(dir, &s, err, ecap)) return 1;
+    size_t n = 0;
+    /* A human typed `promote`: that makes the change human-sponsored, which is
+     * exactly what the policy layer wanted before it would let it through. The
+     * staging record is the accountability link between the AI that proposed
+     * the change and the person who accepted it. */
+    bool ok = stage_promote_locked(&s, &n, err, ecap);
+    if (ok) {
+        char line[256];
+        snprintf(line, sizeof line, "promoted %zu file%s into the jail\n",
+                 n, n == 1 ? "" : "s");
+        *text_out = strdup(line);
+        if (sh->bus) {
+            char ev[512];
+            snprintf(ev, sizeof ev, "{\"files\":%zu,\"dir\":\"%.300s\"}", n, s.dir);
+            sembus_pub(sh->bus, "sh.stage.promote", ev);
+        }
+    }
+    stage_end(&s);
+    (void)json_out;
+    return ok ? 0 : 1;
+}
+
+static int builtin_discard(sh_shell *sh, sargv *a, char **text_out,
+                           json_val **json_out, char *err, size_t ecap) {
+    char dir[600];
+    if (a->n >= 2) {
+        snprintf(dir, sizeof dir, "%s", a->v[1]);
+    } else if (!sh_latest_stage(sh, dir, sizeof dir)) {
+        snprintf(err, ecap, "nothing is staged to discard");
+        return 1;
+    }
+    stage_session s;
+    if (!stage_open(dir, &s, err, ecap)) return 1;
+    bool ok = stage_discard(&s, err, ecap);
+    if (ok) *text_out = strdup("discarded; the jail was never touched\n");
+    stage_end(&s);
+    (void)json_out;
+    return ok ? 0 : 1;
+}
+
+static int builtin_gc(sh_shell *sh, char **text_out, json_val **json_out,
+                      char *err, size_t ecap) {
+    stage_gc_result r;
+    if (!stage_gc(sh->store, (long long)aios_now_ms(), 3600LL * 1000, &r,
+                  err, ecap))
+        return 1;
+    char line[192];
+    snprintf(line, sizeof line, "gc: removed %zu stale session%s, kept %zu\n",
+             r.removed, r.removed == 1 ? "" : "s", r.kept);
+    *text_out = strdup(line);
     (void)json_out;
     return 0;
 }
@@ -1723,6 +2066,10 @@ static int run_command(sh_shell *sh, scmd *c,
     if (strcmp(c0, "history") == 0) return builtin_history(sh, text_out);
     if (strcmp(c0, "cortex") == 0)  return builtin_cortex(sh, a, text_out, err, ecap);
     if (strcmp(c0, "jail") == 0)    return builtin_jail(sh, a, text_out, err, ecap);
+    if (strcmp(c0, "staged") == 0)  return builtin_staged(sh, text_out, json_out, err, ecap);
+    if (strcmp(c0, "promote") == 0) return builtin_promote(sh, a, text_out, json_out, err, ecap);
+    if (strcmp(c0, "discard") == 0) return builtin_discard(sh, a, text_out, json_out, err, ecap);
+    if (strcmp(c0, "gc") == 0)      return builtin_gc(sh, text_out, json_out, err, ecap);
     if (strcmp(c0, "store") == 0)   return builtin_store(sh, a, text_out, err, ecap);
     if (strcmp(c0, "jobs") == 0)    return builtin_jobs(sh, text_out);
     if (strcmp(c0, "wait") == 0)    return builtin_wait(sh, a, text_out, err, ecap);

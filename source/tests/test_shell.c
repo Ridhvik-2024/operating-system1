@@ -183,14 +183,46 @@ static void shell_tests(void) {
           "recall finds it");
     sh_result_free(&r);
 
-    /* ---- foreground agent (scripted cortex) ---- */
+    /* ---- foreground agent (scripted cortex) ----
+     *
+     * M3 changed what "the agent wrote a file" MEANS. Before, the write landed
+     * in the jail immediately. Now an AI write is staged, and the human is shown
+     * a diff. This test asserted the old behaviour, so it is the test that had
+     * to change -- not the behaviour. */
     run("summarize the workspace", &r);
     CHECK(r.status == 0 && strstr(r.text, "summary.md"),
           "NL action verb -> agent run");
+    CHECK(strstr(r.text, "nothing was written to the jail") != NULL,
+          "the agent's write is reported as staged, not applied");
+    CHECK(strstr(r.text, "promote") != NULL,
+          "and the human is told how to apply it");
     sh_result_free(&r);
     {
         FILE *f = fopen("build/test-shell/jail/summary.md", "r");
-        CHECK(f != NULL, "agent wrote summary.md in the jail");
+        CHECK(f == NULL, "the agent's write did NOT land in the jail");
+        if (f) fclose(f);
+    }
+    /* and the human can see what it wants to do */
+    run("staged", &r);
+    CHECK(r.status == 0 && strstr(r.text, "summary.md"),
+          "`staged` shows the pending change");
+    sh_result_free(&r);
+    run("discard", &r);
+    CHECK(r.status == 0, "`discard` throws it away");
+    sh_result_free(&r);
+    run("staged", &r);
+    CHECK(strstr(r.text, "nothing is staged") != NULL,
+          "and nothing is staged afterwards");
+    sh_result_free(&r);
+
+    /* A human write still lands directly: gating a person's own explicit
+     * command behind a second confirmation is theatre. */
+    run("fs.write path=direct.txt content=human", &r);
+    CHECK(r.status == 0, "a human write is not staged");
+    sh_result_free(&r);
+    {
+        FILE *f = fopen("build/test-shell/jail/direct.txt", "r");
+        CHECK(f != NULL, "the human's file is in the jail immediately");
         if (f) fclose(f);
     }
 

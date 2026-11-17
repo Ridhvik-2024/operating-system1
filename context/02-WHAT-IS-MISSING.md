@@ -6,13 +6,16 @@ Each gap: what the project claims → what the code does → smallest honest fix
 
 ---
 
-## Part A — The constitution has no implementation
+## Part A — The constitution has partial implementation (M1–M3)
 
 `os_sys_decided.md` opens with: *"Any component, feature, or implementation that
 violates this document is considered invalid by definition."*
-Measured against that: **the shipped OS violates it today**, because the
-mechanisms it mandates do not exist. These are the constitution-level
-statements, each followed by the measured reality.
+Measured against that: **the shipped OS still violates it**, because most of
+the mechanisms it mandates do not exist yet. M1 (descriptor), M2 (policy) and
+M3 (staging) are real now; G3, G5–G9 are not. Each gap below states the claim,
+the reality **at audit time**, and what changed since — the audit-time text is
+kept verbatim so it is obvious how far the tree has moved and how far it has
+not.
 
 ### G1 — Policy engine: **IMPLEMENTED (M2, 2026-11-17)** · was S1
 - **Claim** (`policy_engine.interface.md`): deterministic, side-effect-free,
@@ -67,13 +70,27 @@ statements, each followed by the measured reality.
   `effects:[{path,op,bytes_before,bytes_after}]` + resource usage; host compares
   with the descriptor's declared writes and blocks on undeclared effects.
 
-### G4 — Staged writes, diffs, tombstones, promotion: MISSING · **S1**
+### G4 — Staged writes, diffs, tombstones, promotion: **IMPLEMENTED (M3, 2026-11-17)** · was S1
 - **Claim**: all changes go through staging; diffs mandatory; deletes become
   recoverable tombstones; bulk changes require snapshots; the AI never writes
   reality directly.
-- **Reality**: `fs.write` (`src/tool-exec.c`) does `open(O_CREAT|O_TRUNC)` +
-  write **inside the real jail directory**. A write is immediate, irreversible
-  and invisible to any diff. `rm`-equivalent is not implemented at all.
+- **Reality at audit time**: `fs.write` (`src/tool-exec.c`) did
+  `open(O_CREAT|O_TRUNC)` + write **inside the real jail directory**. A write was
+  immediate, irreversible and invisible to any diff. `rm`-equivalent did not
+  exist. Worse: the agent loop called `tool_exec()` directly, so even the
+  descriptor gate did not apply to it.
+- **Now (M3)**: `src/stage.c`. An AI write is redirected into
+  `<store>/staging/<intent>-<seq>/upper/`; the worker refuses to write at all if
+  the origin is AI and no staging dir was supplied, so there is no silent
+  fall-through to reality. `staged` shows the diff, `promote` applies it,
+  `discard` throws it away. Deletes copy to `trash/` before unlinking and
+  `stage_undelete()` reverses them. The agent loop now goes through
+  `agent_guard`, which builds a real descriptor and asks policy before every
+  step.
+- **Still missing**: overlayfs (this is copy-on-write with renames), a content
+  diff (per-file counts only), rollback of a promoted change (that is M5), and
+  any binding between "the diff you were shown" and "the promote you typed"
+  (M6/M7).
 - **Fix**: overlay. Either (a) inside the image: `mount -t overlay` with
   `lowerdir=/workspace-ro`, `upperdir=/data/staging/<intent-id>` and only
   `pivot`/commit on promotion; or (b) host runtime: copy-on-write temp dir +

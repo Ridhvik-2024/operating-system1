@@ -205,3 +205,43 @@ function that is usually reproducible, which is worse than one that admits it.
 **Cost:** every caller passes a clock; tests pass 0 to mean "no clock".
 **Reverse if:** never. If a rule genuinely needs wall time (it does not today),
 pass it in.
+
+## D15 — 2026-11-17 — The agent loop asks permission, per step
+`agent_cfg.guard` is required, and the loop calls it before every `tool_exec`.
+`src/agent.c` may not run a tool on its own authority.
+**Why:** it did. The agent called `tool_exec()` directly, so every action ran
+with no descriptor, no verdict and no staging — and the agent is the component
+most likely to act unsupervised. M1 and M2 had both shipped believing the shell
+was the only way in. It was not. "Every action is mediated" is false if any
+component has a `tool_exec()` pointer.
+**Cost:** every step builds and validates a descriptor (a few microseconds), and
+a refused step is reported back into the planner's history rather than aborting
+the run — so a refusal is visible and retryable, not fatal.
+**Reverse if:** never. If the guard becomes expensive, make the descriptor
+cheaper; do not let a caller opt out. A NULL guard is legitimate only in tests.
+
+## D16 — 2026-11-17 — `promote` takes its instructions from the manifest, not the directory
+`stage_promote_locked()` is what a human-triggered promote calls. It loads every
+note first, then moves only files named by notes, and refuses anything whose
+`realpath()` escapes `upper/`.
+**Why:** a directory listing is attacker-controlled the moment a human can write
+into the store. Moving "whatever is in upper/" would let someone plant a file or
+a symlink and have the policy engine never see it — a bypass that does not look
+like one. The manifest is written by code paths that build descriptors.
+**Cost:** two promote functions (`stage_promote()` trusts, `stage_promote_locked()`
+does not) and one more thing to keep in step. Worth it: the trusting one is
+never reachable from a shell builtin.
+**Reverse if:** never. If the two converge, delete the trusting one.
+
+## D17 — 2026-11-17 — A refusal must be visible, and a size cap must be tracked
+Two smaller rules this milestone earned:
+**(a)** When the guardian refused every agent step (a missing intent hash), the
+only symptom was an agent reporting success having done nothing. Fail-closed is
+right, silent is not: the refusal now goes into the planner's history, the
+audit log and the returned message.
+**(b)** `source/boot/.m10-size-cap` is no longer in `.gitignore`. It was
+regenerated on every fresh checkout as "first build + 128 KB", so it could never
+fail in CI — each run re-pinned it to whatever the build had just produced. The
+cap is a tracked number now, and raising it is a reviewed commit.
+**Reverse if:** never for either. A guard whose failure mode is silence, or
+whose threshold is set by the thing it measures, is decoration.

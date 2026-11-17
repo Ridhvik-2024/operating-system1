@@ -329,8 +329,11 @@ static aios_decision step3_sandbox(const aios_action *a,
     /* Which actions must have run in a sandbox first? The ones whose effects
      * are inherently unbounded: a raw shell command, a delete, or any
      * fs-write/delete proposal whose declared set is wide. */
-    int requires = (a->kind == ACT_SHELL || a->kind == ACT_FS_DELETE
-                    || (a->kind == ACT_FS_WRITE && a->n_declared > 1));
+    /* Only multi-file writes are treated as bulk (tier 1). A single write is
+     * not "unbounded": it is capped by the descriptor's budget and effect
+     * limit, and every write is reversible once M5 lands. Requiring a sandbox
+     * for one file made every legitimate AI write unsatisfiable. */
+    int requires = (a->kind == ACT_SHELL || a->kind == ACT_FS_DELETE);
 
     /* A delete has a more fundamental rule than "was it sandboxed" (tier 1
      * destructive, which needs a human). If we report the sandbox rule first,
@@ -551,8 +554,15 @@ aios_decision aios_policy_eval(const aios_action *a, const char *jail,
         } else if (a->kind == ACT_AGENT) {
             granted = has_cap(caps, n_caps, "agent:run")
                       || has_cap(caps, n_caps, "agent:*");
+        } else if (a->target && *a->target) {
+            /* A write or delete names its tool, so `tool:fs.write` means what
+             * it says. The earlier `act:FS_WRITE` form was a second vocabulary
+             * for the same thing, and the two could not be satisfied by the
+             * same grant -- which is how every AI write ended up denied. */
+            snprintf(want, sizeof want, "tool:%s", a->target);
+            granted = has_cap(caps, n_caps, want)
+                      || has_cap(caps, n_caps, "tool:*");
         } else {
-            /* fs.write etc.: the capability names the kind. */
             snprintf(want, sizeof want, "act:%s",
                      aios_action_kind_name(a->kind));
             granted = has_cap(caps, n_caps, want);

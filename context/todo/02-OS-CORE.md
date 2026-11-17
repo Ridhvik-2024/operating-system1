@@ -157,7 +157,50 @@ function is deterministic: same inputs → identical `aios_decision` bytes.
 
 ---
 
-## M3 — Staging, diff, promote/discard · **L** · closes G4
+## M3 — Staging, diff, promote/discard · **L** · closes G4 — ✅ **DONE 2026-11-17**
+
+> `include/aios/stage.h` + `src/stage.c`, **122 checks**. An AI write lands in
+> `<store>/staging/<intent>-<seq>/upper/`, the human sees a diff, and `promote`
+> is the only thing that makes it real. Deletes move to `trash/` with a
+> tombstone; `stage_undelete()` restores them.
+>
+> **The card's premise was wrong, and the tests found it.** The card said wire
+> `tool-exec`'s `fs.write`. But the agent loop called `tool_exec()` directly —
+> it never built a descriptor, never asked policy, and never went through the
+> shell's gate. So the largest hole in the constitution was not a missing
+> staging layer; it was that **the component most likely to act unsupervised
+> was the one unmediated path in the system**. Fixed with `agent_guard`: the
+> loop must ask before every tool, and a refusal is reported back into the
+> planner's history rather than aborting the run.
+>
+> **Bugs found by testing, in order of embarrassment:**
+> 1. `realpath()` was handed a 2048-byte buffer. Stack smash, every AI write.
+> 2. Agent descriptors had no intent hash → M1 refused every step. Fail-closed
+>    and completely useless; the guardian looked "installed" and nothing worked.
+> 3. The action target was the *path* instead of the *tool*, so every step
+>    failed the capability lookup.
+> 4. Policy required a sandbox for a single write — which no single write can
+>    ever satisfy — and looked up `act:FS_WRITE` while the shell grants
+>    `tool:fs.write`. Two vocabularies for one grant meant **every AI write was
+>    denied**. Milestones M1 and M2 both shipped that bug; it only became
+>    visible when something finally tried to write.
+> 5. Promote counted *notes* rather than *moves*, so a re-run after an
+>    interruption claimed to have promoted files it had not touched.
+> 6. The diff measured deletes against the jail, where the file no longer
+>    exists, reporting every delete as 0 bytes — the one number a human reads.
+>
+> **Promote is two functions on purpose.** `stage_promote()` trusts the
+> directory; `stage_promote_locked()` — the one a human triggers — re-derives
+> everything from the manifest and refuses symlink escapes, because a person who
+> can write into the store could otherwise promote an arbitrary file and bypass
+> the whole policy engine without it ever looking like a bypass.
+>
+> **Still not real:** no overlayfs (this is copy-on-write with renames, which is
+> portable and testable but O(bytes)); no diff *content*, only per-file counts
+> (+lines/-lines are computed by prefix comparison, so a whole-file rewrite
+> reads as such); staging lives inside the store, so it is not protected from a
+> human who owns the store; `promote` trusts that the human typing it is the one
+> who was shown the diff (no session binding until M6/M7).
 
 **Goal.** No AI write lands in reality. It lands in staging, shows a diff, and a
 human promotes it.

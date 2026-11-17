@@ -19,6 +19,10 @@ struct tool_reg {
     char store[512];
     char agent[128];
     mem_ctx *mem;      /* borrowed */
+    /* M3: when set, sandboxed writes are redirected here and the worker is
+     * told the action is AI-originated. */
+    char stage[512];
+    int  staged;
 };
 
 /* Native tools need registry state (memory ctx, agent name). tools.c
@@ -174,6 +178,17 @@ static void audit_log(tool_reg *tr, const char *tool, const char *args_json,
 
 static double g_sandbox_timeout_s = 10.0;
 
+void tool_reg_set_staging(tool_reg *tr, const char *stage_dir) {
+    if (!tr) return;
+    if (stage_dir && *stage_dir) {
+        snprintf(tr->stage, sizeof tr->stage, "%s", stage_dir);
+        tr->staged = 1;
+    } else {
+        tr->stage[0] = 0;
+        tr->staged = 0;
+    }
+}
+
 void tool_set_sandbox_timeout(double seconds) {
     if (seconds < 0.5) seconds = 0.5;
     g_sandbox_timeout_s = seconds;
@@ -204,6 +219,11 @@ aios_status tool_exec(tool_reg *tr, const char *name, json_val *args,
         json_val *req = json_new_obj();
         json_obj_set(req, "tool", json_new_str(name));
         json_obj_set(req, "args", args ? args : json_new_null());
+        /* M3: origin and staging travel with the request. The worker needs the
+         * origin to enforce "an AI write must not land", and it must receive
+         * that from its parent rather than assume it. */
+        json_obj_set(req, "origin", json_new_str(tr->staged ? "ai" : "human"));
+        if (tr->staged) json_obj_set(req, "stage", json_new_str(tr->stage));
         char *req_json = json_dump(req);
         json_free(req);              /* frees args too: ownership moved */
         args = NULL;
