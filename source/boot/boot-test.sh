@@ -117,16 +117,42 @@ echo "------------------------------------------"
 explain() {
     log=$1; what=$2
     echo "  MISS $what"
-    # Print the END of the log, not the start: the first four PASS lines say
-    # nothing about where the boot stopped. A previous version did exactly that
-    # and produced an annotation full of successes.
-    echo "  --- last lines of $log ---"
-    grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\]' "$log" 2>/dev/null | tail -12 \
-        | sed 's/^/    | /'
-    if [ -n "$GITHUB_ACTIONS" ]; then
-        detail=$(grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\]' "$log" 2>/dev/null \
-                 | tail -4 | tr '\n' ' ' | tr -s ' ' | cut -c1-400)
-        echo "::error title=boot test::missed: $what -- $detail"
+    if [ ! -s "$log" ]; then
+        echo "  --- $log is missing or empty ---"
+        echo "::error title=boot test::$what -- $log is missing or empty (qemu never wrote it)"
+        fail=1
+        return
+    fi
+    lines=$(wc -l < "$log" 2>/dev/null)
+    ours=$(grep -vcE '^\[[[:space:]]*[0-9]+\.[0-9]+\]' "$log" 2>/dev/null)
+    lines=${lines:-0}; ours=${ours:-0}
+    # The log we are given is the artifact's copy, which may itself be empty.
+    # Fall back to the one qemu wrote, so a truncated artifact does not hide a
+    # usable log sitting on disk next to it.
+    if [ "$lines" -eq 0 ] 2>/dev/null && [ -s "${log##*/}" ]; then
+        log=${log##*/}
+        lines=$(wc -l < "$log"); ours=$(grep -vcE '^\[[[:space:]]*[0-9]+\.[0-9]+\]' "$log")
+        echo "  --- artifact copy was empty; using $log ($lines lines) ---"
+    fi
+    echo "  --- $log: $lines lines, $ours from our programs ---"
+    if [ "$ours" -le 1 ] 2>/dev/null; then
+        # Only kernel chatter: our init never printed. The interesting line is the
+        # last kernel one, which is usually the panic or the missing device.
+        panic=$(grep -iE 'panic|not found|No such|error|failed' "$log" 2>/dev/null \
+                | tail -2 | tr '\n' ' ' | tr -s ' ' | cut -c1-300)
+        echo "  --- kernel only; tail: ---"
+        tail -4 "$log" | sed 's/^/    | /'
+        if [ -n "$GITHUB_ACTIONS" ]; then
+            echo "::error title=boot test::our init never printed (kernel-only log). ${panic:+Kernel says: $panic}"
+        fi
+    else
+        echo "  --- last lines from our programs ---"
+        grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\]' "$log" | tail -12 | sed 's/^/    | /'
+        if [ -n "$GITHUB_ACTIONS" ]; then
+            detail=$(grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\]' "$log" \
+                     | tail -4 | tr '\n' ' ' | tr -s ' ' | cut -c1-400)
+            echo "::error title=boot test::missed: $what -- $detail"
+        fi
     fi
     fail=1
 }
