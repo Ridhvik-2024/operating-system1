@@ -11,7 +11,9 @@
    "governed" until those exist.
 3. The next milestone is **the mediator** (D5): descriptor → policy →
    staging/diff → promote/rollback → audit, then namespaces/overlayfs/seccomp-
-   notify underneath it (`03-LINUX-INTEGRATION.md`, Phase L1→L2).
+   notify underneath it (`03-LINUX-INTEGRATION.md`, Phase L1→L2). That is
+   **W0-B** of `ROADMAP-TO-WINDOWS.md`, which is the map to desktop parity
+   (W0 base → W1 platform → W2 shell → W3 apps+SDK → W4 hardware → W5 users).
 4. Before coding: confirm `make && make test` is green using the traps in
    `CONTEXT.agent.md` (font header, `tool-exec` discovery, glibc `sched_param`).
 5. Do not edit the constitution documents (`os_sys_decided.md` + the four
@@ -280,7 +282,8 @@ sandboxed worker · `intent class` INTERACTIVE/BATCH/IDLE ·
 | `03-LINUX-INTEGRATION.md` | you | which Linux parts to adopt, in what order, with acceptance criteria |
 | `04-BUILD-VERIFY.md` | you | exact commands, what passed, what failed and why |
 | `05-DECISIONS.md` | you | decision log + constitution-vs-code conflicts and how to resolve them |
-| `todo/00-MASTER.md` | you | **the phase plan + index + progress tracker** |
+| `ROADMAP-TO-WINDOWS.md` | you | **the window to v5.0: W0–W6 milestones + phases + exit tests** |
+| `todo/00-MASTER.md` | you | the near-term phase plan + index + progress tracker (W0 of the roadmap) |
 | `todo/03-GUI-TASKS.md` | ChatGPT | desktop/app/UI cards (notepad, files, launcher, resize…) |
 | `todo/04-SMALL-TASKS.md` | ChatGPT | tiny ≤1 h cards |
 | `prompts/` | everyone | named, copy-paste prompts (`00`…`09`) |

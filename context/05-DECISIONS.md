@@ -109,3 +109,26 @@ build-target exercise, not an architecture change.
 a uid boundary between human-originated and AI-originated actions (G6).
 **Recommendation:** implement the two-level boundary now (human uid vs `aios`
 uid via user namespace); multi-user later reuses it.
+
+---
+
+## D8 — 2026-11-17 — Target is *capability parity*, not Win32 compatibility
+`context/ROADMAP-TO-WINDOWS.md` defines parity as five layers (platform, shell,
+apps, app platform, ops/security) and explicitly excludes `.exe`/Win32, registry
+semantics and Office file fidelity.
+**Why:** binary compatibility would dictate the whole architecture and poison
+every AI-native decision; capability parity is what a user actually experiences.
+**Cost:** no existing Windows software; everything in the suite is ours.
+**Reverse if:** never for Win32. File *interchange* (ODF/CSV/Markdown/PDF) is a
+separate, smaller commitment that we do keep.
+
+## D9 — 2026-11-17 — Roadmap order: base → platform → shell → apps → hardware
+Storage/persistence (W1) before hardware (W4); the mediator (W0-B) before the app
+platform (W3-A); identity (W1-C) before networking (W1-D); text/Unicode (W2-A)
+before the app suite (W3-B).
+**Why:** each of these is a hard dependency that would otherwise force a rewrite
+(the 8 MiB ext2 disk cannot carry firmware blobs; a capability manifest with no
+enforcer is theatre).
+**Cost:** the flashy things (browser, audio, hardware) land late.
+**Reverse if:** a sponsor needs hardware support first — then W4-A/W4-B move up
+and W1-D slips, at the cost of a non-persistent system for longer.

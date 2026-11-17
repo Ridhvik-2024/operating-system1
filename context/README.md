@@ -34,6 +34,7 @@ context/
 ├── CONTEXT.agent.md           coding-agent memory: commands, traps, recipes
 ├── CONTEXT.chatgpt.md         self-contained paste for ChatGPT
 ├── RULES.md                   BUILD RULES — universal + AI-OS-specific + traps
+├── ROADMAP-TO-WINDOWS.md      v1.1 -> v5.0: W0..W6, phases, exit tests, effort
 ├── 01-WHAT-IS-HERE.md         inventory of every subsystem, with evidence
 ├── 02-WHAT-IS-MISSING.md      gaps G1–G23, severity, smallest honest fix
 ├── 03-LINUX-INTEGRATION.md    which Linux parts, in which phase, acceptance criteria

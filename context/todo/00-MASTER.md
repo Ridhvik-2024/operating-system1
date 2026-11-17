@@ -1,5 +1,11 @@
 # 00-MASTER — AI-OS task list (the plan)
 
+**Big picture:** this file is the **near term** (roadmap phase W0). The full
+path to desktop capability — W0 base → W1 platform → W2 shell → W3 apps + SDK →
+W4 hardware → W5 users/security → W6 ecosystem, ~18–24 months — is
+`context/ROADMAP-TO-WINDOWS.md`. Cards here feed that plan; nothing here is
+thrown away by it.
+
 **How to use:** this is the phase plan and the index. Detailed, delegatable
 cards live in the sibling files:
 
