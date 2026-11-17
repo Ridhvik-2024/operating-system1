@@ -30,7 +30,7 @@ PREFIX=$HOME/.local ./tools/install.sh   # user-local, no root
 ```bash
 make -j          # libaios.a, tool-exec, aiosh, aios-demo, aios-memctl,
                  # aios-governor
-make test        # must print: == 10 passed, 0 failed ==
+make test        # must print: == 11 passed, 0 failed ==
 make install     # PREFIX=/usr/local by default; DESTDIR works for staging
 ```
 
