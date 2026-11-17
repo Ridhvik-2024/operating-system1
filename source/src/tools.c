@@ -23,6 +23,13 @@ struct tool_reg {
      * told the action is AI-originated. */
     char stage[512];
     int  staged;
+
+    /* M4: the account from the last sandboxed call. Owned here so the caller
+     * can inspect it after tool_exec returns, which is when it knows what it
+     * declared. */
+    json_val *last_effects;
+    json_val *last_usage;
+    int       last_complete;
 };
 
 /* Native tools need registry state (memory ctx, agent name). tools.c
@@ -99,6 +106,8 @@ void tool_reg_free(tool_reg *tr) {
         free(t);
         t = nx;
     }
+    json_free(tr->last_effects);
+    json_free(tr->last_usage);
     free(tr);
 }
 
@@ -178,6 +187,21 @@ static void audit_log(tool_reg *tr, const char *tool, const char *args_json,
 
 static double g_sandbox_timeout_s = 10.0;
 
+const json_val *tool_reg_last_effects(const tool_reg *tr) {
+    return tr ? tr->last_effects : NULL;
+}
+
+int tool_reg_last_complete(const tool_reg *tr) {
+    return tr ? tr->last_complete : 0;
+}
+
+void tool_reg_clear_effects(tool_reg *tr) {
+    if (!tr) return;
+    json_free(tr->last_effects);
+    tr->last_effects = NULL;
+    tr->last_complete = 0;
+}
+
 void tool_reg_set_staging(tool_reg *tr, const char *stage_dir) {
     if (!tr) return;
     if (stage_dir && *stage_dir) {
@@ -203,6 +227,11 @@ aios_status tool_exec(tool_reg *tr, const char *name, json_val *args,
         if (err && ecap) snprintf(err, ecap, "invalid tool_exec call");
         return AIOS_ERR_ARG;
     }
+    /* Clear the out-parameter before anything can fail. Without this, a caller
+     * that reuses one `json_val *res` across calls double-frees the previous
+     * result the first time a tool fails -- which is exactly what a test did,
+     * and which every real caller would do eventually. */
+    *result_out = NULL;
     const tool_def *def = tool_reg_find(tr, name);
     if (!def) {
         json_free(args);
@@ -227,17 +256,32 @@ aios_status tool_exec(tool_reg *tr, const char *name, json_val *args,
         char *req_json = json_dump(req);
         json_free(req);              /* frees args too: ownership moved */
         args = NULL;
-        st = sandbox_run(tr->jail,
-                         req_json ? req_json : "{}",
-                         req_json ? strlen(req_json) : 2,
-                         g_sandbox_timeout_s, &res, err, ecap);
+        sandbox_result sr = {0};
+        st = sandbox_run_ex(tr->jail,
+                            req_json ? req_json : "{}",
+                            req_json ? strlen(req_json) : 2,
+                            g_sandbox_timeout_s, &sr, err, ecap);
         free(req_json);
-        if (st == AIOS_OK && res) {
-            /* unwrap worker envelope {"ok":true,"result":X} -> X (or null) */
-            json_val *r = json_obj_take(res, "result");
-            json_free(res);
-            res = r ? r : json_new_null();
+        if (sr.resp) {
+            /* The account is kept whatever the outcome. A tool that failed
+             * halfway may already have written something; discarding its
+             * testimony because it also reported an error would hide exactly
+             * that. The verdict on `st` is unaffected. */
+            /* M4: unpack the envelope, keeping the account. The result is
+             * handed on as before; the effects document rides along beside it,
+             * because the caller needs both to answer "did it do what it
+             * said?" -- a question the result alone cannot answer. */
+            json_val *r = json_obj_take(sr.resp, "result");
+            tr->last_effects = json_obj_take(sr.resp, "effects");
+            tr->last_complete = sr.complete ? json_bool(sr.complete) : 0;
+            json_free(tr->last_usage);
+            tr->last_usage = json_obj_take(sr.resp, "usage");
+            json_free(sr.resp);
+            sr.resp = NULL;
+            if (st == AIOS_OK) res = r ? r : json_new_null();
+            else json_free(r);
         }
+        sandbox_result_free(&sr);
     } else {
         g_active_reg = tr;
         st = def->native ? def->native(args, &res, err, ecap)

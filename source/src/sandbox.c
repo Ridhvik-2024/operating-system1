@@ -5,6 +5,7 @@
 #include "sandbox.h"
 #include "aios/types.h"
 #include "aios/json.h"
+#include "aios/tools.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -18,7 +19,8 @@
 #include <unistd.h>
 #include <limits.h>
 
-#define REQ_MAX  (64u * 1024)
+/* Must match the worker's limit and be larger than a max-size write. */
+#define REQ_MAX  (AIOS_TOOL_REQ_MAX)
 #define RESP_MAX (2u * 1024 * 1024)
 
 static const char *resolve_worker(char *buf, size_t cap) {
@@ -51,11 +53,29 @@ static void set_err(char *err, size_t cap, const char *fmt, ...) {
     va_end(ap);
 }
 
+void sandbox_result_free(sandbox_result *r) {
+    if (!r) return;
+    json_free(r->resp);
+    memset(r, 0, sizeof *r);
+}
+
 aios_status sandbox_run(const char *jail, const char *request_json,
                         size_t req_len, double timeout_s,
                         json_val **result_out, char *err, size_t ecap) {
-    if (!request_json || req_len == 0 || req_len > REQ_MAX || !result_out || !jail)
+    sandbox_result sr = {0};
+    aios_status st = sandbox_run_ex(jail, request_json, req_len, timeout_s,
+                                    &sr, err, ecap);
+    if (st != AIOS_OK) { sandbox_result_free(&sr); return st; }
+    *result_out = sr.resp;        /* transfer ownership of the envelope */
+    return AIOS_OK;
+}
+
+aios_status sandbox_run_ex(const char *jail, const char *request_json,
+                           size_t req_len, double timeout_s,
+                           sandbox_result *out, char *err, size_t ecap) {
+    if (!request_json || req_len == 0 || req_len > REQ_MAX || !out || !jail)
         return set_err(err, ecap, "bad request"), AIOS_ERR_ARG;
+    memset(out, 0, sizeof *out);
 
     char wbuf[PATH_MAX];
     const char *worker = resolve_worker(wbuf, sizeof wbuf);
@@ -166,10 +186,23 @@ aios_status sandbox_run(const char *jail, const char *request_json,
     if (!ok || !json_bool(ok)) {
         json_val *e = json_obj_get(v, "error");
         set_err(err, ecap, "%s", e && json_str(e) ? json_str(e) : "worker reported failure");
-        json_free(v);
+        /* M4: a FAILED tool still gets its account handed back. It may have
+         * written something before it failed, and "it says it errored" is not
+         * the same claim as "it did nothing". Dropping the envelope here is how
+         * a failed write would have been invisible to the very check that
+         * exists to notice it. The caller decides whether to look. */
+        out->resp     = v;
+        out->effects  = json_obj_get(v, "effects");
+        out->complete = json_obj_get(v, "complete");
+        out->usage    = json_obj_get(v, "usage");
         return AIOS_ERR_TOOL;
     }
-    /* keep only {"ok":true,"result":...} shape; result may be null */
-    *result_out = v;
+    /* Hand back the whole envelope: `effects`, `complete` and `usage` are part
+     * of the answer. Flattening to {"ok":true,"result":...} here is what made
+     * the account invisible to the only code that could act on it. */
+    out->resp     = v;
+    out->effects  = json_obj_get(v, "effects");
+    out->complete = json_obj_get(v, "complete");
+    out->usage    = json_obj_get(v, "usage");
     return AIOS_OK;
 }

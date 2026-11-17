@@ -51,6 +51,15 @@ aios_status tool_exec(tool_reg *tr, const char *name, json_val *args,
 /* Default M4 toolset (calc, fs.*, memory.search, proc.info). */
 void tool_reg_install_default(tool_reg *tr);
 
+/* The largest request the worker protocol carries, in bytes.
+ *
+ * This used to be 64 KiB in two places (the parent's REQ_MAX and the worker's
+ * own read loop) while FS_WRITE_MAX is 1 MiB -- so the documented write limit
+ * was unreachable, and a legitimate 100 KB write failed as "request too large"
+ * with no explanation of which limit it had hit. One number, in one header,
+ * larger than the largest legitimate payload, and both sides use it. */
+#define AIOS_TOOL_REQ_MAX (1200u * 1024)
+
 /* Wall-clock budget for sandboxed tool calls (default 10s, min 0.5s). */
 void tool_set_sandbox_timeout(double seconds);
 
@@ -64,6 +73,14 @@ void tool_set_sandbox_timeout(double seconds);
  * to write at all if the directory is missing -- an AI write must never fall
  * back to writing reality directly. */
 void tool_reg_set_staging(tool_reg *tr, const char *stage_dir);
+
+/* M4: the account from the last sandboxed call — the worker's own statement of
+ * which paths it read, wrote or listed, plus whether it could enumerate them all.
+ * Borrowed; valid until the next call or tool_reg_free(). The caller must treat
+ * this as testimony: it is compared against the declaration, not believed. */
+const json_val *tool_reg_last_effects(const tool_reg *tr);
+int             tool_reg_last_complete(const tool_reg *tr);
+void            tool_reg_clear_effects(tool_reg *tr);
 
 #ifdef __cplusplus
 }

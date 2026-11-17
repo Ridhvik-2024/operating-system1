@@ -260,6 +260,20 @@ aios_status agent_run(const agent_cfg *cfg, char *final_out, size_t cap) {
         }
         free(args_json);
 
+        /* M4: the guardian's post-check, on the worker's own account. A batch
+         * agent has no human reading its diff, so this is the only thing
+         * standing between "it said it wrote one file" and the truth. */
+        if (!refused && st == AIOS_OK && cfg->guard.after) {
+            char aerr[512] = {0};
+            if (cfg->guard.after(cfg->guard.ud, act.tool, aerr, sizeof aerr) != 0) {
+                snprintf(err, sizeof err, "%.400s", aerr[0] ? aerr : "effects refused");
+                st = AIOS_ERR_TOOL;
+                json_free(result);
+                result = NULL;
+                last_ok = false;
+            }
+        }
+
         /* reflect: write the tool outcome into episodic memory */
         if (cfg->mem) {
             char line[OBS_TRAIL_CAP];

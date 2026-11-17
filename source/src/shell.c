@@ -23,6 +23,7 @@
 #include "aios/durable.h"
 #include "aios/policy.h"
 #include "aios/stage.h"
+#include "aios/effects.h"
 #include "shroute.h"
 
 #include <dirent.h>
@@ -108,6 +109,16 @@ typedef struct {
     char  *final;      /* from result file once finished */
 } sh_job;
 
+/* M4b: a remembered state of one jail path, so the parent can tell whether the
+ * world moved during a staged command. Declared above the shell because the
+ * shell keeps an array of them. */
+typedef struct {
+    char     rel[AIOS_EFFECT_PATH_MAX];
+    bool     existed;
+    long     size;
+    uint64_t hash;
+} jail_witness;
+
 struct sh_shell {
     sembus   *bus;
     mem_ctx  *mem;
@@ -123,6 +134,11 @@ struct sh_shell {
      * opted out). Set up per command, torn down after it. */
     char      stage_dir[512];
     int       stage_live;
+
+    /* M4b: what the jail looked like before a staged command. */
+    #define SH_MAX_WITNESS 16
+    jail_witness witness[SH_MAX_WITNESS];
+    int          n_witness;
 
     char *var_name[SH_MAX_VARS];
     char *var_val[SH_MAX_VARS];
@@ -535,6 +551,40 @@ static int exec_tool(sh_shell *sh, const char *name, json_val *args,
     return 0;
 }
 
+static bool hash_file(const char *abs, uint64_t *out, long *size_out) {
+    char *buf = NULL;
+    size_t len = 0;
+    if (aios_read_file(abs, &buf, &len, 1u * 1024 * 1024) != AIOS_OK) return false;
+    *out = aios_fnv1a(buf, len);
+    if (size_out) *size_out = (long)len;
+    free(buf);
+    return true;
+}
+
+/* Record the current state of a jail-relative path. */
+static void witness_take(const char *jail, const char *rel, jail_witness *w) {
+    memset(w, 0, sizeof *w);
+    snprintf(w->rel, sizeof w->rel, "%s", rel);
+    char abs[AIOS_EFFECT_PATH_MAX * 2];
+    int n = snprintf(abs, sizeof abs, "%s/%s", jail, rel);
+    if (n < 0 || (size_t)n >= sizeof abs) { w->existed = true; return; }  /* unnameable: assume it exists and "changed" */
+    struct stat st;
+    if (stat(abs, &st) != 0 || !S_ISREG(st.st_mode)) { w->existed = false; return; }
+    w->existed = true;
+    w->size = (long)st.st_size;
+    if (!hash_file(abs, &w->hash, NULL)) w->hash = 0;
+}
+
+/* Did it change? A missing-then-present file is a change; so is a different
+ * hash. A present-then-missing file is a change too (a delete by a write). */
+static bool witness_changed(const char *jail, const jail_witness *w) {
+    jail_witness now;
+    witness_take(jail, w->rel, &now);
+    if (now.existed != w->existed) return true;
+    if (!now.existed) return false;
+    return now.hash != w->hash || now.size != w->size;
+}
+
 /* ---- M3: staging for machine-originated writes ----
  *
  * The rule: if an AI chose the action, its writes do not land. They go to a
@@ -558,6 +608,16 @@ static bool sh_stage_begin(sh_shell *sh, aios_action *act, char *err, size_t eca
     snprintf(sh->stage_dir, sizeof sh->stage_dir, "%s", s.dir);
     sh->stage_live = 1;
 
+    /* Witness the jail BEFORE the worker runs. This is what makes the
+     * guarantee independent of the worker's honesty. */
+    sh->n_witness = 0;
+    for (int i = 0; i < act->n_declared && sh->n_witness < SH_MAX_WITNESS; i++) {
+        const char *eff = act->declared[i];
+        if (!eff || strncmp(eff, "write:", 6) != 0) continue;
+        if (eff[6]) witness_take(sh->jail, eff + 6,
+                                 &sh->witness[sh->n_witness++]);
+    }
+
     /* Pre-note every declared write so the diff has rows even if the worker
      * never gets the chance to note its own. The note is idempotent. */
     for (int i = 0; i < act->n_declared; i++) {
@@ -568,6 +628,25 @@ static bool sh_stage_begin(sh_shell *sh, aios_action *act, char *err, size_t eca
     }
     stage_end(&s);
     return true;
+}
+
+/* Abandon a staged session: throw the directory away AND forget it. Used when
+ * the result must not be offered to anyone -- an undeclared effect, a jail that
+ * moved. Dropping the pointer alone leaves an empty "open" session in the store,
+ * which looks to `staged` like something waiting for review. */
+static void sh_stage_abandon(sh_shell *sh) {
+    if (!sh) return;
+    if (sh->stage_live && sh->stage_dir[0]) {
+        stage_session sess;
+        char derr[192] = {0};
+        if (stage_open(sh->stage_dir, &sess, derr, sizeof derr)) {
+            (void)stage_discard(&sess, derr, sizeof derr);
+            stage_end(&sess);
+        }
+    }
+    sh->stage_live = 0;
+    sh->stage_dir[0] = 0;
+    sh->n_witness = 0;
 }
 
 static void sh_stage_drop(sh_shell *sh) {
@@ -607,6 +686,130 @@ static int sh_stage_report(sh_shell *sh, char **text_out, char *err, size_t ecap
     return rc;
 }
 
+/* Did the jail move where it was told not to? Returns 1 and names the path. */
+static int sh_jail_moved(sh_shell *sh, char *first, size_t fcap) {
+    if (first && fcap) first[0] = 0;
+    for (int i = 0; i < sh->n_witness; i++) {
+        if (witness_changed(sh->jail, &sh->witness[i])) {
+            if (first && fcap) snprintf(first, fcap, "%s", sh->witness[i].rel);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- M4b: the parent watches the jail, not the story ----
+ *
+ * Everything in M4 compares what the worker SAID against what was DECLARED.
+ * That is a real check, and it is not enough, because both halves can be lies
+ * from the same source. The test that proved it: swap `tool-exec` for a worker
+ * that ignores the `stage` argument and writes into the jail, then reports only
+ * the file it was asked about. Its account matches the declaration exactly, so
+ * every rule above passes -- and the file is already in the jail.
+ *
+ * M3's guarantee was therefore being enforced by the worker. The worker is the
+ * component we least control, so the guarantee has to be checked from outside
+ * it: the parent looks at the jail itself, before and after, and refuses if the
+ * world moved. Testimony is what we ASK; the witness is what we CHECK.
+ *
+ * Cost: a bounded read (hash) of each declared write path, twice per staged
+ * command. Files are already capped at 1 MiB, and only for AI writes.
+ */
+
+
+/* ---- M4: did it do what it said? ----
+ *
+ * Everything up to here has trusted the declaration. This is the first place
+ * that asks whether the declaration was true, and it is the only place that can
+ * do anything about the answer, because it is the only place that holds both
+ * halves: what the descriptor claimed and what the worker reported.
+ *
+ * The asymmetry is the whole design:
+ *
+ *   clean account          -> accept, log the numbers
+ *   under-delivered        -> accept, log it (nothing happened; not dangerous)
+ *   undeclared effect      -> FAIL CLOSED. The result is discarded, the staging
+ *                             directory is discarded, the action is denied
+ *                             after the fact and the reason names the path.
+ *
+ * Discarding the staging directory rather than "reviewing it anyway" is the
+ * point: a worker that touched a file it never mentioned has demonstrated it
+ * cannot be trusted about the files it did mention.
+ */
+static int sh_check_effects(sh_shell *sh, const aios_action *act,
+                            char *err, size_t ecap) {
+    if (!sh || !act || !act->target) return 0;
+
+    /* Only tools that run in the worker can account for themselves. A native
+     * tool runs in this process: there is no worker to interrogate, and its
+     * effects are this process's effects, which the shell already knows because
+     * it is the one running them. Treating "no document" as a violation here
+     * would fail-closed on every native tool, which teaches people that the
+     * check is noise -- the worst outcome for a safety mechanism. */
+    const tool_def *def = tool_reg_find(sh->tools, act->target);
+    if (!def || !def->sandboxed) return 0;
+
+    aios_effects actual;
+    char perr[192] = {0};
+    if (!aios_effects_from_array(tool_reg_last_effects(sh->tools),
+                                 tool_reg_last_complete(sh->tools),
+                                 &actual, perr, sizeof perr)) {
+        snprintf(err, ecap, "the worker's effect report was malformed: %s", perr);
+        return 1;      /* malformed is not "no news", it is bad news */
+    }
+
+    char first[256] = {0};
+    aios_effects_verdict v = aios_effects_compare(&actual, (const char *const *)act->declared,
+                                                 act->n_declared, first, sizeof first);
+
+    if (v == EFFECTS_MISSING) {
+        /* A sandboxed tool that returns no account is not the build we think it
+         * is. That is worth failing on: silence cannot be compared with
+         * anything, so it cannot be cleared. */
+        sembus_pub_kv(sh->bus, "sh.action.refused", (const char *const[]){
+            "kind", aios_action_kind_name(act->kind),
+            "target", act->target, "verdict", "DENY",
+            "reason", "EFFECTS_MISSING", "why", "no effects document", NULL});
+        snprintf(err, ecap, "the worker returned no effects document");
+        return 1;
+    }
+
+    if (v == EFFECTS_OK || v == EFFECTS_UNDER_DELIVERED) {
+        /* Under-delivery is recorded but accepted: the world did not change in
+         * a way nobody expected, which is the only thing this rule is for. */
+        sembus_pub_kv(sh->bus, "sh.effects", (const char *const[]){
+            "action", act->target,
+            "verdict", aios_effects_verdict_str(v),
+            "detail", first, NULL});
+        return 0;
+    }
+
+    /* Undeclared, incomplete or malformed: fail closed, and throw the staging
+     * directory away. A worker that touched a file it never mentioned has shown
+     * it cannot be trusted about the files it did mention, so "let the human
+     * review it anyway" would launder the lie into a diff. */
+    const char *reason = (v == EFFECTS_UNDECLARED) ? "UNDECLARED_EFFECT"
+                                                   : "EFFECTS_UNACCOUNTED";
+    sembus_pub_kv(sh->bus, "sh.action.refused", (const char *const[]){
+        "kind", aios_action_kind_name(act->kind),
+        "target", act->target, "verdict", "DENY",
+        "reason", reason,
+        "why", first[0] ? first : aios_effects_verdict_str(v), NULL});
+    sembus_pub_kv(sh->bus, "sh.action.log", (const char *const[]){
+        "verdict", "DENY", "reason", reason,
+        "action", act->target, "detail", first, NULL});
+
+    sh_stage_abandon(sh);
+
+    if (v == EFFECTS_UNDECLARED)
+        snprintf(err, ecap, "undeclared effect: the worker touched %.120s, "
+                            "which the descriptor never declared", first);
+    else
+        snprintf(err, ecap, "the worker could not account for its effects: %s",
+                 aios_effects_verdict_str(v));
+    return 1;
+}
+
 /* ---- the guardian: how the agent loop reaches policy and staging ----
  *
  * The agent loop used to call tool_exec() directly. That made it the one place
@@ -622,6 +825,13 @@ typedef struct {
     const char *goal;      /* the agent's goal, for the intent hash */
     size_t    n_staged;
     int       n_refused;
+    int       jail_mutated;   /* fatal: the worker ignored staging entirely */
+
+    /* M4: the descriptor the guarded step built, kept so the post-check can
+     * compare the worker's account against the SAME claim that was permitted.
+     * Rebuilding it afterwards would compare reality against a different
+     * question. */
+    aios_action *last_act;
 } sh_guard_ctx;
 
 static int sh_agent_guard(void *ud, const char *tool, json_val *args,
@@ -629,6 +839,8 @@ static int sh_agent_guard(void *ud, const char *tool, json_val *args,
     sh_guard_ctx *g = (sh_guard_ctx *)ud;
     if (!g || !g->sh) return 1;
     sh_shell *sh = g->sh;
+    aios_action_free(g->last_act);
+    g->last_act = NULL;
 
     const char *path = json_str(json_obj_get(args, "path"));
     aios_act_kind kind = ACT_TOOL;
@@ -696,8 +908,42 @@ static int sh_agent_guard(void *ud, const char *tool, json_val *args,
         g->n_staged++;
     }
 
-    aios_action_free(act);
+    /* Keep the descriptor for the post-check; the tool gets its own copy of the
+     * args, so the loop's json_val is not consumed twice. */
+    aios_action_set_args(act, json_new_obj());
+    g->last_act = act;
+    (void)path;
     return rc;
+}
+
+static int sh_agent_after(void *ud, const char *tool, char *err, size_t ecap) {
+    sh_guard_ctx *g = (sh_guard_ctx *)ud;
+    if (!g || !g->sh || !g->last_act) return 0;
+    (void)tool;
+
+    /* 1. what the worker says it did, against what it was permitted to do */
+    if (sh_check_effects(g->sh, g->last_act, err, ecap) != 0) return 1;
+
+    /* 2. what the JAIL says, against what the worker said. This is the only
+     *    check here that does not rely on the worker's honesty: a swapped or
+     *    compromised tool-exec can forge its account, but it cannot forge the
+     *    jail it left behind. */
+    char moved[AIOS_EFFECT_PATH_MAX] = {0};
+    if (sh_jail_moved(g->sh, moved, sizeof moved)) {
+        sh_stage_abandon(g->sh);        /* nothing to promote: the run is void */
+        g->jail_mutated = 1;
+        sembus_pub_kv(g->sh->bus, "sh.action.refused", (const char *const[]){
+            "kind", aios_action_kind_name(g->last_act->kind),
+            "target", g->last_act->target ? g->last_act->target : "",
+            "verdict", "DENY", "reason", "JAIL_MUTATED", "why", moved, NULL});
+        snprintf(err, ecap,
+                 "the jail changed during a staged write (%.120s): the worker is "
+                 "not honouring the staging directory, so its account of what it "
+                 "did cannot be trusted", moved);
+        return 1;
+    }
+    g->sh->n_witness = 0;
+    return 0;
 }
 
 /* Execute a tool THROUGH its descriptor.
@@ -721,8 +967,12 @@ static int exec_tool_action(sh_shell *sh, aios_action *act,
     action_accept(sh, act);
 
     /* M3: an AI write is intercepted before it can reach the jail. */
-    bool staged = false;
-    if (act->origin == ORIGIN_AI && strcmp(act->target, "fs.write") == 0) {
+    /* `sh->stage_live` is already set when the agent guardian staged this step
+     * earlier; a typed AI write gets here with it clear. Checking both means
+     * the witness runs for either route -- the first version of this only
+     * handled the typed one, and the swapped-worker test sailed through. */
+    bool staged = (sh->stage_live != 0);
+    if (!staged && act->origin == ORIGIN_AI && strcmp(act->target, "fs.write") == 0) {
         if (!sh_stage_begin(sh, act, err, ecap)) {
             stage_text_of(NULL, NULL, text_out);
             *json_out = NULL;
@@ -734,9 +984,72 @@ static int exec_tool_action(sh_shell *sh, aios_action *act,
     /* Tell the tool layer where an AI write must go. Cleared on every path so
      * one staged command cannot redirect the next one. */
     tool_reg_set_staging(sh->tools, staged ? sh->stage_dir : NULL);
+    tool_reg_clear_effects(sh->tools);
     int rc = exec_tool(sh, act->target, aios_action_take_args(act),
                        text_out, json_out, err, ecap);
     tool_reg_set_staging(sh->tools, NULL);
+
+    /* M4: the verdict on the worker's own account, before anything is offered
+     * to the human as "here is what it wants to do". */
+    if (rc == 0 && sh_check_effects(sh, act, err, ecap) != 0) {
+        free(*text_out);
+        *text_out = strdup("");
+        json_free(*json_out);
+        *json_out = NULL;
+        return 1;
+    }
+
+    /* A jail mutation is not a step the agent can route around: it means the
+     * worker is not honouring staging at all. Report it as a fatal condition of
+     * the run rather than a failed step, or the agent reports success while
+     * reality has already been changed. */
+    if (staged) {
+        char moved[AIOS_EFFECT_PATH_MAX] = {0};
+        if (sh_jail_moved(sh, moved, sizeof moved)) {
+            sh_stage_abandon(sh);
+            snprintf(err, ecap,
+                     "the jail changed during a staged write (%.120s): the worker "
+                     "is not honouring the staging directory", moved);
+            sembus_pub_kv(sh->bus, "sh.action.refused", (const char *const[]){
+                "kind", aios_action_kind_name(act->kind),
+                "target", act->target ? act->target : "",
+                "verdict", "DENY", "reason", "JAIL_MUTATED", "why", moved, NULL});
+            free(*text_out);
+            *text_out = strdup("");
+            json_free(*json_out);
+            *json_out = NULL;
+            return 1;
+        }
+        sh->n_witness = 0;
+    }
+
+    /* M4b: and the check that does not depend on the worker telling the truth.
+     * If the jail moved while the worker was supposed to be writing into
+     * staging, the worker is enforcing nothing and its account is worthless --
+     * refuse, and say which file moved. */
+    if (staged) {
+        char moved[AIOS_EFFECT_PATH_MAX] = {0};
+        if (sh_jail_moved(sh, moved, sizeof moved)) {
+            sh_stage_drop(sh);
+            char reason[AIOS_EFFECT_PATH_MAX + 96];
+            snprintf(reason, sizeof reason,
+                     "the jail changed during a staged write (%.120s): the worker "
+                     "is not honouring the staging directory", moved);
+            sembus_pub_kv(sh->bus, "sh.action.refused", (const char *const[]){
+                "kind", aios_action_kind_name(act->kind),
+                "target", act->target ? act->target : "",
+                "verdict", "DENY", "reason", "JAIL_MUTATED",
+                "why", moved, NULL});
+            free(*text_out);
+            *text_out = strdup("");
+            json_free(*json_out);
+            *json_out = NULL;
+            snprintf(err, ecap, "%.400s", reason);
+            return 1;
+        }
+        sh->n_witness = 0;
+    }
+
     if (staged) {
         /* The worker wrote into the staging dir (it was told where). Replace
          * the raw tool text with the diff the human needs to decide. */
@@ -878,7 +1191,7 @@ static int run_agent_fg(sh_shell *sh, const aios_action *act,
     agent_cfg cfg = {
         .name = "sh", .goal = goal, .cx = cx,
         .tools = sh->tools, .mem = sh->mem, .max_steps = 10,
-        .guard = { .check = sh_agent_guard, .ud = &gctx }
+        .guard = { .check = sh_agent_guard, .after = sh_agent_after, .ud = &gctx }
     };
     char final[2048] = {0};
     aios_status st = agent_run(&cfg, final, sizeof final);
@@ -906,8 +1219,17 @@ static int run_agent_fg(sh_shell *sh, const aios_action *act,
         }
         sh->stage_live = 0;
         sh->stage_dir[0] = 0;
+        sh->n_witness = 0;
     } else {
         *text_out = xstrdup(final);
+        sh->n_witness = 0;
+    }
+    if (gctx.jail_mutated) {
+        sh_stage_drop(sh);
+        snprintf(err, ecap,
+                 "agent run refused: the tool worker wrote into the jail instead "
+                 "of staging, so its result was not accepted");
+        return 1;
     }
     if (st != AIOS_OK) {
         /* Clamp the message into the caller's buffer on purpose: a failed

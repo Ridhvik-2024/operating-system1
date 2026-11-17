@@ -55,6 +55,12 @@ void    cortex_free(cortex *cx);
 typedef struct {
     int (*check)(void *ud, const char *tool, json_val *args,
                  char *err, size_t ecap);
+    /* Called AFTER the tool ran, with the same tool name. This is where the
+     * guardian compares what the worker says it did against what was declared
+     * (M4). It may refuse the step, in which case the result is discarded and
+     * the loop treats it as a failed step. Running unattended is exactly when
+     * the check matters most, since no human is watching the diff. */
+    int (*after)(void *ud, const char *tool, char *err, size_t ecap);
     void *ud;
 } agent_guard;
 
