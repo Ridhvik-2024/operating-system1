@@ -483,13 +483,26 @@ static void test_deaf_worker_does_not_kill_the_parent(void) {
     char path[512];
     char cwd[400];
     if (!getcwd(cwd, sizeof cwd)) { CHECK(1, "no cwd (skipped)"); return; }
-    if (access("build/deaf-worker", X_OK) != 0) {
+
+    /* Beside the executable first (where the booted image installs fixtures),
+     * then build/ for a source-tree run. */
+    path[0] = 0;
+    ssize_t dn = readlink("/proc/self/exe", path, sizeof path - 1);
+    if (dn > 0) {
+        path[dn] = 0;
+        char *slash = strrchr(path, '/');
+        if (slash) snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path),
+                            "deaf-worker");
+    }
+    if (path[0] == 0 || access(path, X_OK) != 0) {
+        snprintf(path, sizeof path, "%s/build/deaf-worker", cwd);
+    }
+    if (access(path, X_OK) != 0) {
         /* Not a skip: an image without this fixture cannot test the crash that
          * took the image down. */
         CHECK(0, "the deaf worker is built (make build/deaf-worker)");
         return;
     }
-    snprintf(path, sizeof path, "%s/build/deaf-worker", cwd);
     setenv("AIOS_TOOL_EXEC", path, 1);
 
     /* A request big enough that it cannot fit in the pipe buffer, so the write

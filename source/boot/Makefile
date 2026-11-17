@@ -31,7 +31,7 @@ LIB       := boot/build/libaios.a
 TEST_BINS := $(patsubst tests/%.c,boot/build/%,$(wildcard tests/test_*.c))
 # The M4 adversary ships with the image: test_shell and test_effects run inside
 # the booted system, and the image has no compiler to build it there.
-FIXTURE_BINS := boot/build/liar-worker
+FIXTURE_BINS := boot/build/liar-worker boot/build/deaf-worker
 
 BOOT_DIR  := boot
 BLD       := boot/build
@@ -106,6 +106,10 @@ $(BLD)/assets/%.aiosimg: desktop/assets/%.png tools/img2aiosimg.py
 # A test fixture, built by the same toolchain as everything else and installed
 # next to the tests it belongs to.
 boot/build/liar-worker: tests/fixtures/liar-worker.c
+	@mkdir -p $(BLD)
+	$(CC) $(CFLAGS) -o $@ $<
+
+boot/build/deaf-worker: tests/fixtures/deaf-worker.c
 	@mkdir -p $(BLD)
 	$(CC) $(CFLAGS) -o $@ $<
 

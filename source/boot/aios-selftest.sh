@@ -17,7 +17,15 @@ for t in /usr/lib/aios/tests/test_*; do
         pass=$((pass + 1))
     else
         echo "  SELFTEST $name: FAIL (rc=$rc)"
-        echo "$out" | sed 's/^/      /' | head -6
+        # The first failures, not the first lines: the suite prints its progress
+        # and its failures interleaved, so `head -6` can be six successes.
+        echo "$out" | grep -E '^FAIL' | head -6 | sed 's/^/      /'
+        [ -z "$(echo "$out" | grep -E '^FAIL')" ] && \
+            echo "$out" | tail -6 | sed 's/^/      /'
+        # One line for the CI annotation, which is length-limited.
+        f=$(echo "$out" | grep -E '^FAIL' | head -4 | tr '\n' ' ' | tr -s ' ')
+        [ -n "$GITHUB_ACTIONS" ] && [ -n "$f" ] && \
+            echo "::error title=selftest $name::$f"
         fail=$((fail + 1))
     fi
 done
