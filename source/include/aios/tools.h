@@ -60,6 +60,13 @@ void tool_reg_install_default(tool_reg *tr);
  * larger than the largest legitimate payload, and both sides use it. */
 #define AIOS_TOOL_REQ_MAX (1200u * 1024)
 
+/* The most content a single fs.write may carry. Enforced by the worker AND
+ * checked by the parent before it sends anything (see tools.c): shipping 1.1 MB
+ * over a pipe under QEMU's emulation, just to be told it is too big, took longer
+ * than the call's own timeout on a busy boot -- a refusal that arrives after the
+ * deadline is indistinguishable from a hang. */
+#define AIOS_FS_WRITE_MAX (1024u * 1024)
+
 /* Wall-clock budget for sandboxed tool calls (default 10s, min 0.5s). */
 void tool_set_sandbox_timeout(double seconds);
 

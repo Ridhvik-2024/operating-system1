@@ -34,7 +34,7 @@
 #include <limits.h>
 
 #define FS_READ_MAX  (256u * 1024)
-#define FS_WRITE_MAX (1024u * 1024)
+#define FS_WRITE_MAX AIOS_FS_WRITE_MAX
 
 /* Set from the request envelope before any tool runs. Default: a human
  * invocation, which writes through to the jail. */

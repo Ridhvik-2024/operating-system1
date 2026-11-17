@@ -244,6 +244,25 @@ aios_status tool_exec(tool_reg *tr, const char *name, json_val *args,
     aios_status st;
     json_val *res = NULL;
 
+    /* Refuse an over-limit write HERE, before it becomes a 1.1 MB pipe payload.
+     * The worker enforces the same limit, but doing it only there means the
+     * refusal competes with the sandbox deadline: under emulation on a busy
+     * boot the round trip loses, and a clear "too big" arrives as a timeout. */
+    if (def->sandboxed && strcmp(name, "fs.write") == 0) {
+        const json_val *c = json_obj_get(args, "content");
+        if (c && json_str(c) && strlen(json_str(c)) > AIOS_FS_WRITE_MAX) {
+            if (err && ecap) snprintf(err, ecap, "content exceeds 1MB write limit");
+            /* A refused call must not leave the PREVIOUS call's account lying
+             * around as if it described this one. */
+            json_free(tr->last_effects);
+            tr->last_effects = json_new_arr();
+            tr->last_complete = 1;
+            free(args_json);
+            free(args);
+            return AIOS_ERR_TOOL;
+        }
+    }
+
     if (def->sandboxed) {
         json_val *req = json_new_obj();
         json_obj_set(req, "tool", json_new_str(name));

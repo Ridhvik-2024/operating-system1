@@ -360,8 +360,20 @@ static void test_worker_protocol(void) {
             tool_reg_clear_effects(tr);
             st = tool_exec(tr, "fs.write", args, &res, err, sizeof err);
             json_free(res);
+            /* Timed, because the refusal must happen in the PARENT. Shipping
+             * 1.1 MB to a worker to be told it is too big takes longer than the
+             * call's own deadline under emulation on a busy boot, and a refusal
+             * that arrives after the deadline is a timeout: same outcome for the
+             * user, no explanation. 50 ms is generous for a local check and
+             * impossible for a 1.1 MB pipe round trip with a forked worker. */
+            double t_ref = aios_mono_ms();
             CHECK(st != AIOS_OK, "a write over FS_WRITE_MAX is refused");
+            double took = aios_mono_ms() - t_ref;
+            if (!strstr(err, "1MB"))
+                printf("      over-limit write said: [%s] (status %d)\n", err, (int)st);
             CHECK_STR_CONTAINS(err, "1MB", "with a clear reason");
+            CHECK(took < 50.0,
+                  "and it is refused by the parent, without a 1.1MB round trip");
             eff = tool_reg_last_effects(tr);
             CHECK(eff != NULL && json_arr_len(eff) == 0,
                   "and no effect is recorded for a write that did not happen");
