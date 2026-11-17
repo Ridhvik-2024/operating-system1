@@ -14,8 +14,11 @@
 #include "aios/effects.h"
 #include "aios/stage.h"
 #include "aios/tools.h"
+#include "../src/sandbox.h"
 #include "aios/json.h"
 
+#include <signal.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -462,6 +465,63 @@ static void test_mirror(void) {
     CHECK_STR_CONTAINS(first, "b.txt", "and it names the leak, not the clean one");
 }
 
+/* ---- 5d. a worker that never reads its request ----
+ *
+ * The booted image caught this and the developer machine did not: a worker that
+ * exits before reading stdin closes the pipe while the parent is still writing,
+ * and the default SIGPIPE action kills the parent. In the image the parent is
+ * PID 1, so the whole system goes down; in a test runner the suite dies with
+ * rc=141 and reports nothing at all.
+ *
+ * The test asserts the parent SURVIVES and reports an error. Whether it happens
+ * to hit the race here does not matter -- the signal disposition is now set for
+ * the whole call, so the outcome must be an error either way.
+ */
+static void test_deaf_worker_does_not_kill_the_parent(void) {
+    printf("a worker that exits without reading\n");
+
+    char path[512];
+    char cwd[400];
+    if (!getcwd(cwd, sizeof cwd)) { CHECK(1, "no cwd (skipped)"); return; }
+    if (access("build/deaf-worker", X_OK) != 0) {
+        /* Not a skip: an image without this fixture cannot test the crash that
+         * took the image down. */
+        CHECK(0, "the deaf worker is built (make build/deaf-worker)");
+        return;
+    }
+    snprintf(path, sizeof path, "%s/build/deaf-worker", cwd);
+    setenv("AIOS_TOOL_EXEC", path, 1);
+
+    /* A request big enough that it cannot fit in the pipe buffer, so the write
+     * cannot all land before the worker exits. */
+    size_t len = 200 * 1024;
+    char *req = malloc(len + 64);
+    if (!req) { CHECK(0, "oom"); unsetenv("AIOS_TOOL_EXEC"); return; }
+    int n = snprintf(req, 64, "{\"path\":\"");
+    memset(req + n, 'a', len);
+    req[n + len] = 0;
+    size_t req_len = (size_t)n + len;
+
+    sandbox_result r;
+    char err[256] = {0};
+    /* Reaching this line at all is most of the assertion: the previous version
+     * of this code never returned. */
+    aios_status st = sandbox_run_ex("build/test-eff-jail", req, req_len,
+                                    5.0, &r, err, sizeof err);
+    CHECK(st != AIOS_OK, "a worker that exits early is reported as an error");
+    CHECK(err[0] != 0, "with a message rather than nothing");
+    sandbox_result_free(&r);
+    free(req);
+    unsetenv("AIOS_TOOL_EXEC");
+
+    /* SIGPIPE must be back to normal for everyone else: this function is a
+     * library call, not the process's owner. */
+    struct sigaction cur;
+    CHECK(sigaction(SIGPIPE, NULL, &cur) == 0, "SIGPIPE disposition is readable");
+    CHECK(cur.sa_handler == SIG_DFL,
+          "and the caller's SIGPIPE disposition is restored");
+}
+
 /* ---- 6. the adversary ----
  *
  * Everything above tests the machinery. This tests the thing the machinery is
@@ -610,6 +670,7 @@ int main(void) {
     test_text();
     test_undeclared_discards_staging();
     test_mirror();
+    test_deaf_worker_does_not_kill_the_parent();
     test_lying_worker_is_caught();
     printf("%s: %d checks, %d failed\n", g_failed ? "FAIL" : "PASS", g_checks, g_failed);
     return g_failed ? 1 : 0;

@@ -73,11 +73,21 @@ build/liar-worker: tests/fixtures/liar-worker.c
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ $<
 
+build/deaf-worker: tests/fixtures/deaf-worker.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ $<
+
+# These two suites drive the real worker and its adversaries. Built here rather
+# than only by `make test`, so `make build/tests/test_effects` on its own does not
+# produce a suite that fails for a reason it cannot explain.
+build/tests/test_effects: build/liar-worker build/deaf-worker tool-exec
+build/tests/test_shell:   build/liar-worker tool-exec
+
 build/tests/%: tests/%.c $(LIB) tests/t.h
 	@mkdir -p build/tests
 	$(CC) $(CFLAGS) -Iinclude -MMD -o $@ $< $(LIB) $(LDFLAGS)
 
-test: $(LIB) $(TEST_BINS) tool-exec build/liar-worker
+test: $(LIB) $(TEST_BINS) tool-exec build/liar-worker build/deaf-worker
 	@pass=0; fail=0; \
 	for t in $(TEST_BINS); do \
 	  if ./$$t >build/last_test.log 2>&1; then pass=$$((pass+1)); \

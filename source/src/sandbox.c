@@ -81,16 +81,36 @@ aios_status sandbox_run_ex(const char *jail, const char *request_json,
     const char *worker = resolve_worker(wbuf, sizeof wbuf);
     if (!worker) return set_err(err, ecap, "tool-exec worker not found"), AIOS_ERR_NOTFOUND;
 
+    /* A worker that dies or exits before reading its whole request leaves us
+     * writing into a closed pipe, and the default SIGPIPE action would kill PID 1
+     * -- or the test runner -- outright. Seen in the booted image as rc=141 on a
+     * suite that runs perfectly on a developer machine: one crashed worker and
+     * the whole supervisor is gone, with no message anywhere.
+     *
+     * Saved and restored rather than left ignored: this function must not change
+     * the signal behaviour of the process that called it. */
+    struct sigaction sa_new, sa_old;
+    memset(&sa_new, 0, sizeof sa_new);
+    sa_new.sa_handler = SIG_IGN;
+    sigemptyset(&sa_new.sa_mask);
+    bool sigpipe_saved = (sigaction(SIGPIPE, &sa_new, &sa_old) == 0);
+    aios_status rc_out;
+
     int in_pipe[2], out_pipe[2];
-    if (pipe(in_pipe) != 0)  return set_err(err, ecap, "pipe: %s", strerror(errno)), AIOS_ERR_IO;
+    if (pipe(in_pipe) != 0) {
+        set_err(err, ecap, "pipe: %s", strerror(errno)); rc_out = AIOS_ERR_IO;
+        goto restore_sigpipe;
+    }
     if (pipe(out_pipe) != 0) { close(in_pipe[0]); close(in_pipe[1]);
-        return set_err(err, ecap, "pipe: %s", strerror(errno)), AIOS_ERR_IO; }
+        set_err(err, ecap, "pipe: %s", strerror(errno)); rc_out = AIOS_ERR_IO;
+        goto restore_sigpipe; }
 
     pid_t pid = fork();
     if (pid < 0) {
         close(in_pipe[0]); close(in_pipe[1]);
         close(out_pipe[0]); close(out_pipe[1]);
-        return set_err(err, ecap, "fork: %s", strerror(errno)), AIOS_ERR_IO;
+        set_err(err, ecap, "fork: %s", strerror(errno)); rc_out = AIOS_ERR_IO;
+        goto restore_sigpipe;
     }
     if (pid == 0) {
         /* child: wire pipes, exec worker (jail passed via argv[1]) */
@@ -121,7 +141,8 @@ aios_status sandbox_run_ex(const char *jail, const char *request_json,
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
         close(out_pipe[0]);
-        return set_err(err, ecap, "failed writing request to worker"), AIOS_ERR_IO;
+        set_err(err, ecap, "failed writing request to worker"); rc_out = AIOS_ERR_IO;
+        goto restore_sigpipe;
     }
 
     /* read response with deadline */
@@ -129,7 +150,8 @@ aios_status sandbox_run_ex(const char *jail, const char *request_json,
     char *resp = (char *)malloc(RESP_MAX);
     if (!resp) {
         kill(pid, SIGKILL); waitpid(pid, NULL, 0); close(out_pipe[0]);
-        return set_err(err, ecap, "oom"), AIOS_ERR_NOMEM;
+        set_err(err, ecap, "oom"); rc_out = AIOS_ERR_NOMEM;
+        goto restore_sigpipe;
     }
     size_t got = 0;
     bool timed_out = false, eof = false;
@@ -161,8 +183,9 @@ aios_status sandbox_run_ex(const char *jail, const char *request_json,
         waitpid(pid, &wstatus, 0);
     done_wait:
         free(resp);
-        return set_err(err, ecap, "tool timed out after %.1fs (worker killed)",
-                       timeout_s), AIOS_ERR_TIMEOUT;
+        set_err(err, ecap, "tool timed out after %.1fs (worker killed)", timeout_s);
+        rc_out = AIOS_ERR_TIMEOUT;
+        goto restore_sigpipe;
     }
 
     /* reap with a safety deadline even when worker finished normally */
@@ -173,14 +196,26 @@ aios_status sandbox_run_ex(const char *jail, const char *request_json,
     }
 
     if (got == 0) {
+        /* rc 141 means the worker died of SIGPIPE, which in this protocol means
+         * it stopped reading before the end of the request. Naming that is worth
+         * a special case: otherwise it reads as a mysterious "no output". */
+        int ws = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
         free(resp);
-        return set_err(err, ecap, "worker produced no output (status %d)",
-                       WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1), AIOS_ERR_TOOL;
+        set_err(err, ecap,
+                ws == 141
+                ? "worker exited while reading its request (SIGPIPE): it did "
+                  "not read the whole request"
+                : "worker produced no output (status %d)", ws);
+        rc_out = AIOS_ERR_TOOL;
+        goto restore_sigpipe;
     }
 
     json_val *v = json_parse(resp, got);
     free(resp);
-    if (!v) return set_err(err, ecap, "worker returned unparsable output"), AIOS_ERR_TOOL;
+    if (!v) {
+        set_err(err, ecap, "worker returned unparsable output"); rc_out = AIOS_ERR_TOOL;
+        goto restore_sigpipe;
+    }
 
     json_val *ok = json_obj_get(v, "ok");
     if (!ok || !json_bool(ok)) {
@@ -195,7 +230,8 @@ aios_status sandbox_run_ex(const char *jail, const char *request_json,
         out->effects  = json_obj_get(v, "effects");
         out->complete = json_obj_get(v, "complete");
         out->usage    = json_obj_get(v, "usage");
-        return AIOS_ERR_TOOL;
+        rc_out = AIOS_ERR_TOOL;
+        goto restore_sigpipe;
     }
     /* Hand back the whole envelope: `effects`, `complete` and `usage` are part
      * of the answer. Flattening to {"ok":true,"result":...} here is what made
@@ -204,5 +240,10 @@ aios_status sandbox_run_ex(const char *jail, const char *request_json,
     out->effects  = json_obj_get(v, "effects");
     out->complete = json_obj_get(v, "complete");
     out->usage    = json_obj_get(v, "usage");
-    return AIOS_OK;
+    rc_out = AIOS_OK;
+    /* fall through */
+
+restore_sigpipe:
+    if (sigpipe_saved) sigaction(SIGPIPE, &sa_old, NULL);
+    return rc_out;
 }
