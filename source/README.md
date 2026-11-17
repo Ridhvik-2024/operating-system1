@@ -51,6 +51,10 @@ services layer above it is rewritten around three native abstractions:
 +--------------------------------------------------------------+
 ```
 
+**Licence:** Apache-2.0 (see `LICENSE`). **Contributing:** see
+`CONTRIBUTING.md` and `context/RULES.md`. **Roadmap to desktop capability:**
+`context/ROADMAP-TO-WINDOWS.md`.
+
 This repository is **AI-OS v1.1 (M10 `desktop`)** — a self-contained
 C11 runtime layer (zero external dependencies, builds in seconds)
 **plus a bootable OS image** — and since M10 the OS has a graphical

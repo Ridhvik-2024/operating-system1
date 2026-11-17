@@ -28,7 +28,7 @@ Read `context/RULES.md` **before** any card. Every card assumes it.
 | ID | Task | Size | Why now |
 |---|---|---|---|
 | `H1` | ~~Commit the generated `font8x16.h` so `make` needs no Pillow~~ **DONE** | S | was: nobody could build on a clean machine |
-| `H2` | Add `LICENSE` + `CONTRIBUTING.md` | S | the repo is unlicensed |
+| `H2` | ~~Add `LICENSE` + `CONTRIBUTING.md`~~ **DONE** | S | was: the repo was unlicensed |
 | `H3` | CI: `make && make test` on a clean runner | M | the green tests are not enforced |
 | `H4` | Fix stale counts ("10 suites" → 11) and dead doc paths | S | done partly in this snapshot; finish `docs/`, `CHANGELOG` |
 | `H5` | Boot CI job (`boot-test.sh`) on a qemu-enabled runner | M | the two-boot durable proof is the crown jewel and untested |
@@ -116,3 +116,4 @@ skipping the sandbox in a tool · a new dependency · "just disable the test".
 | — | `.gitignore` added | 2026-11-16 | `.gitignore` |
 | — | suite count corrected 10 → 11 in README/INSTALL | 2026-11-16 | `source/README.md` |
 | `H1` | font table committed at `src/font8x16.h`; both Makefiles no longer run Python; `test_fb` now passes on the host (89/89) | 2026-11-17 | `src/font8x16.h`, `Makefile`, `boot/Makefile`, `tools/gen_font.py` |
+| `H2` | Apache-2.0 `LICENSE` + `CONTRIBUTING.md`; `types.h` + README updated | 2026-11-17 | `LICENSE`, `CONTRIBUTING.md` |

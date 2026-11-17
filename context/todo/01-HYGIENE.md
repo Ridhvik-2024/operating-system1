@@ -39,7 +39,11 @@ DejaVu fonts) and is **not committed**. On a clean machine `make` dies:
 
 ---
 
-## H2 — LICENSE + CONTRIBUTING · **S**
+## H2 — LICENSE + CONTRIBUTING · **S** — ✅ **DONE 2026-11-17**
+
+> Apache-2.0 (patent grant matters for a kernel-adjacent project) with the
+> copyright line filled in; `CONTRIBUTING.md` mirrors `RULES.md` §1.1/§1.2/§1.3
+> plus the hard stops; `include/aios/types.h` no longer says "project-internal".
 
 **Problem.** No `LICENSE` anywhere. For an OS with a written constitution, this
 blocks contributors and makes the "project-internal" note in `types.h` ambiguous.
