@@ -148,10 +148,23 @@ explain() {
     fi
     printf '%s\n' "$body" | sed 's/^/    | /'
 
+    # The lines that answer the question, wherever they are in the log. Booting
+    # is chatty by design, so "the last fifteen lines" lands after the answer.
+    marks=$(tr -d '\r' < "$log" 2>/dev/null \
+            | grep -E 'SELFTEST|selftest|phase [0-9]|AIOS-BOOT-OK|AIOS-DUR|panic|BUG:' \
+            | grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\] SELFTEST' | head -12)
+    if [ -n "$marks" ]; then
+        echo "  --- selftest / phase markers ---"
+        printf '%s\n' "$marks" | sed 's/^/    | /'
+    else
+        echo "  --- no selftest or phase marker in the log at all ---"
+        marks="NO SELFTEST OR PHASE MARKER IN LOG ($total lines, $ours ours)"
+    fi
+
     if [ -n "$GITHUB_ACTIONS" ]; then
         # One line, and never empty: an annotation that says only "missed:" has
-        # cost four CI cycles on this change alone.
-        flat=$(printf '%s' "$body" | tr '\n' ' ' | tr -s ' ' | cut -c1-500)
+        # cost CI cycles on this change alone.
+        flat=$(printf '%s' "$marks" | tr '\n' ' ' | tr -s ' ' | cut -c1-600)
         echo "::error title=boot test::missed $what :: $flat"
     fi
     fail=1
