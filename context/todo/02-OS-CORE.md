@@ -270,6 +270,23 @@ suite is green.
 > when it had written something first; and two test fixtures skipped instead of
 > failing when they did not compile — a skipping test reports PASS.
 
+> **And the part worth more than the feature:** the first version of this passed
+> CI's build and test jobs and failed the boot job four times. Not because the
+> logic was wrong — 15/15 passed on the host and in an extracted rootfs — but
+> because the *tests themselves* could not run where the product runs: a fixture
+> that needed a compiler the image does not have, fixtures linked against a libc
+> the initramfs does not have, and a `/proc/self/exe` lookup before `/proc` is
+> mounted. Three separate bugs, all invisible on a developer machine, all silent.
+> Then the last one was real: an over-limit write was refused by the worker after
+> the parent had shipped a megabyte down a pipe, which under emulation arrives
+> after the call's own deadline — so a clear refusal read as a timeout.
+>
+> **Run the suite where the product runs** (D22). `boot-test.sh` and
+> `aios-selftest.sh` now put the failing assertions in the job annotation rather
+> than an artifact nobody opens; four cycles went into fixing the diagnostics that
+> would have found the bug in one.
+
+
 **Goal.** The host learns what *actually* happened, not what the model claimed.
 
 **Do.**
