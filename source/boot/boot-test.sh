@@ -155,7 +155,7 @@ explain() {
     # name, and those lines are the whole answer -- dropping them because they do
     # not match /SELFTEST/ is how this took three cycles.
     marks=$(tr -d '\r' < "$log" 2>/dev/null \
-            | grep -E 'SELFTEST|selftest|^ +FAIL |phase [0-9]|AIOS-BOOT-OK|AIOS-DUR|panic|BUG:' \
+            | grep -E 'SELFTEST|selftest|^ +FAIL |phase [0-9]|AIOS-BOOT-OK|AIOS-DUR|panic|BUG:|rollback|snapshot|bootproof|wrote ' \
             | grep -vE '^\[[[:space:]]*[0-9]+\.[0-9]+\] SELFTEST' | head -20)
     if [ -n "$marks" ]; then
         echo "  --- selftest / phase markers ---"
