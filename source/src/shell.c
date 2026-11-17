@@ -22,6 +22,7 @@
 #include "aios/autopilot.h"
 #include "aios/durable.h"
 #include "aios/policy.h"
+#include "aios/snapshot.h"
 #include "aios/stage.h"
 #include "aios/effects.h"
 #include "shroute.h"
@@ -1167,6 +1168,63 @@ static int run_tool_stage(sh_shell *sh, const char *name, sargv *a,
 /* `goal` is the descriptor's target; the descriptor itself carries the
  * intent hash and origin that M6 will log and M2 will evaluate. An agent
  * cannot be started without one. */
+
+/* M5: take a snapshot before anything a rollback might have to undo.
+ *
+ * This is the whole guarantee of the milestone: "rollback is available" means a
+ * snapshot already exists at the moment something went wrong, not that a
+ * snapshot COULD have been taken. So it happens automatically, here, before the
+ * work -- not as a command a human has to remember at 2am.
+ *
+ * A failure to snapshot is published and reported but does not stop the work:
+ * refusing to run an agent because a backup could not be written would make the
+ * backup a single point of failure for the whole OS. The refusal is visible
+ * (`sh.snap.failed` on the bus, and the text of the command) because a
+ * rollback that silently does not exist is worse than a loud one.
+ *
+ * Returns true when a snapshot exists afterwards. */
+static bool sh_snap_before(sh_shell *sh, const char *why, char *note, size_t ncap) {
+    char id[AIOS_SNAP_ID_MAX] = {0};
+    char err[256] = {0};
+    bool ok = snap_take(sh->jail, sh->store, why, id, sizeof id, err, sizeof err);
+    if (!ok) {
+        sembus_pub_kv(sh->bus, "sh.snap.failed",
+                      (const char *const[]){ "why", why, "error", err, NULL });
+        if (note && ncap)
+            snprintf(note, ncap, " (no snapshot taken: %.120s)", err);
+        return false;
+    }
+    sembus_pub_kv(sh->bus, "sh.snap.taken",
+                  (const char *const[]){ "id", id, "why", why, NULL });
+    /* Retention is enforced every time, not by a cron nobody runs. */
+    char perr[192] = {0};
+    (void)snap_prune(sh->store, AIOS_SNAP_KEEP, perr, sizeof perr);
+    if (note && ncap) snprintf(note, ncap, " (snapshot %.24s)", id);
+    return true;
+}
+
+/* M5: revoke running jobs. A restore that leaves an agent writing into the tree
+ * it is restoring is not a rollback, it is a race. Returns how many were killed. */
+static int sh_revoke_jobs(sh_shell *sh) {
+    int killed = 0;
+    for (int i = 0; i < sh->njobs; i++) {
+        sh_job *j = &sh->jobs[i];
+        if (j->state != JOB_RUNNING) continue;
+        kill(j->pid, SIGKILL);
+        for (int k = 0; k < 200; k++) {
+            int wst = 0;
+            if (waitpid(j->pid, &wst, WNOHANG) == j->pid) break;
+            usleep(10000);
+        }
+        j->state = JOB_KILLED;
+        killed++;
+    }
+    if (killed)
+        sembus_pub_kv(sh->bus, "sh.jobs.revoked",
+                      (const char *const[]){ "n", "revoked", "why", "rollback", NULL });
+    return killed;
+}
+
 static int run_agent_fg(sh_shell *sh, const aios_action *act,
                         char **text_out, char *err, size_t ecap) {
     if (action_gate(sh, act, err, ecap) != 0) {
@@ -1174,6 +1232,10 @@ static int run_agent_fg(sh_shell *sh, const aios_action *act,
         return 1;
     }
     action_accept(sh, act);
+    /* M5: the snapshot happens before the first tool call, so every write the
+     * agent makes has something to be rolled back to. */
+    char snapnote[160] = {0};
+    sh_snap_before(sh, "before an agent run", snapnote, sizeof snapnote);
     const char *goal = act->target;
     cortex *cx = strcmp(sh->cortex_mode, "llm") == 0
                  ? cortex_llm_create(NULL)
@@ -1329,6 +1391,8 @@ static const char HELP_TEXT[] =
     "  tune [k=v ...]              show/rewrite the autopilot conf (M7)\n"
     "  lm [classify|gen|selftest]  the OS micro language model (M7)\n"
     "  dur [sync]                  durable-store status (ext2 side disk, M8)\n"
+    "  snap [take LABEL]           list snapshots, or take one now (M5)\n"
+    "  rollback [latest|ID]        undo to a snapshot; running jobs are revoked\n"
     "  cortex [scripted|micro|llm] show/switch the routing cortex\n"
     "  jail [DIR] | store [DIR]    show/rebind workspace jail / OS store\n"
     "  agent GOAL...               run an agent to completion (foreground)\n"
@@ -1495,6 +1559,10 @@ static int builtin_promote(sh_shell *sh, sargv *a, char **text_out,
      * exactly what the policy layer wanted before it would let it through. The
      * staging record is the accountability link between the AI that proposed
      * the change and the person who accepted it. */
+    /* M5: a promote is the moment a change becomes real, so it is the moment
+     * worth having a snapshot of the state before it. */
+    char snapnote[160] = {0};
+    sh_snap_before(sh, "before a promote", snapnote, sizeof snapnote);
     bool ok = stage_promote_locked(&s, &n, err, ecap);
     if (ok) {
         char line[256];
@@ -2148,6 +2216,91 @@ static void jobs_restore(sh_shell *sh) {
 }
 
 /* M8 durable: `dur` — durable-store status on the ext2 side disk. */
+
+/* `snap` -- list, or take, a snapshot. */
+static int builtin_snap(sh_shell *sh, sargv *a, char **text_out,
+                        char *err, size_t ecap) {
+    if (a->n >= 2 && strcmp(a->v[1], "take") == 0) {
+        const char *label = a->n >= 3 ? a->v[2] : "manual";
+        char id[AIOS_SNAP_ID_MAX] = {0};
+        if (!snap_take(sh->jail, sh->store, label, id, sizeof id, err, ecap)) {
+            return 1;
+        }
+        char perr[128] = {0};
+        (void)snap_prune(sh->store, AIOS_SNAP_KEEP, perr, sizeof perr);
+        char line[256];
+        snprintf(line, sizeof line, "snapshot %.48s taken (%s)", id, label);
+        *text_out = strdup(line);
+        return 0;
+    }
+    snap_list l;
+    if (!snap_list_all(sh->store, &l, err, ecap)) return 1;
+    char *txt = snap_list_text(&l);
+    size_t need = strlen(txt ? txt : "") + 200;
+    char *out = (char *)malloc(need);
+    if (out) {
+        snprintf(out, need,
+                 "snapshots (%zu, keeping %d):\n%s  rollback [latest|<id>] undoes "
+                 "the most recent one",
+                 l.n, AIOS_SNAP_KEEP, txt ? txt : "");
+        free(txt);
+        *text_out = out;
+    } else {
+        free(txt);
+        *text_out = strdup("");
+    }
+    snap_list_free(&l);
+    return 0;
+}
+
+/* `rollback [latest|<id>]` -- restore the jail and store, revoking jobs.
+ *
+ * The order is deliberate and is the milestone's whole argument: jobs are
+ * stopped FIRST, because restoring a tree that an agent is still writing to
+ * produces a state that is neither the old one nor the new one. */
+static int builtin_rollback(sh_shell *sh, sargv *a, char **text_out,
+                            char *err, size_t ecap) {
+    const char *which = a->n >= 2 ? a->v[1] : "latest";
+
+    snap_info si;
+    if (!snap_find(sh->store, which, &si, err, ecap)) return 1;
+
+    int killed = sh_revoke_jobs(sh);
+    sh_poll_jobs(sh);
+
+    char replaced[600] = {0};
+    char rerr[512] = {0};
+    if (!snap_restore(sh->jail, sh->store, si.id,
+                      replaced, sizeof replaced, rerr, sizeof rerr)) {
+        snprintf(err, ecap, "rollback failed: %.400s", rerr);
+        sembus_pub_kv(sh->bus, "sh.rollback.failed",
+                      (const char *const[]){ "id", si.id, "error", rerr, NULL });
+        return 1;
+    }
+    sembus_pub_kv(sh->bus, "sh.rollback.done",
+                  (const char *const[]){ "id", si.id, "jobs_revoked", "yes", NULL });
+
+    /* The tool registry and memory hold the OLD tree's state in memory. Reopening
+     * them is not optional: a shell that reports a rollback while its memory
+     * still describes the rolled-back session is lying about what it did. */
+    tool_reg_free(sh->tools);
+    mem_close(sh->mem);
+    sh->mem = mem_open(sh->store);
+    sh->tools = sh->mem ? tool_reg_create(sh->jail, sh->store, "sh", sh->mem) : NULL;
+    if (sh->tools) tool_reg_install_default(sh->tools);
+
+    char line[900];
+    snprintf(line, sizeof line,
+             "rolled back to %.48s (%s)\n"
+             "  %d running job%s revoked\n"
+             "  the state that was replaced is in %.200s",
+             si.id, si.label[0] ? si.label : "no label",
+             killed, killed == 1 ? "" : "s",
+             replaced[0] ? replaced : "(not recorded)");
+    *text_out = strdup(line);
+    return 0;
+}
+
 static int builtin_dur(sh_shell *sh, sargv *a, char **text_out,
                        char *err, size_t ecap) {
     (void)err; (void)ecap;
@@ -2401,6 +2554,8 @@ static int run_command(sh_shell *sh, scmd *c,
     if (strcmp(c0, "autopilot") == 0) return builtin_autopilot(sh, a, text_out, err, ecap);
     if (strcmp(c0, "tune") == 0)    return builtin_tune(sh, a, text_out, err, ecap);
     if (strcmp(c0, "dur") == 0)     return builtin_dur(sh, a, text_out, err, ecap);
+    if (strcmp(c0, "snap") == 0)    return builtin_snap(sh, a, text_out, err, ecap);
+    if (strcmp(c0, "rollback") == 0) return builtin_rollback(sh, a, text_out, err, ecap);
     if (strcmp(c0, "agent") == 0) {
         char *goal = join_args(a->v, a->n, 1);
         if (!*goal) { free(goal); snprintf(err, ecap, "agent needs a goal"); return 1; }

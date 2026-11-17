@@ -23,4 +23,15 @@ echo boot: kernel bridge status
 kernel
 echo boot: autopilot governor status
 autopilot
+echo boot: rollback proof (M5)
+# The proof runs in the shell so it exercises exactly what a human would type:
+# write, snapshot, wreck, roll back, and read the file back. boot-test.sh then
+# asserts the FIRST content after a REBOOT, which is the part that proves the
+# snapshot was on disk rather than in a variable.
+snap take boot-proof
+fs.write path=bootproof.txt content=v1
+snap take before-wreck
+fs.write path=bootproof.txt content=v2
+rollback latest
+fs.read path=bootproof.txt
 echo boot: aiosh bring-up complete

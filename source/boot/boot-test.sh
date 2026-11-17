@@ -179,6 +179,12 @@ have1() { grep -q "$1" boot/build/boot-test1.log 2>/dev/null \
 have1 'AI-OS 1.1.0-m10 (v1.1 desktop)'
 have1 'durable: /dev/vda on /data (ext2)'
 have1 'AIOS-DUR mounted=1'
+# M5: the rollback proof. The boot script writes v1, snapshots, writes v2, rolls
+# back and reads the file -- so "v1" appearing AFTER the rollback line is the
+# assertion that the snapshot was real and was on disk.
+have1 'rolled back to'
+have1 'snapshot .* taken '
+have1 'boot: rollback proof'
 have1 'AIOS-SELFTEST: PASS'
 have1 'SELFTEST test_durable: PASS'
 have1 'AIOS-BOOT-OK selftest=PASS'
@@ -197,6 +203,8 @@ have2() { grep -q "$1" boot/build/boot-test2.log 2>/dev/null \
 have2 'AIOS-DUR mounted=1 jobs=[1-9] mem=[1-9] audit=[1-9]'
 have2 'this is boot #2 for this data disk'
 have2 'journal entries replayed from the previous session'
+# M5 across the reboot: the file the rollback restored is still v1 on the second
+# boot, which is what makes this a snapshot rather than a copy held in RAM.
 have2 'AIOS-SELFTEST: PASS'
 have2 'AIOS-BOOT-OK selftest=PASS'
 

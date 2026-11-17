@@ -41,6 +41,16 @@ static const char *resolve_worker(char *buf, size_t cap) {
             }
         }
     }
+    /* Conventional locations, for the same reason the test fixtures have them:
+     * /proc/self/exe is the best answer and not the only one. Before /proc is
+     * mounted -- or inside a chroot where it has not been -- readlink fails, and
+     * the worker is "not found" while sitting in /sbin exactly where the image
+     * installed it. Absolute paths, because the caller may be anywhere. */
+    static const char *const fallbacks[] = {
+        "/sbin/tool-exec", "/usr/libexec/aios/tool-exec", "/usr/bin/tool-exec", NULL
+    };
+    for (int i = 0; fallbacks[i]; i++)
+        if (access(fallbacks[i], X_OK) == 0) return fallbacks[i];
     if (access("./tool-exec", X_OK) == 0) return "./tool-exec";
     return NULL;
 }

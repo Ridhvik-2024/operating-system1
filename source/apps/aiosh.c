@@ -24,8 +24,22 @@ static void print_result(const sh_result *r) {
     if (r->status != 0 && r->error) printf("error: %s\n", r->error);
 }
 
+/* Where the workspace lives when nobody says otherwise.
+ *
+ * This used to be the relative "./workspace", which is fine at a shell prompt
+ * and wrong when PID 1 starts the shell: init never chdir()s, so the jail
+ * resolved to /workspace while the image installs it at /workspace -- and the
+ * relative path only worked for a human who happened to be in the right
+ * directory. A path that depends on someone else's cwd is not a default, it is a
+ * coincidence. Absolute first, relative as the fallback for a source-tree run. */
+static const char *default_jail(void) {
+    if (access("/workspace", F_OK) == 0) return "/workspace";
+    if (access("./workspace", F_OK) == 0) return "./workspace";
+    return "./workspace";
+}
+
 int main(int argc, char **argv) {
-    const char *jail = "./workspace";
+    const char *jail = default_jail();
     /* M8 durable: init points AIOS_STORE at the ext2 side disk when it
      * mounted one — memory/audit/jobs then persist across reboots. */
     const char *store = getenv("AIOS_STORE");
