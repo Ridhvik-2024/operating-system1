@@ -317,3 +317,75 @@ The same instinct that made M3's guarantee decorative for the agent path.
 that touches process spawning, paths, signals or the loader.
 **Reverse if:** never. Add the run to CI as a scripted step when it is cheap
 enough; do not drop it because it is inconvenient.
+
+## D23 — 2026-11-17 — A filesystem boundary breaks every rename, so stage next to the target
+The restore path staged its copies inside the store and then renamed them onto the
+jail. It passed every host test, because on a host the store and the jail are two
+directories on one filesystem. In the image the jail is on the ext2 side disk and
+the store is in the initramfs, and every one of four renames answered `EXDEV`:
+*"cannot move the current jail aside: Invalid cross-device link"*.
+**Why:** `rename()` is not a copy. It is a directory-entry move, and it is only
+defined within one filesystem. The boot job found this because it is the only place
+the two trees are ever on different media — and the message reads like a permission
+problem, one step away from the real cause.
+**What it cost:** four separate renames, each hiding the next. The staging dir
+inside the jail (`<jail>/.restore`) was the worst: it is a *child*, so it moves
+with the parent and the subsequent rename finds nothing, reporting "No such file
+or directory" about a path that obviously exists.
+**Fix:** every temporary and backup path is a **sibling** of the thing it protects,
+built by `sibling_path()` rather than `snprintf` so a path build cannot silently
+truncate. State preserved during a restore is `<jail>.old` and `<store>.replaced…`.
+**Test:** `test_cross_filesystem()` puts the store on `/dev/shm` and the jail in
+the source tree — two real filesystems, no root needed — and reproduces the CI
+failure exactly when the fix is reverted.
+**Reverse if:** never. Any place that renames between two trees must first ask
+whether they can be on different filesystems. In this OS the answer is yes.
+
+## D24 — 2026-11-17 — Coarse clocks turn "unique" ids into collisions
+Snapshot ids were `<milliseconds>-<pid>`. On a desktop that is unique. In the
+image the clock ticks coarsely and a take of a small jail finishes well inside one
+tick, so two takes produced the same id, the same temp directory, and the second
+could not rename onto the first. The reported failure was three groups downstream
+("an ambiguous id is not guessed"), because there was only one snapshot left to be
+ambiguous about.
+**Why:** uniqueness was assumed from the resolution of the machine the code was
+written on. A virtual clock is not a wall clock.
+**Fix:** `<ms>-<pid>-<seq>`, where seq is the first value with no existing
+directory. This is what `snapshot.h` already promised; the code had dropped it.
+**Test:** `test_ids_are_unique()` asserts the *property* — eight takes, eight
+distinct ids, eight directories — rather than the format. It cannot fail on a fine
+host clock, which is exactly why the bug was invisible there.
+**Reverse if:** never. Any identifier that must be unique must be made unique by
+checking, not by hoping the clock is good enough.
+
+## D25 — 2026-11-17 — The component that takes AI input must not hold rollback power
+`aiosh` can be talked into things by an agent; that is what a shell for an AI is.
+So the ability to put the machine back is served by PID 1 over a unix socket, and
+the shell asks.
+**Why:** a rollback owned by the shell is a rollback an agent can reach through
+the shell. The boundary that matters is not "can the AI type `rollback`" — it is
+"does the code that executes AI input own the restore path". It does not.
+**Cost:** a protocol, a server, a client, and a documented answer to "who may
+ask". Every snapshot now costs a connect().
+**Honest limit:** `SO_PEERCRED` is checked before the request is read, but today
+every process runs as the same uid, so the check cannot tell an agent from a
+human. The header says so. It becomes a real boundary when agents get their own
+uid (Phase 3), and the check will already be in the right place.
+**Reverse if:** never for the ownership. The protocol could be replaced by a
+different transport; the property to keep is that the restore path is not reached
+from AI input.
+
+## D26 — 2026-11-17 — A stale socket and an absent supervisor must not look alike
+The shell falls back to an in-process snapshot when no supervisor answers, which
+is what makes the host tests work. The first version of that fallback made "PID 1
+owns rollback" true only when the shell happened to start second: the socket file
+did not exist yet, the shell connected to nothing, and quietly did the work itself.
+**Why:** a fallback that cannot distinguish "not there" from "not up yet" turns a
+guarantee into a race, and the race is invisible because both paths succeed.
+**Fix:** if the socket's directory exists but the socket does not, the client waits
+up to ~1 s for it. If the directory does not exist at all, there is no supervisor
+on this machine and the fallback is correct.
+**Test:** the in-image check starts the supervisor and the shell *concurrently* and
+asserts the snapshot came from the supervisor's jail, not the shell's.
+**Reverse if:** the supervisor ever becomes optional on a booted image, in which
+case absence should be an error, not a fallback.

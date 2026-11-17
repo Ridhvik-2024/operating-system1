@@ -110,7 +110,31 @@ not.
   three-way diff. Tombstone = move into `staging/.trash/<ts>-<name>` and only
   `unlink` on user confirmation.
 
-### G5 — Snapshots and rollback: MISSING · **S1**
+### G5 — Snapshots and rollback: **PRESENT, with named limits** (M5, 2026-11-17) · **S1**
+- **Was**: `grep -ri rollback src include` → 0 hits. No snapshot store, no restore
+  path, no `rollback` command.
+- **Now**: `snap_take` / `snap_restore` / `snap_list_all` / `snap_prune`
+  (`src/snapshot.c`), a supervisor in PID 1 serving `snap|list|restore|kill` on
+  `/run/aios/supervisor.sock`, `snap` / `rollback` builtins in `aiosh`, and a
+  snapshot taken automatically before every agent run and every promote
+  (keep 5). Proven in the image: write, snapshot, wreck, rollback, reboot,
+  reads back the first content.
+- **The claim "rollback is physics" is still only half true**, and the half that is
+  missing is the important half:
+  - it *is* always available (nothing can turn it off) and it *is* owned by PID 1
+    rather than the AI-facing shell — but **every process still runs as one uid**,
+    so PID 1 cannot tell an agent's request from a human's. The `SO_PEERCRED`
+    check is the right shape and distinguishes nothing yet (D25).
+  - it is **O(bytes)**, not physics: a copy, on an 8 MiB disk, holding ~5 of them.
+    overlayfs/btrfs subvolumes (L2) are what make it cheap enough to be routine.
+  - it does **not** revoke AI *authority* or hardware access, because authority is
+    not yet a thing that can be revoked (G6).
+- **Fix (still open)**: per-agent uid so the supervisor's peer check means
+  something; overlay or dm-snapshot so a snapshot stops costing a full copy;
+  and the rollback of *promoted* changes, which needs M6's chain to name the
+  state being restored.
+
+### G5 (original statement, kept for the record) — Snapshots and rollback: MISSING · **S1**
 - **Claim**: rollback is *physics* — always available, cannot be disabled,
   host-controlled, revokes AI authority and hardware access, restores a
   previous valid state; micro / session / emergency rollback.

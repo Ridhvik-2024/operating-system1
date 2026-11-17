@@ -311,7 +311,33 @@ did not declare → result `ok:false` + `undeclared_effect`; a declared write �
 
 ---
 
-## M5 — Snapshots and rollback · **L** · closes G5
+## M5 — Snapshots and rollback · **L** · closes G5 — ✅ **DONE 2026-11-17**
+
+> `include/aios/snapshot.h` + `src/snapshot.c` (**86 checks**),
+> `include/aios/supervisor.h` + `src/supervisor.c` (**55 checks**), shell builtins
+> `snap` / `rollback` (in `tests/test_shell.c`), `dur` now reports snapshot
+> availability, and the boot proof runs in the real image on every CI run.
+>
+> **The card's own premise needed correcting in three places:**
+> 1. It said `snap_restore` "swaps dirs atomically". It cannot. `rename()` across
+>    filesystems is `EXDEV` (D23), so the restore stages siblings and moves the
+>    current state aside first; the guarantee is "a failed restore leaves the
+>    previous state recoverable", not "the swap is atomic".
+> 2. It said ids were timestamps. Timestamps collide on a coarse virtual clock
+>    (D24).
+> 3. It said the socket check "never accepts an AI uid (Phase 3)". Everything runs
+>    as one uid today, so that check cannot distinguish anything yet; the header
+>    says so instead of implying a boundary that does not exist (D25).
+>
+> **What is real:** take/restore across filesystems, verified in the image;
+> retention enforced on every take; a snapshot survives a reboot; restore revokes
+> running jobs; PID 1 serves `snap|list|restore|kill|ping` on
+> `/run/aios/supervisor.sock` (0600) and the shell asks rather than acting.
+>
+> **What is not:** no overlayfs, so a snapshot is O(bytes) (an 8 MiB disk holds a
+> handful — hence `AIOS_SNAP_KEEP 5`); no content diff between snapshots; nothing
+> yet binds "the diff you were shown" to "the rollback you asked for" (that is
+> M6/M7's hash chain).
 
 **Goal.** Rollback exists, is available always, and is owned by PID 1 — not by
 the component that takes AI input.

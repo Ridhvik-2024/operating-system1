@@ -204,6 +204,9 @@ have1 'AIOS-SELFTEST: PASS'
 have1 'SELFTEST test_durable: PASS'
 have1 'AIOS-BOOT-OK selftest=PASS'
 have1 'autopilot governor: pid'
+# M5: PID 1 must establish the supervisor before any shell exists, or "rollback
+# is owned by PID 1" is something the shell does to itself and calls a guarantee.
+have1 'supervisor: pid .* serving /run/aios/supervisor.sock'
 
 echo
 echo "[boot-test] phase 2: same disk — reboot and replay the journal"
