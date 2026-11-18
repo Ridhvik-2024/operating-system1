@@ -133,7 +133,7 @@ static int seccomp_install(char *why, size_t cap) {
 /* One rule: "everything beneath `path` may be read and written". Returns 0 on
  * success, -1 with *why filled. */
 static int landlock_allow(const char *path, int ruleset_fd, __u64 handled,
-                          long abi, char *why, size_t cap) {
+                          char *why, size_t cap) {
     int jfd = open(path, O_PATH | O_CLOEXEC | O_DIRECTORY);
     if (jfd < 0) {
         whyf(why, cap, "open %s: %s", path, strerror(errno));
@@ -187,7 +187,7 @@ static int landlock_apply(const char *jail, const char *extra_rw,
     }
 
     /* Allow everything within the jail. */
-    if (landlock_allow(jail, ruleset_fd, handled, abi, why, cap) != 0) {
+    if (landlock_allow(jail, ruleset_fd, handled, why, cap) != 0) {
         close(ruleset_fd);
         return -1;
     }
@@ -195,7 +195,7 @@ static int landlock_apply(const char *jail, const char *extra_rw,
      * staging subtree the parent named, which is the only outside place a
      * machine's write is supposed to reach. */
     if (extra_rw && *extra_rw) {
-        if (landlock_allow(extra_rw, ruleset_fd, handled, abi, why, cap) != 0) {
+        if (landlock_allow(extra_rw, ruleset_fd, handled, why, cap) != 0) {
             /* Not fatal, and deliberately so. The jail rule is the one that must
              * hold; the staging rule is an addition, and failing to add it must
              * not turn "sandbox is up" into "sandbox is off". What it must do is
