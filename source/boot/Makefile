@@ -26,6 +26,7 @@ LIB_SRCS  := src/json.c src/types.c src/aiproc.c src/sembus.c \
 	     src/agent.c \
 	     src/cortex.c src/shell.c src/shroute.c src/ksched.c src/ebpf.c src/hardening.c \
 	     src/microlm.c src/autopilot.c src/durable.c \
+	     src/stoich.c src/firewall.c \
 	     src/fb.c src/win.c src/input.c
 LIB       := boot/build/libaios.a
 # Host-only tests: they need /dev/shm or a compiler, or they would have to write
