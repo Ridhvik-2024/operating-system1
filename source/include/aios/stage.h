@@ -183,6 +183,86 @@ bool stage_promote_locked(stage_session *s, aios_origin origin,
                           size_t *n_promoted,
                           char *err, size_t ecap);
 
+/* ---- M7.5: pending is a LIST, and nothing is silently lost ----
+ *
+ * M3 through M7 treated the staging area as if at most one change were ever
+ * waiting. Two things were true and neither was checked:
+ *
+ *   1. `promote` and `staged` each answered "which change do you mean?" by
+ *      picking ONE session out of the directory -- the newest by mtime, ties
+ *      broken by readdir order. Two pending changes were indistinguishable from
+ *      one, and the one not picked could never be named.
+ *   2. A session can hold a file that no note names. The shell pre-notes the
+ *      effects it declared; a second write folded into an already-live session
+ *      never got its own note, so its bytes sat in upper/ described by nothing.
+ *      The diff iterates over NOTES, so those bytes were invisible to `staged`
+ *      and were never promoted. The human read "1 file" while two had been
+ *      written.
+ *
+ * A diff that shows less than the staging area holds is worse than no diff: it
+ * is a review that can be passed without reviewing. The rule this file now
+ * enforces is the boring one -- what is shown is what would move, and what
+ * would move is named in the manifest.
+ */
+
+#define AIOS_STAGE_MAX_PENDING 32
+
+typedef struct {
+    char        dir[AIOS_STAGE_PATH_MAX];
+    char        id[80];               /* <intent>-<seq>: the name under staging/ */
+    stage_state state;
+    size_t      n_notes;              /* rows the manifest records             */
+    size_t      n_files;              /* files actually in upper/ (recursive)  */
+    size_t      n_unnoted;            /* files in upper/ that no note names    */
+    long long   mtime_ms;             /* used only to order the list           */
+} stage_pending;
+
+typedef struct {
+    stage_pending items[AIOS_STAGE_MAX_PENDING];
+    size_t        n;
+    bool          truncated;          /* more sessions pending than we can list */
+} stage_pending_list;
+
+/* Enumerate every session that is still promotable (manifest OPEN or
+ * PROMOTING), newest first. A missing staging directory is an empty list, not
+ * an error: "nothing is staged" is an answer.
+ *
+ * PROMOTING sessions are included on purpose. A promote that died half-way is
+ * the one change that most needs to be seen -- it is the only record that the
+ * jail may be part-way between two states. */
+bool stage_pending_scan(const char *store, stage_pending_list *out,
+                        char *err, size_t ecap);
+void stage_pending_free(stage_pending_list *l);
+
+/* Resolve what a human typed after `promote`/`discard` into a session dir.
+ *
+ * Accepts an id (`<intent>-<seq>`, as printed by `staged`), a session
+ * directory path, or `latest`. `latest` resolves only when the answer is
+ * unambiguous -- it is a convenience for "the one change that is pending", not
+ * a way to pick one of several. Ambiguity is an ERROR here rather than a
+ * choice, because a promote is not a place to guess: see the file comment.
+ * On error the reason names the ids that were pending. */
+bool stage_resolve(const char *store, const char *what,
+                   char *dir_out, size_t cap, char *err, size_t ecap);
+
+/* Files inside the session's upper/ that the manifest does not name, as
+ * jail-relative paths. `names` may be NULL to only count. Returns the number
+ * found (capped at `cap`, but the return value counts only what it stored when
+ * `names` is non-NULL).
+ *
+ * These files are not promotable and must not be described as if they were; the
+ * shell prints them separately and refuses a promote that would leave them. */
+size_t stage_unnoted(stage_session *s,
+                     char (*names)[AIOS_STAGE_PATH_MAX], size_t cap,
+                     char *err, size_t ecap);
+
+/* Record every note in `paths`/`ops` the session does not already have.
+ * Used by the shell to keep extending one live session across several AI
+ * writes without re-noting what is already there. */
+bool stage_note_many(stage_session *s,
+                     const char (*paths)[AIOS_STAGE_PATH_MAX],
+                     const stage_op *ops, size_t n, char *err, size_t ecap);
+
 /* ---- introspection, used by the shell and by tests ---- */
 
 /* Read the manifest state of a directory without opening a session. */

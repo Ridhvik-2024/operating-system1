@@ -534,3 +534,66 @@ says NOTHING WAS STAGED".
 **Reverse if:** never for the rule itself. If staging ever moves inside the jail
 (the overlayfs design in the M3 card), the second root disappears — and the test
 that proves the store is still refused should be deleted with it, not before.
+
+## D34 — 2026-11-18 — A review that shows less than it holds is not a review
+M3 through M7 treated the staging area as if at most one change were ever
+waiting. That was never asserted anywhere — it was assumed, in three places at
+once, and the assumption was wrong in each of them.
+
+**The three defects, found by asking "what does the human see?" rather than "does
+the code run":**
+1. `sh_latest_stage()` answered "which change do you mean?" by picking the newest
+   session by mtime, ties broken by readdir order. Two pending changes were
+   indistinguishable from one, and `promote` / `discard` with no argument took
+   whichever won. A human who reviewed one change and typed `promote` had no way
+   to know that a second existed, let alone which one was applied.
+2. A staged file could exist that NO NOTE NAMED. The shell pre-noted the effects
+   it declared, so a second AI write folded into an already-live session landed
+   its bytes in `upper/` described by nothing. `stage_diff_compute()` iterates
+   over notes, so those bytes were invisible to `staged` — and `promote` moves
+   notes, so they were never applied. The human read "1 file" while two were
+   written, and one was stranded.
+3. The worst one: `stage_live` was SHELL state, not COMMAND state. A typed AI
+   write left its session live, and the next line — an unrelated agent run —
+   inherited it. The agent's guardian staged its own step into the human's
+   pending change, and when the run finished with the jail unchanged the
+   after-hook discarded "the run's" staging, which by then was the person's
+   change. **A change a human had been shown, and had not decided on, was thrown
+   away by an agent that never knew it existed.** The reproduction is four lines:
+   `machine "fs.write path=REVIEWED.txt content=one"`, `staged`,
+   `machine "summarize the workspace"`, `staged`.
+
+**Fix, one rule per defect, all in the fail-closed direction:**
+1. `stage_pending_scan()` enumerates every OPEN and PROMOTING session; `staged`
+   prints all of them, each with the `[id]` a human types. `stage_resolve()`
+   accepts an id, a path, or `latest` — and `latest` resolves ONLY when exactly
+   one change is pending. With two, it is an error that names both. A promote is
+   not a place to guess.
+2. `stage_unnoted()` walks `upper/` and compares it against the manifest, and
+   both `stage_promote()` and `stage_promote_locked()` refuse when they disagree.
+   The old contract — "the manifest drives the move, unlisted files are ignored"
+   — was defended by a test (`test_locked_promote_ignores_unlisted_files`) whose
+   last assertion was that the unlisted file did NOT land. That was half a
+   protection: ignoring a file is indistinguishable, from the human's side, from
+   never having staged it, and the diff did not mention it either. The promote
+   SUCCEEDED and left bytes behind that nobody was shown. That test's conclusion
+   is now the opposite, and the reversal is stated in the test.
+3. `sh_exec_origin()` clears the live-session pointer, so nothing is live until
+   the command being run stages something. No command can act on a session it did
+   not open. The cost is stated rather than hidden: two AI writes in two commands
+   are now two changes, not one — which is exactly what the pending list is for.
+
+**Why this was not visible before:** all three are only observable with *more than
+one* pending change, and every test that staged anything promoted or discarded it
+before doing the next thing. The suite was a sequence of single-change stories.
+The new checks are the first ones that ask what happens when a person is looking
+at one change while another arrives.
+
+**Cost.** One walk of `upper/` per promote and per `staged`. Promotion is a human
+action, bounded by `AIOS_STAGE_MAX_FILES`, and the alternative is a review tool
+that can omit. Cheap at any price this milestone would pay.
+
+**Reverse if:** the manifest stops being the only source of truth about a staging
+session — e.g. if upper/ becomes a real overlay and the kernel can enumerate it.
+Even then the refusal must stay: "the diff showed everything" is the property,
+not "the manifest names everything".

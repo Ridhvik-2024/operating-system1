@@ -551,8 +551,23 @@ static void test_locked_promote_refuses_orphan(void) {
     CHECK(n == 0, "nothing was promoted");
 }
 
-static void test_locked_promote_ignores_unlisted_files(void) {
-    printf("locked promote only moves what the manifest names\n");
+/* M7.5 changed this test's conclusion, on purpose.
+ *
+ * It used to assert: an unlisted file in upper/ is ignored, the listed one is
+ * promoted, "the manifest drives the move". The last clause was the problem.
+ * Ignoring the unlisted file is indistinguishable, from the human's side, from
+ * never having staged it -- and the diff they approved iterates over the
+ * manifest, so it did not mention it either. The promote SUCCEEDED and left
+ * bytes behind that nobody was ever shown: the same defect as a review that
+ * shows one of two pending changes, one layer down.
+ *
+ * The rule now is the fail-closed one: if the staging directory holds a file the
+ * manifest does not name, the manifest has stopped describing the change, and
+ * neither promote variant will act on it. The human is told to discard and
+ * re-stage, because re-staging re-derives the manifest from reality.
+ */
+static void test_promote_refuses_unlisted_files(void) {
+    printf("promote refuses a staging dir the manifest does not describe\n");
     char jail[512], store[512];
     fixture("lu", jail, sizeof jail, store, sizeof store);
     char err[256] = {0};
@@ -566,14 +581,28 @@ static void test_locked_promote_ignores_unlisted_files(void) {
     write_text(sneaky, "not listed\n");
 
     size_t n = 0;
-    CHECK(stage_promote_locked(&s, ORIGIN_HUMAN, &n, err, sizeof err), "promote_locked succeeds");
-    CHECK(n == 1, "it promoted exactly the one listed file");
+    CHECK(!stage_promote_locked(&s, ORIGIN_HUMAN, &n, err, sizeof err),
+          "promote_locked REFUSES rather than promoting part of the change");
+    CHECK_STR(err, "not named by the manifest", "and says the manifest does not describe it");
+    CHECK(n == 0, "nothing was promoted");
 
     char jp[600], js[600];
     snprintf(jp, sizeof jp, "%s/named.txt", jail);
     snprintf(js, sizeof js, "%s/sneaky.txt", jail);
-    CHECK(exists(jp), "the listed file landed");
-    CHECK(!exists(js), "the unlisted file did NOT land: the manifest drives the move");
+    CHECK(!exists(jp), "the listed file did NOT land either: a partial promote is not a promote");
+    CHECK(!exists(js), "and the unlisted file certainly did not");
+
+    /* The plain variant has the same rule: it must not be the way around it. */
+    err[0] = 0;
+    n = 0;
+    CHECK(!stage_promote(&s, ORIGIN_HUMAN, &n, err, sizeof err),
+          "stage_promote refuses for the same reason");
+    CHECK_STR(err, "not named by the manifest", "with the same explanation");
+    CHECK(!exists(jp), "and still nothing landed");
+
+    /* Discarding is the documented way out, and it never touches the jail. */
+    CHECK(stage_discard(&s, err, sizeof err), "discard works on a change that cannot be promoted");
+    CHECK(!exists(jp) && !exists(js), "and the jail is still untouched");
     stage_end(&s);
 }
 
@@ -705,7 +734,7 @@ int main(void) {
     test_duplicate_note_is_idempotent();
     test_too_many_files();
     test_locked_promote_refuses_orphan();
-    test_locked_promote_ignores_unlisted_files();
+    test_promote_refuses_unlisted_files();
     test_locked_promote_refuses_symlink_escape();
     test_promote_refuses_machine_origin();
 

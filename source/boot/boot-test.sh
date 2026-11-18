@@ -232,6 +232,19 @@ have1 'boot: staging under the sandbox'
 have1 'bootproof\-m7\.txt'
 have1 'nothing was written to the jail'
 have1 'discarded; the jail was never touched'
+# M7.5: the pending list survives an intervening agent run. Three claims, and
+# the middle one is the whole milestone:
+#   - a change staged BEFORE a full agent run is still listed after it (the run
+#     used to inherit the live session and discard it on the way out);
+#   - promoting it BY ID applies that change and not the agent's;
+#   - the change nobody named is still pending afterwards, rather than being
+#     silently dropped once something was promoted.
+have1 'boot: pending is a list'
+have1 'after an agent run, the earlier change is still listed'
+have1 '2 changes are pending'
+have1 'promoting the change that was reviewed, by name'
+have1 'written-by-a-machine'
+have1 'the agent did not get its own change applied'
 
 echo
 echo "[boot-test] phase 2: same disk — reboot and replay the journal"

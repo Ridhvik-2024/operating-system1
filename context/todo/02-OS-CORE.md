@@ -508,6 +508,51 @@ that an AI-origin action can never reach `stage_promote()` directly.
 
 ---
 
+## M7.5 — Pending is a list, and nothing is silently lost · **S** · closes G4 half — ✅ **DONE 2026-11-18**
+
+**Why this exists and was not on the board.** M8's do-list already said
+`pending`/`diff <id>`/`promote <id>`. Those words presume more than one pending
+change and a stable identity per change — and the engine underneath had neither.
+It knew about exactly one change, could not name it, and could lose it. Building
+the UI first would have produced a good-looking list of one.
+
+**The three defects (details and the reproduction in D34):**
+1. `sh_latest_stage()` picked one session by mtime; ties broken by readdir.
+   Two pending changes were indistinguishable from one, and a bare `promote`
+   took whichever won.
+2. A file could be staged that no note named, so `staged` showed less than the
+   staging area held and `promote` never applied it. *The human read "1 file"
+   while two were written.*
+3. `stage_live` was shell state, not command state, so an unrelated agent run
+   inherited a person's pending change — and discarded it on the way out.
+   *A change that had been shown, and not yet decided, was thrown away by a run
+   that never mentioned it.*
+
+**Do.** ✅ all four
+1. `stage_pending_scan()` — every OPEN/PROMOTING session, newest first, stable
+   ordering. `staged` prints all of them with a `[id]` each.
+2. `stage_resolve()` — id / path / `latest`, where `latest` resolves **only**
+   when exactly one change is pending. Several pending + no id = an error that
+   names them. No guessing on the one command that makes change real.
+3. `stage_unnoted()` + a precheck in **both** promote variants: if `upper/` holds
+   a file the manifest does not name, promote refuses. This reversed
+   `test_locked_promote_ignores_unlisted_files`, deliberately.
+4. `sh_exec_origin()` clears the live-session pointer: nothing is live until the
+   command being run stages something.
+
+**Acceptance.** ✅ `tests/test_shell.c::pending_tests` — 51 checks covering all
+three defects, each stated as a sentence that was false before. `test_stage`
+141 checks, shell 352, suite 1406 total. Boot proof in `boot/boot.aiosh`
+("pending is a list") + 6 `have1` assertions. Each guard sabotaged and seen to
+fail: removing the per-command clear → 16 failures; removing the invariant → 8;
+making `stage_resolve` guess → 10; making a joining write start a new session → 6.
+
+**Not fixed here, and it is the remaining honest gap:** the origin tag is still a
+voluntary argument in a one-uid process, and `promote` still does not verify that
+the diff a human *read* is the diff it applies (that binding is M8's job).
+
+---
+
 ## M8 — Promote/reject UX (console + desktop) · **M** · closes G4/G9 UX half
 
 **Goal.** A human can see pending changes, read a diff, and decide — in both
@@ -516,6 +561,10 @@ front-ends, with the same engine underneath.
 **Do.**
 1. Console builtins: `pending` (list), `diff <id>`, `promote <id|all>`,
    `discard <id>`.
+   — `staged` already does the list-with-ids and `promote <id>`/`discard <id>`
+   already work (M7.5). What is left is `diff <id>` (single change, no
+   `[id]` headers), `pending` as an alias or rename, and `promote all` — which
+   must be a *deliberate* word, given D34.
 2. Desktop: a **pending-changes** window (6th *window*, not a 6th launcher app —
    see RULES §2.4 on the 5-slot launcher): rows = intent id, origin, summary;
    keys `p`/`d`/`enter`; a diff pane rendered with the 8×16 grid (green `+`,
@@ -538,7 +587,7 @@ M1 (descriptor, pass-through)
        └─ M4 (effects from the worker)
             └─ M3 (staging) ── M6 (audit chain)
                  └─ M5 (snapshot/rollback, PID 1)
-                      └─ M7 (origin) ── M8 (promote UX)
+                      └─ M7 (origin) ── M7.5 (pending list) ── M8 (promote UX)
 ```
 
 Why: you cannot gate writes (M3) before you can decide (M2), and you cannot

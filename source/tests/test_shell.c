@@ -1289,7 +1289,271 @@ static void router_tests(void) {
     tool_reg_free(tr);
 }
 
-#include "aios/types.h"
+/* ---- M7.5: pending is a list, and nothing is silently lost ----
+ *
+ * Every check in this block is a sentence that was FALSE before this milestone,
+ * taken from a reproduction of the bug rather than invented:
+ *
+ *   - "a second AI write is shown to the human"  (it vanished from `staged`,
+ *      and its bytes were named by no note, so promote left them behind)
+ *   - "an unrelated agent run does not consume a pending change"  (the run
+ *      inherited the session, found the jail unchanged, and discarded it)
+ *   - "promote will not choose between two changes"  (it picked the newest by
+ *      mtime, and would have applied a change the human never saw)
+ *
+ * They live in the shell suite because the shell is where the single-session
+ * assumption lived. The storage primitives were individually correct.
+ */
+static void pending_tests(void) {
+    sh_result r;
+    const char *jail  = "build/test-pending/jail";
+    const char *store = "build/test-pending/store";
+    if (system("rm -rf build/test-pending") != 0) { /* best effort */ }
+    CHECK(aios_mkdirs(jail) == AIOS_OK, "pending: fresh jail");
+    CHECK(aios_mkdirs(store) == AIOS_OK, "pending: fresh store");
+    write_file("build/test-pending/jail/seed.txt", "seed\n");
+
+    sh_shell *o = sh_create(jail, store);
+    CHECK(o != NULL, "pending: shell");
+    if (!o) return;
+
+    /* ---- 1. two AI writes: BOTH are pending and both are named ----
+     *
+     * They are two changes, not one, and that is deliberate: a staged session
+     * belongs to the command that opened it (sh_exec_origin clears the pointer),
+     * so no command can ever act on a session it did not open. The property
+     * that matters is not "one change" but "nothing invisible" -- the old code
+     * reported the newer change and silently dropped the older one from every
+     * listing while leaving it promotable and unnameable.
+     */
+    int rc = sh_exec_origin(o, "fs.write path=ALPHA.txt content=alpha", ORIGIN_AI, &r);
+    CHECK(rc == 0, "pending: first AI write is accepted");
+    CHECK_STR_CONTAINS(r.text, "ALPHA.txt", "pending: and reported as staged");
+    sh_result_free(&r);
+    rc = sh_exec_origin(o, "fs.write path=BETA.txt content=beta", ORIGIN_AI, &r);
+    CHECK(rc == 0, "pending: second AI write is accepted");
+    CHECK_STR_CONTAINS(r.text, "other change is still pending",
+                       "pending: and the FIRST one is named, not forgotten");
+    sh_result_free(&r);
+
+    rc = sh_exec_origin(o, "staged", ORIGIN_AI, &r);
+    CHECK(rc == 0, "pending: staged succeeds");
+    CHECK_STR_CONTAINS(r.text, "ALPHA.txt", "pending: the list holds the first change");
+    CHECK_STR_CONTAINS(r.text, "BETA.txt",
+                       "pending: ...and the second, which used to be invisible");
+    CHECK(r.text && strstr(r.text, "2 changes are pending") != NULL,
+          "pending: and says there are two");
+    {
+        /* ---- 2. promote refuses to choose between changes ---- */
+        char id_a[96] = {0};
+        const char *p = r.text ? strstr(r.text, "ALPHA.txt") : NULL;
+        if (p) {
+            const char *lb = p;
+            while (lb > r.text && *lb != '[') lb--;
+            const char *rb = (*lb == '[') ? strchr(lb, ']') : NULL;
+            if (rb && (size_t)(rb - lb - 1) < sizeof id_a)
+                snprintf(id_a, sizeof id_a, "%.*s", (int)(rb - lb - 1), lb + 1);
+        }
+        sh_result_free(&r);
+        CHECK(id_a[0] != 0, "pending: each change is printed with an id");
+
+        sh_exec_origin(o, "promote", ORIGIN_HUMAN, &r);
+        CHECK(r.status != 0, "pending: a bare promote is REFUSED when two are pending");
+        CHECK_STR_CONTAINS(r.error, "2 changes are pending",
+                           "pending: and says how many, rather than picking one");
+        sh_result_free(&r);
+        {
+            FILE *f = fopen("build/test-pending/jail/ALPHA.txt", "r");
+            CHECK(f == NULL, "pending: the refusal promoted nothing");
+            if (f) fclose(f);
+        }
+
+        /* ---- 2b. the named change is applied, and only it ---- */
+        if (id_a[0]) {
+            char line[160];
+            snprintf(line, sizeof line, "promote %s", id_a);
+            sh_exec_origin(o, line, ORIGIN_HUMAN, &r);
+            CHECK(r.status == 0, "pending: the named change promotes");
+            CHECK_STR_CONTAINS(r.text, "promoted 1 file", "pending: exactly one file");
+            sh_result_free(&r);
+            {
+                FILE *f = fopen("build/test-pending/jail/ALPHA.txt", "r");
+                FILE *g = fopen("build/test-pending/jail/BETA.txt", "r");
+                CHECK(f != NULL, "pending: the change the human named landed");
+                CHECK(g == NULL, "pending: ...and the one they did not name did not");
+                if (f) fclose(f);
+                if (g) fclose(g);
+            }
+            /* ---- 2c. discard names its target too ----
+             * Take the id from a live read, before freeing it: reading r.text
+             * after sh_result_free is exactly the kind of bug this milestone is
+             * about, and it cost a debugging cycle here. */
+            sh_exec_origin(o, "staged", ORIGIN_HUMAN, &r);
+            CHECK_STR_CONTAINS(r.text, "BETA.txt",
+                               "pending: the remaining change is still listed after a promote");
+            {
+                char id_b[96] = {0};
+                const char *pb = r.text ? strstr(r.text, "BETA.txt") : NULL;
+                if (pb) {
+                    const char *lb = pb;
+                    while (lb > r.text && *lb != '[') lb--;
+                    const char *rb = (*lb == '[') ? strchr(lb, ']') : NULL;
+                    if (rb && (size_t)(rb - lb - 1) < sizeof id_b)
+                        snprintf(id_b, sizeof id_b, "%.*s", (int)(rb - lb - 1), lb + 1);
+                }
+                CHECK(id_b[0] != 0, "pending: the remaining change has an id");
+                sh_result_free(&r);
+
+                if (id_b[0]) {
+                    char dline2[160];
+                    snprintf(dline2, sizeof dline2, "discard %s", id_b);
+                    sh_exec_origin(o, dline2, ORIGIN_HUMAN, &r);
+                    CHECK(r.status == 0, "pending: discard <id> discards the named change");
+                    CHECK_STR_CONTAINS(r.text, "never touched",
+                                       "pending: and says the jail was not touched");
+                    sh_result_free(&r);
+                }
+                sh_exec_origin(o, "staged", ORIGIN_HUMAN, &r);
+                CHECK(r.text && strstr(r.text, "nothing is staged") != NULL,
+                      "pending: and the list is empty afterwards");
+                sh_result_free(&r);
+            }
+        }
+    }
+
+
+    /* ---- 2d. two AI writes in ONE command are one change ----
+     *
+     * A piped machine line stages twice inside a single command, so the second
+     * write joins the live session. That is the path `sh_stage_extend` exists
+     * for, and the one where a missing note would have left bytes in upper/
+     * that the diff could not show. It also demonstrates the difference the
+     * per-command clear makes: the same two writes typed separately (above) are
+     * two changes; piped, they are one.
+     */
+    {
+        sh_exec_origin(o, "machine \"fs.write path=P1.txt content=one | fs.write path=P2.txt content=two\"",
+                       ORIGIN_HUMAN, &r);
+        CHECK(r.status == 0, "pending: a piped machine line stages twice");
+        sh_result_free(&r);
+        sh_exec_origin(o, "staged", ORIGIN_HUMAN, &r);
+        CHECK_STR_CONTAINS(r.text, "P1.txt", "pending: the piped change shows the first write");
+        CHECK_STR_CONTAINS(r.text, "P2.txt", "pending: ...and the second, in the same change");
+        CHECK(r.text && strstr(r.text, "2 files") != NULL,
+              "pending: both rows are in ONE change, so promote applies both");
+        sh_result_free(&r);
+        sh_exec_origin(o, "promote", ORIGIN_HUMAN, &r);
+        CHECK(r.status == 0, "pending: the one change can be promoted");
+        CHECK_STR_CONTAINS(r.text, "promoted 2 files", "pending: and it carried both files");
+        sh_result_free(&r);
+        FILE *f1 = fopen("build/test-pending/jail/P1.txt", "r");
+        FILE *f2 = fopen("build/test-pending/jail/P2.txt", "r");
+        CHECK(f1 && f2, "pending: both piped writes landed");
+        if (f1) fclose(f1);
+        if (f2) fclose(f2);
+    }
+
+    /* ---- 3. an unrelated agent run does not consume a pending change ----
+     *
+     * This is the one that mattered. Before M7.5 the agent inherited the live
+     * session, and its after-hook -- which runs on every step -- discarded the
+     * staging it believed was its own. A change the human had been shown, and
+     * had not decided on, was thrown away by a run that never mentioned it. */
+    sh_exec_origin(o, "fs.write path=REVIEWED-BY-NOBODY.txt content=one", ORIGIN_AI, &r);
+    CHECK(r.status == 0, "pending: a machine stages a change for review");
+    sh_result_free(&r);
+    {
+        FILE *f = fopen("build/test-pending/jail/REVIEWED-BY-NOBODY.txt", "r");
+        CHECK(f == NULL, "pending: it did not land");
+        if (f) fclose(f);
+    }
+
+    sh_exec_origin(o, "summarize the workspace", ORIGIN_AI, &r);
+    CHECK(r.status == 0, "pending: an unrelated agent run succeeds");
+    sh_result_free(&r);
+
+    rc = sh_exec_origin(o, "staged", ORIGIN_HUMAN, &r);
+    CHECK(rc == 0, "pending: staged still works");
+    CHECK_STR_CONTAINS(r.text, "REVIEWED-BY-NOBODY.txt",
+                       "pending: the reviewed change SURVIVED the agent run");
+    CHECK_STR_CONTAINS(r.text, "summary.md",
+                       "pending: and the agent's own change is listed beside it");
+    CHECK(r.text && strstr(r.text, "2 changes are pending") != NULL,
+          "pending: the list says how many there are");
+    {
+        char id[96] = {0};
+        /* Take the id of the reviewed change out of the listing: the whole
+         * point is that a human can name what they are looking at. */
+        const char *p = r.text ? strstr(r.text, "REVIEWED-BY-NOBODY.txt") : NULL;
+        if (p) {
+            const char *lb = p;
+            while (lb > r.text && *lb != '[') lb--;
+            if (*lb == '[') {
+                const char *rb = strchr(lb, ']');
+                if (rb && (size_t)(rb - lb - 1) < sizeof id)
+                    snprintf(id, sizeof id, "%.*s", (int)(rb - lb - 1), lb + 1);
+            }
+        }
+        sh_result_free(&r);
+
+        /* ---- 4. promote refuses to choose, and names what it could not ---- */
+        CHECK(id[0] != 0, "pending: an id is printed for the change");
+        sh_exec_origin(o, "promote", ORIGIN_HUMAN, &r);
+        CHECK(r.status != 0, "pending: a bare promote is REFUSED when two are pending");
+        CHECK_STR_CONTAINS(r.error, "2 changes are pending",
+                           "pending: and says how many, rather than picking");
+        sh_result_free(&r);
+        {
+            FILE *f = fopen("build/test-pending/jail/REVIEWED-BY-NOBODY.txt", "r");
+            CHECK(f == NULL, "pending: refusal promoted nothing");
+            if (f) fclose(f);
+        }
+
+        /* ---- 5. the named one can be promoted, exactly it ---- */
+        if (id[0]) {
+            char line[160];
+            snprintf(line, sizeof line, "promote %s", id);
+            sh_exec_origin(o, line, ORIGIN_HUMAN, &r);
+            CHECK(r.status == 0, "pending: the named change promotes");
+            CHECK_STR_CONTAINS(r.text, "promoted 1 file", "pending: exactly one file");
+            sh_result_free(&r);
+            {
+                FILE *f = fopen("build/test-pending/jail/REVIEWED-BY-NOBODY.txt", "r");
+                FILE *g = fopen("build/test-pending/jail/summary.md", "r");
+                CHECK(f != NULL, "pending: the change the human named was applied");
+                CHECK(g == NULL, "pending: ...and the one they did not name was NOT");
+                if (f) fclose(f);
+                if (g) fclose(g);
+            }
+            /* and what is left is still named, not silently forgotten */
+            sh_exec_origin(o, "staged", ORIGIN_HUMAN, &r);
+            CHECK_STR_CONTAINS(r.text, "summary.md",
+                               "pending: the remaining change is still listed after a promote");
+            sh_result_free(&r);
+        }
+    }
+
+    /* ---- 6. discarding one change leaves the others alone ---- */
+    CHECK(sh_exec_origin(o, "fs.write path=SECOND-TYPED.txt content=x", ORIGIN_AI, &r) == 0,
+          "pending: a third change stages");
+    sh_result_free(&r);
+    sh_exec_origin(o, "discard summary.md", ORIGIN_HUMAN, &r);
+    CHECK(r.status != 0, "pending: discarding by a name that is not an id is refused");
+    CHECK_STR_CONTAINS(r.error, "no pending change with id",
+                       "pending: ...with a message that says what is pending");
+    sh_result_free(&r);
+    sh_exec_origin(o, "staged", ORIGIN_HUMAN, &r);
+    {
+        /* The failed `discard summary.md` must not have removed anything. */
+        bool still_there = r.text && strstr(r.text, "summary.md") != NULL;
+        const char *sum = r.text;
+        CHECK(still_there, "pending: the refused discard removed nothing");
+        (void)sum;
+    }
+    sh_result_free(&r);
+
+    sh_free(o);
+}
 
 
 int main(int argc, char **argv) {
@@ -1297,6 +1561,7 @@ int main(int argc, char **argv) {
     router_tests();
     shell_tests();
     origin_tests();
+    pending_tests();
     ui_tests();
     printf("%s: %d checks, %d failed\n",
            g_failed ? "FAIL" : "PASS", g_checks, g_failed);

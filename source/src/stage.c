@@ -417,6 +417,255 @@ bool stage_note(stage_session *s, const char *rel, stage_op op,
     return manifest_write(s, STAGE_MANIFEST_OPEN, paths, ops, n + 1, err, ecap);
 }
 
+/* ---------------- M7.5: what upper/ holds vs what the manifest names ------- */
+
+/* Walk upper/ and collect every regular file, as a jail-relative path.
+ *
+ * This is the inventory the diff used to lack. The diff is driven by NOTES, so
+ * a file can sit in upper/ described by nothing -- and then `staged` shows one
+ * row while two changes are waiting. Walking the tree is the only way to know
+ * that the manifest is telling the whole truth. */
+static void walk_upper(const char *upper, const char *rel,
+                       char (*names)[AIOS_STAGE_PATH_MAX], size_t cap,
+                       size_t *found, char *err, size_t ecap) {
+    char dir[AIOS_STAGE_PATH_MAX];
+    if (rel && *rel) snprintf(dir, sizeof dir, "%s/%s", upper, rel);
+    else             snprintf(dir, sizeof dir, "%s", upper);
+
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char rel2[AIOS_STAGE_PATH_MAX];
+        int rn = (rel && *rel)
+               ? snprintf(rel2, sizeof rel2, "%s/%s", rel, de->d_name)
+               : snprintf(rel2, sizeof rel2, "%s", de->d_name);
+        if (rn < 0 || (size_t)rn >= sizeof rel2) {
+            set_err(err, ecap, "staged path too long under %s", dir);
+            continue;
+        }
+        char full[AIOS_STAGE_PATH_MAX];
+        int fn = snprintf(full, sizeof full, "%s/%s", dir, de->d_name);
+        if (fn < 0 || (size_t)fn >= sizeof full) continue;
+
+        struct stat st;
+        if (lstat(full, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            walk_upper(upper, rel2, names, cap, found, err, ecap);
+            continue;
+        }
+        /* A symlink or a device node in upper/ is not something staging put
+         * there; count it as a file so it is reported, and never promote it. */
+        if (names && *found < cap) snprintf(names[*found], AIOS_STAGE_PATH_MAX, "%s", rel2);
+        (*found)++;
+    }
+    closedir(d);
+}
+
+size_t stage_unnoted(stage_session *s,
+                     char (*names)[AIOS_STAGE_PATH_MAX], size_t cap,
+                     char *err, size_t ecap) {
+    static char files[AIOS_STAGE_MAX_FILES * 4][AIOS_STAGE_PATH_MAX];
+    const size_t maxf = sizeof files / sizeof files[0];
+    size_t nfiles = 0;
+    walk_upper(s->upper, "", NULL, 0, &nfiles, err, ecap);
+
+    static char noted[AIOS_STAGE_MAX_FILES][AIOS_STAGE_PATH_MAX];
+    static stage_op nops[AIOS_STAGE_MAX_FILES];
+    size_t nnotes = load_notes(s, noted, nops, AIOS_STAGE_MAX_FILES);
+
+    size_t nf = 0;
+    walk_upper(s->upper, "", files, maxf, &nf, err, ecap);
+    if (nf > maxf) nf = maxf;
+
+    size_t out_n = 0;
+    for (size_t i = 0; i < nf; i++) {
+        bool named = false;
+        for (size_t k = 0; k < nnotes; k++) {
+            if (strcmp(files[i], noted[k]) == 0) { named = true; break; }
+        }
+        if (named) continue;
+        if (names && out_n < cap) {
+            /* Copy by measured length: the row is a fixed 512-byte field and the
+             * name was bounded when it was collected, so this cannot overrun. */
+            size_t l = strlen(files[i]);
+            if (l >= AIOS_STAGE_PATH_MAX) l = AIOS_STAGE_PATH_MAX - 1;
+            memcpy(names[out_n], files[i], l);
+            names[out_n][l] = 0;
+        }
+        out_n++;
+    }
+    return out_n;
+}
+
+bool stage_note_many(stage_session *s,
+                     const char (*paths)[AIOS_STAGE_PATH_MAX],
+                     const stage_op *ops, size_t n, char *err, size_t ecap) {
+    if (!s) return set_err(err, ecap, "no session"), false;
+
+    static char cur[AIOS_STAGE_MAX_FILES][AIOS_STAGE_PATH_MAX];
+    static stage_op cops[AIOS_STAGE_MAX_FILES];
+    size_t nc = load_notes(s, cur, cops, AIOS_STAGE_MAX_FILES);
+
+    bool changed = false;
+    for (size_t i = 0; i < n; i++) {
+        if (!rel_ok(paths[i])) return set_err(err, ecap, "staged path is not jail-relative"), false;
+        bool have = false;
+        for (size_t k = 0; k < nc; k++) {
+            if (strcmp(cur[k], paths[i]) == 0) { have = true; break; }
+        }
+        if (have) continue;
+        if (nc >= AIOS_STAGE_MAX_FILES)
+            return set_err(err, ecap, "too many staged files (max %d)", AIOS_STAGE_MAX_FILES), false;
+        snprintf(cur[nc], AIOS_STAGE_PATH_MAX, "%s", paths[i]);
+        cops[nc] = ops[i];
+        nc++;
+        changed = true;
+    }
+    if (!changed) return true;                 /* nothing new: no rewrite */
+    return manifest_write(s, STAGE_MANIFEST_OPEN, cur, cops, nc, err, ecap);
+}
+
+/* ---------------- M7.5: the pending list and id resolution ---------------- */
+
+void stage_pending_free(stage_pending_list *l) {
+    if (l) memset(l, 0, sizeof *l);
+}
+
+static int pending_cmp(const void *a, const void *b) {
+    const stage_pending *x = a, *y = b;
+    if (x->mtime_ms != y->mtime_ms) return (x->mtime_ms < y->mtime_ms) ? 1 : -1;
+    /* Same second (the common case in a test, and not rare in a person's
+     * session): order by name so the list is stable rather than
+     * readdir-dependent. Stability matters because the ids are what a human
+     * types; a list that reshuffles is a list you cannot act on. */
+    return strcmp(y->id, x->id);
+}
+
+bool stage_pending_scan(const char *store, stage_pending_list *out,
+                        char *err, size_t ecap) {
+    if (!store || !out) return set_err(err, ecap, "bad arguments"), false;
+    memset(out, 0, sizeof *out);
+
+    /* Normalize the store exactly as stage_begin/stage_open do, so the dirs this
+     * hands back compare equal to the dirs a session already holds. Without it a
+     * relative store produced "./store/staging/x" here and "/abs/store/staging/x"
+     * there, and the shell concluded its OWN live session was "another change
+     * still pending" -- the same class of bug as the one this milestone fixes,
+     * introduced by half-normalizing. */
+    char abs_store[AIOS_STAGE_PATH_MAX];
+    if (!abs_dir(store, abs_store, sizeof abs_store))
+        return set_err(err, ecap, "store must be an absolute path"), false;
+
+    char staging[AIOS_STAGE_PATH_MAX];
+    if (!join(staging, sizeof staging, abs_store, "staging"))
+        return set_err(err, ecap, "store path too long"), false;
+
+    DIR *d = opendir(staging);
+    if (!d) return true;                       /* nothing staged is not an error */
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char dir[AIOS_STAGE_PATH_MAX];
+        int dn = snprintf(dir, sizeof dir, "%s/%s", staging, de->d_name);
+        if (dn < 0 || (size_t)dn >= sizeof dir) continue;
+
+        struct stat st;
+        if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+
+        stage_state state = stage_manifest_state(dir);
+        if (state != STAGE_MANIFEST_OPEN && state != STAGE_MANIFEST_PROMOTING)
+            continue;                          /* done, or unpromotable */
+
+        if (out->n >= AIOS_STAGE_MAX_PENDING) {
+            out->truncated = true;
+            continue;                          /* keep counting? no: say it */
+        }
+        if (strlen(de->d_name) >= sizeof out->items[0].id) continue;   /* not nameable */
+        stage_pending *p = &out->items[out->n];
+        snprintf(p->dir, sizeof p->dir, "%s", dir);
+        snprintf(p->id, sizeof p->id, "%.79s", de->d_name);
+        p->state = state;
+        p->n_notes = stage_manifest_count(dir);
+        p->mtime_ms = (long long)st.st_mtime * 1000LL;
+
+        stage_session s;
+        char serr[192] = {0};
+        if (stage_open(dir, &s, serr, sizeof serr)) {
+            size_t files = 0;
+            walk_upper(s.upper, "", NULL, 0, &files, serr, sizeof serr);
+            p->n_files = files;
+            p->n_unnoted = stage_unnoted(&s, NULL, 0, serr, sizeof serr);
+            stage_end(&s);
+        }
+        out->n++;
+    }
+    closedir(d);
+    qsort(out->items, out->n, sizeof out->items[0], pending_cmp);
+    return true;
+}
+
+bool stage_resolve(const char *store, const char *what,
+                   char *dir_out, size_t cap, char *err, size_t ecap) {
+    if (!store || !dir_out) return set_err(err, ecap, "bad arguments"), false;
+
+    /* An explicit directory path is taken as given: `promote ./x` was already
+     * accepted before M7.5 and callers may be holding a path. */
+    if (what && strchr(what, '/'))
+        return snprintf(dir_out, cap, "%s", what) < (int)cap ? true
+               : (set_err(err, ecap, "staging path too long"), false);
+
+    stage_pending_list l;
+    if (!stage_pending_scan(store, &l, err, ecap)) return false;
+
+    /* Built by hand rather than with snprintf so the compiler can see that the
+     * result cannot overrun: ids are bounded by the struct field, and anything
+     * that would not fit is simply not listed (the count still is). */
+    char ids[512] = {0};
+    size_t off = 0;
+    for (size_t i = 0; i < l.n; i++) {
+        const char *id = l.items[i].id;
+        size_t need = strlen(id) + (i ? 1 : 0);
+        if (off + need + 1 > sizeof ids) break;
+        if (i) ids[off++] = ' ';
+        memcpy(ids + off, id, strlen(id));
+        off += strlen(id);
+        ids[off] = 0;
+    }
+
+    bool ok = false;
+    if (l.n == 0) {
+        set_err(err, ecap, "nothing is staged");
+        ok = false;
+    } else if (!what || strcmp(what, "latest") == 0) {
+        /* "latest" is a convenience for the unambiguous case only. */
+        if (l.n == 1) {
+            ok = snprintf(dir_out, cap, "%s", l.items[0].dir) < (int)cap;
+            if (!ok) set_err(err, ecap, "staging path too long");
+        } else {
+            set_err(err, ecap,
+                    "%zu changes are pending and none was named. Say which one: "
+                    "`promote <id>` or `promote latest` after choosing. Pending: %s",
+                    l.n, ids);
+        }
+    } else {
+        for (size_t i = 0; i < l.n; i++) {
+            if (strcmp(l.items[i].id, what) == 0) {
+                ok = snprintf(dir_out, cap, "%s", l.items[i].dir) < (int)cap;
+                if (!ok) set_err(err, ecap, "staging path too long");
+                break;
+            }
+        }
+        if (!ok && !*err)
+            set_err(err, ecap, "no pending change with id `%.64s`. Pending: %s",
+                    what, l.n ? ids : "(none)");
+    }
+    stage_pending_free(&l);
+    return ok;
+}
+
 /* ---------------- diff ---------------- */
 
 void stage_diff_free(stage_diff *d) {
@@ -654,6 +903,34 @@ bool stage_promote_one(stage_session *s, const char *rel, char *err, size_t ecap
     return promote_one_ex(s, rel, err, ecap) >= 0;
 }
 
+/* M7.5: the invariant that makes `staged` honest.
+ *
+ * Promote moves files named by the manifest. If upper/ holds a file the
+ * manifest does not name, then the diff -- which iterates over notes -- showed
+ * the human less than the staging area contains. Quietly promoting the named
+ * subset would make that subset real while the rest stays behind as garbage;
+ * quietly promoting everything would apply something nobody reviewed.
+ *
+ * So promote refuses, and says what it found. That is the same fail-closed
+ * direction as the undeclared-effect rule in M4, for the same reason: a
+ * component that is describing less than it holds has stopped being a source of
+ * truth, and its account cannot be used to decide what to do.
+ */
+static bool promote_precheck(stage_session *s, char *err, size_t ecap) {
+    char first[AIOS_STAGE_PATH_MAX] = {0};
+    char names[1][AIOS_STAGE_PATH_MAX];
+    size_t n = stage_unnoted(s, names, 1, err, ecap);
+    if (n == 0) return true;
+    if (names[0][0]) snprintf(first, sizeof first, "%s", names[0]);
+    return set_err(err, ecap,
+                   "refusing to promote: %zu file%s in the staging directory "
+                   "%s not named by the manifest (%.100s%s). The diff could not "
+                   "have shown them, so promoting would apply something nobody "
+                   "reviewed. Discard this change and re-stage it.",
+                   n, n == 1 ? " is" : "s are", n == 1 ? "" : "are", first,
+                   n > 1 ? " and others" : ""), false;
+}
+
 bool stage_promote(stage_session *s, aios_origin origin, size_t *n_promoted,
                    char *err, size_t ecap) {
     if (n_promoted) *n_promoted = 0;
@@ -672,6 +949,8 @@ bool stage_promote(stage_session *s, aios_origin origin, size_t *n_promoted,
         return set_err(err, ecap,
                        "refusing to promote %s: no manifest (abandoned or corrupt)",
                        s->dir), false;
+
+    if (!promote_precheck(s, err, ecap)) return false;
 
     /* Mark intent BEFORE the first rename. If we die here, the manifest says
      * PROMOTING and a re-run can finish. */
@@ -714,6 +993,8 @@ bool stage_promote_locked(stage_session *s, aios_origin origin,
         return set_err(err, ecap,
                        "refusing to promote %s: no manifest (abandoned or corrupt)",
                        s->dir), false;
+
+    if (!promote_precheck(s, err, ecap)) return false;
 
     /* Snapshot the note list BEFORE touching anything: promotion is driven by
      * the manifest, not by whatever is in the directory at the time. */

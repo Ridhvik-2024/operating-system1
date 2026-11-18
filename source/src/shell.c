@@ -850,6 +850,68 @@ static bool witness_changed(const char *jail, const jail_witness *w) {
  * an environment variable is inherited by everything the worker spawns, so it
  * would leak the staging location into any process the tool starts.
  */
+/* Witness the declared writes, then pre-note them.
+ *
+ * The note is what gives the diff a ROW even when the worker never runs -- a
+ * refused worker still owes the human an explanation, so this is deliberate.
+ * The witness is what makes the M4 guarantee independent of the worker: it is
+ * taken BEFORE the tool runs, so a worker that writes into the jail anyway is
+ * caught by comparing the world with this snapshot, not by trusting its report.
+ *
+ * M7.5: EVERY declared write is noted, not just the first. `fs.write` declares
+ * one path today, so this looked fine -- until a second write joined a live
+ * session and landed in upper/ with no note at all, invisible to the diff and
+ * unpromotable. That is the same class of defect as an under-declared effect,
+ * on the side that reports rather than the side that acts.
+ */
+static void sh_stage_witness_and_note(sh_shell *sh, stage_session *s,
+                                      aios_action *act, char *err, size_t ecap) {
+    for (int i = 0; i < act->n_declared && sh->n_witness < SH_MAX_WITNESS; i++) {
+        const char *eff = act->declared[i];
+        if (!eff || strncmp(eff, "write:", 6) != 0) continue;
+        if (eff[6]) witness_take(sh->jail, eff + 6,
+                                 &sh->witness[sh->n_witness++]);
+    }
+
+    static char paths[SH_MAX_WITNESS][AIOS_STAGE_PATH_MAX];
+    static stage_op ops[SH_MAX_WITNESS];
+    size_t n = 0;
+    for (int i = 0; i < act->n_declared && n < SH_MAX_WITNESS; i++) {
+        const char *eff = act->declared[i];       /* "write:a/b.txt" */
+        if (!eff || strncmp(eff, "write:", 6) != 0) continue;
+        const char *p = eff + 6;
+        if (!*p || strlen(p) >= AIOS_STAGE_PATH_MAX) continue;
+        snprintf(paths[n], AIOS_STAGE_PATH_MAX, "%s", p);
+        ops[n] = STAGE_OP_ADD;
+        n++;
+    }
+    if (n) (void)stage_note_many(s, (const char (*)[AIOS_STAGE_PATH_MAX])paths, ops,
+                                 n, err, ecap);
+}
+
+/* M7.5: join the live session instead of starting a second one.
+ *
+ * Two sessions for one gesture is what made a reviewed change disappear:
+ * `staged` showed the newer, `promote` applied the newer, and the older was
+ * still pending, still promotable, mentioned nowhere. One gesture is one
+ * change. The witness array is NOT reset here -- the jail must be compared
+ * against how it looked before the FIRST write of this change, or a worker that
+ * moved a file during the second write would be checked against a baseline that
+ * already includes it.
+ */
+static bool sh_stage_extend(sh_shell *sh, aios_action *act, char *err, size_t ecap) {
+    if (!sh || !act) return false;
+    stage_session s;
+    if (!stage_open(sh->stage_dir, &s, err, ecap)) {
+        sh->stage_live = 0;
+        sh->stage_dir[0] = 0;
+        return false;
+    }
+    sh_stage_witness_and_note(sh, &s, act, err, ecap);
+    stage_end(&s);
+    return true;
+}
+
 static bool sh_stage_begin(sh_shell *sh, aios_action *act, char *err, size_t ecap) {
     if (!sh || !act) return false;
     stage_session s;
@@ -861,24 +923,9 @@ static bool sh_stage_begin(sh_shell *sh, aios_action *act, char *err, size_t eca
     snprintf(sh->stage_dir, sizeof sh->stage_dir, "%s", s.dir);
     sh->stage_live = 1;
 
-    /* Witness the jail BEFORE the worker runs. This is what makes the
-     * guarantee independent of the worker's honesty. */
-    sh->n_witness = 0;
-    for (int i = 0; i < act->n_declared && sh->n_witness < SH_MAX_WITNESS; i++) {
-        const char *eff = act->declared[i];
-        if (!eff || strncmp(eff, "write:", 6) != 0) continue;
-        if (eff[6]) witness_take(sh->jail, eff + 6,
-                                 &sh->witness[sh->n_witness++]);
-    }
-
-    /* Pre-note every declared write so the diff has rows even if the worker
-     * never gets the chance to note its own. The note is idempotent. */
-    for (int i = 0; i < act->n_declared; i++) {
-        const char *eff = act->declared[i];       /* "write:a/b.txt" */
-        if (!eff || strncmp(eff, "write:", 6) != 0) continue;
-        const char *p = eff + 6;
-        if (*p) stage_note(&s, p, STAGE_OP_ADD, err, ecap);
-    }
+    /* Witness and note, in that order: the witness must be taken before the
+     * worker runs, or it records a world that already moved. */
+    sh_stage_witness_and_note(sh, &s, act, err, ecap);
     stage_end(&s);
     return true;
 }
@@ -927,6 +974,43 @@ static int sh_stage_has_bytes(const char *stage_dir) {
     }
     closedir(d);
     return have;
+}
+
+/* M7.5: is there anything ELSE waiting, and would a promote know which to pick?
+ *
+ * The defect this closes: a shell reported a diff for the change it had just
+ * staged, then forgot it. A second change -- or a plain agent run -- took the
+ * slot, and the first one stopped being mentioned anywhere. It was still in the
+ * store, still promotable, and invisible. A person who read the report and
+ * decided "not yet" was never told the decision was still open. */
+static size_t sh_pending_others(sh_shell *sh, const char *except_dir,
+                               char *first_id, size_t idcap) {
+    if (first_id && idcap) first_id[0] = 0;
+    stage_pending_list l;
+    char perr[192] = {0};
+    if (!stage_pending_scan(sh->store, &l, perr, sizeof perr)) return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < l.n; i++) {
+        if (except_dir && except_dir[0] && strcmp(l.items[i].dir, except_dir) == 0)
+            continue;
+        if (n == 0 && first_id && idcap) snprintf(first_id, idcap, "%s", l.items[i].id);
+        n++;
+    }
+    stage_pending_free(&l);
+    return n;
+}
+
+/* The one-line warning appended wherever a change is described. Silently
+ * leaving a second change unmentioned is the bug; naming it is the fix. */
+static void sh_pending_note(sh_shell *sh, const char *except_dir,
+                            char *buf, size_t cap) {
+    char id[80];
+    size_t n = sh_pending_others(sh, except_dir, id, sizeof id);
+    if (n == 0) { if (cap) buf[0] = 0; return; }
+    snprintf(buf, cap,
+             "  %zu other change%s still pending (%.40s%s). `staged` lists them;\n"
+             "  `promote` will not choose between changes you have not named.\n",
+             n, n == 1 ? " is" : "s are", id, n == 1 ? "" : ", ...");
 }
 
 /* After a staged tool run: turn the session into a diff for the human. */
@@ -978,6 +1062,18 @@ static int sh_stage_report(sh_shell *sh, char **text_out, char *err, size_t ecap
                            "  means the sandbox worker could not be run.\n") < 0)
             msg = NULL;
         free(body);
+        /* M7.5: and say what else is still waiting. */
+        if (msg) {
+            char note[256];
+            sh_pending_note(sh, s.dir, note, sizeof note);
+            if (note[0]) {
+                char *full = NULL;
+                if (asprintf(&full, "%s%s", msg, note) >= 0) {
+                    free(msg);
+                    msg = full;
+                }
+            }
+        }
         *text_out = msg ? msg : strdup("(staged)\n");
         stage_diff_free(&d);
     } else {
@@ -1277,7 +1373,21 @@ static int exec_tool_action(sh_shell *sh, aios_action *act, aios_origin origin,
      * the witness runs for either route -- the first version of this only
      * handled the typed one, and the swapped-worker test sailed through. */
     bool staged = (sh->stage_live != 0);
-    if (!staged && act->origin == ORIGIN_AI && strcmp(act->target, "fs.write") == 0) {
+    if (staged && act->origin == ORIGIN_AI && strcmp(act->target, "fs.write") == 0) {
+        /* M7.5: a second AI write joins the session that is already live.
+         *
+         * The first version started a NEW session for every write, so the
+         * earlier change lost the shell's pointer to it. Both were real, both
+         * were promotable, and only one could be named. Joining keeps the
+         * person's decision in one place: they are shown one change with two
+         * rows, not two changes of which one is invisible. */
+        if (!sh_stage_extend(sh, act, err, ecap)) {
+            stage_text_of(NULL, NULL, text_out);
+            *json_out = NULL;
+            return 1;
+        }
+    } else if (!staged && act->origin == ORIGIN_AI &&
+               strcmp(act->target, "fs.write") == 0) {
         if (!sh_stage_begin(sh, act, err, ecap)) {
             stage_text_of(NULL, NULL, text_out);
             *json_out = NULL;
@@ -1947,87 +2057,118 @@ static int builtin_policy(sh_shell *sh, sargv *a,
 }
 
 /* ---- M3: the human half of staging ---- */
-
-/* Find the most recent staging session in the store. `promote` with no argument
- * means "the thing I was just shown", which is what a human will type. */
-static bool sh_latest_stage(sh_shell *sh, char *out, size_t ocap) {
-    char staging[600];
-    snprintf(staging, sizeof staging, "%s/staging", sh->store);
-    DIR *d = opendir(staging);
-    if (!d) return false;
-
-    char best[512] = {0};
-    long long best_mtime = -1;
-    /* `staging` may be up to 600 bytes and `best` is 512: we copy only what
-     * fits and refuse a session dir we could not name completely. */
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        if (de->d_name[0] == '.') continue;
-        char dir[700];
-        int dn = snprintf(dir, sizeof dir, "%s/%s", staging, de->d_name);
-        if (dn < 0 || (size_t)dn >= sizeof dir) continue;
-        if (stage_manifest_state(dir) == STAGE_MANIFEST_NONE) continue;
-        if (stage_manifest_state(dir) == STAGE_MANIFEST_DONE) continue;
-        struct stat sst;
-        if (stat(dir, &sst) != 0 || !S_ISDIR(sst.st_mode)) continue;
-        if ((long long)sst.st_mtime >= best_mtime) {
-            best_mtime = (long long)sst.st_mtime;
-            if (strlen(dir) < sizeof best) memcpy(best, dir, strlen(dir) + 1);
-        }
-    }
-    closedir(d);
-    if (!best[0] || strlen(best) >= ocap) return false;
-    memcpy(out, best, strlen(best) + 1);
-    return true;
-}
-
+/* M7.5: `staged` shows EVERY pending change, each with an id a human can type.
+ *
+ * Before this it showed one change -- whichever `sh_latest_stage()` happened to
+ * pick -- and printed no id at all, so a second pending change could be neither
+ * seen nor named. The output shape stays close to what it was (a diff and a
+ * hint) so muscle memory and the boot script keep working; what is new is that
+ * the answer is the whole answer.
+ */
 static int builtin_staged(sh_shell *sh, char **text_out, json_val **json_out,
                           char *err, size_t ecap) {
-    char dir[600];
-    if (sh->stage_live && sh->stage_dir[0]) {
-        if (strlen(sh->stage_dir) >= sizeof dir) { *text_out = strdup(""); return 1; }
-        memcpy(dir, sh->stage_dir, strlen(sh->stage_dir) + 1);
-    } else if (!sh_latest_stage(sh, dir, sizeof dir)) {
+    stage_pending_list l;
+    if (!stage_pending_scan(sh->store, &l, err, ecap)) return 1;
+
+    if (l.n == 0) {
         *text_out = strdup("nothing is staged\n");
         (void)json_out;
+        stage_pending_free(&l);
         return 0;
     }
-    stage_session s;
-    if (!stage_open(dir, &s, err, ecap)) return 1;
-    stage_diff d;
-    if (!stage_diff_compute(&s, &d, err, ecap)) { stage_end(&s); return 1; }
-    char *body = stage_diff_text(&d);
-    /* M7: the same honesty as the report after a run. `staged` is where a human
-     * goes to decide, so it must not show a pending change that has no bytes
-     * behind it -- the rows come from the manifest, and the manifest is written
-     * before the worker runs. */
-    if (!sh_stage_has_bytes(dir) && body) {
-        char *msg = NULL;
-        if (asprintf(&msg, "%s"
-                           "  nothing is actually staged: the rows above are "
-                           "declared effects,\n"
-                           "  not files. There is nothing here to promote.\n",
-                     body) >= 0) {
-            free(body);
-            body = msg;
+
+    char *acc = NULL;
+    size_t cap = 0;
+    FILE *f = open_memstream(&acc, &cap);
+    if (!f) { stage_pending_free(&l); snprintf(err, ecap, "oom"); return 1; }
+
+    if (l.n > 1)
+        fprintf(f, "%zu changes are pending. Each block below is one change; "
+                   "none is chosen for you.\n\n", l.n);
+
+    for (size_t i = 0; i < l.n; i++) {
+        stage_pending *p = &l.items[i];
+        /* Always print the id, even for a single change. One place to look for
+         * it, and `promote <id>` works the same way whether one change is
+         * pending or five -- the form of the answer does not depend on how many
+         * there happen to be. */
+        fprintf(f, "[%s]\n", p->id);
+
+        stage_session s;
+        char oerr[192] = {0};
+        if (!stage_open(p->dir, &s, oerr, sizeof oerr)) {
+            fprintf(f, "  (could not be reopened: %s)\n\n", oerr);
+            continue;
         }
+        stage_diff d;
+        if (stage_diff_compute(&s, &d, oerr, sizeof oerr)) {
+            char *body = stage_diff_text(&d);
+            if (body) fprintf(f, "%s", body);
+            free(body);
+            stage_diff_free(&d);
+        } else {
+            fprintf(f, "  (could not compute the diff: %s)\n", oerr);
+        }
+
+        /* Files the manifest does not name cannot be promoted and were not in
+         * the diff above. Saying nothing here is how they went missing. */
+        if (p->n_unnoted)
+            fprintf(f, "  %zu file%s inside this change %s not named by its "
+                       "manifest and cannot be promoted.\n",
+                    p->n_unnoted, p->n_unnoted == 1 ? "" : "s",
+                    p->n_unnoted == 1 ? "is" : "are");
+        if (p->state == STAGE_MANIFEST_PROMOTING)
+            fprintf(f, "  A promote of this change started and did not finish. "
+                       "Promoting again completes it.\n");
+        if (!sh_stage_has_bytes(p->dir) && p->n_notes)
+            fprintf(f, "  nothing is actually staged here: the rows above are "
+                       "declared effects,\n  not files. There is nothing here "
+                       "to promote.\n");
+        stage_end(&s);
+        fprintf(f, "\n");
     }
-    *text_out = body;
-    stage_diff_free(&d);
-    stage_end(&s);
+
+    if (l.n == 1)
+        fprintf(f, "  promote %s        apply it\n"
+                   "  discard %s        throw it away\n",
+                l.items[0].id, l.items[0].id);
+    else
+        fprintf(f, "  promote <id> / discard <id>   you must name which change\n");
+    if (l.truncated)
+        fprintf(f, "  (more changes are pending than this list can show)\n");
+
+    fclose(f);
+    *text_out = acc ? acc : strdup("");
     (void)json_out;
+    stage_pending_free(&l);
     return 0;
+}
+
+/* M7.5: resolve what the human typed into exactly one session, never a guess.
+ *
+ * `promote` with no argument used to mean "whichever is newest", which is a
+ * choice made by mtime and readdir order on the human's behalf, in the one
+ * place where the difference between two changes is the whole point. Now it
+ * means "the one pending change", and if there is more than one the answer is
+ * an error that names them. */
+static bool sh_pick_session(sh_shell *sh, sargv *a, const char *verb,
+                            char *dir, size_t dcap, char *err, size_t ecap) {
+    const char *what = (a && a->n >= 2) ? a->v[1] : "latest";
+    if (!stage_resolve(sh->store, what, dir, dcap, err, ecap)) {
+        /* stage_resolve's text is the message; make the verb fit it. */
+        char msg[512];
+        snprintf(msg, sizeof msg, "%s", err);
+        snprintf(err, ecap, "cannot %s: %s", verb, msg);
+        return false;
+    }
+    return true;
 }
 
 static int builtin_promote(sh_shell *sh, sargv *a, char **text_out,
                            json_val **json_out, char *err, size_t ecap) {
     char dir[600];
-    if (a->n >= 2) {
-        snprintf(dir, sizeof dir, "%s", a->v[1]);
-    } else if (!sh_latest_stage(sh, dir, sizeof dir)) {
-        snprintf(err, ecap, "nothing is staged to promote");
-        return 1;
-    }
+    if (!sh_pick_session(sh, a, "promote", dir, sizeof dir, err, ecap)) return 1;
+
     stage_session s;
     if (!stage_open(dir, &s, err, ecap)) return 1;
     size_t n = 0;
@@ -2053,6 +2194,16 @@ static int builtin_promote(sh_shell *sh, sargv *a, char **text_out,
             snprintf(ev, sizeof ev, "{\"files\":%zu,\"dir\":\"%.300s\"}", n, s.dir);
             sembus_pub(sh->bus, "sh.stage.promote", ev);
         }
+        /* M7.5: an applied change must not silently leave others behind. */
+        char note[256];
+        sh_pending_note(sh, s.dir, note, sizeof note);
+        if (note[0] && *text_out) {
+            char *full = NULL;
+            if (asprintf(&full, "%s%s", *text_out, note) >= 0) {
+                free(*text_out);
+                *text_out = full;
+            }
+        }
     }
     stage_end(&s);
     (void)json_out;
@@ -2062,17 +2213,31 @@ static int builtin_promote(sh_shell *sh, sargv *a, char **text_out,
 static int builtin_discard(sh_shell *sh, sargv *a, char **text_out,
                            json_val **json_out, char *err, size_t ecap) {
     char dir[600];
-    if (a->n >= 2) {
-        snprintf(dir, sizeof dir, "%s", a->v[1]);
-    } else if (!sh_latest_stage(sh, dir, sizeof dir)) {
-        snprintf(err, ecap, "nothing is staged to discard");
-        return 1;
-    }
+    bool explicit_id = (a && a->n >= 2);
+    if (!sh_pick_session(sh, a, "discard", dir, sizeof dir, err, ecap)) return 1;
+
     stage_session s;
     if (!stage_open(dir, &s, err, ecap)) return 1;
+    /* Remember where it was, so "did anything else survive" is asked about the
+     * list without this one in it. discard moves the directory, so the path in
+     * `s.dir` changes underneath us. */
+    char was[600];
+    snprintf(was, sizeof was, "%s", s.dir);
     bool ok = stage_discard(&s, err, ecap);
     if (ok) *text_out = strdup("discarded; the jail was never touched\n");
+    if (ok) {
+        char note[256];
+        sh_pending_note(sh, was, note, sizeof note);
+        if (note[0] && *text_out) {
+            char *full = NULL;
+            if (asprintf(&full, "%s%s", *text_out, note) >= 0) {
+                free(*text_out);
+                *text_out = full;
+            }
+        }
+    }
     stage_end(&s);
+    (void)explicit_id;
     (void)json_out;
     return ok ? 0 : 1;
 }
@@ -3486,6 +3651,26 @@ int sh_exec_origin(sh_shell *sh, const char *line, aios_origin origin,
     }
     sh->last_origin = origin;
     sh->last_needs_human = 0;
+
+    /* M7.5: a staged session belongs to ONE command.
+     *
+     * `stage_live` is shell state, and the shell outlives any single line. So a
+     * typed AI write left its session live, and the next line -- an unrelated
+     * agent run -- inherited it: the agent's guardian staged its own step into
+     * the human's pending change, and when the run finished with the jail
+     * unchanged the after-hook discarded "the run's" staging, which by then was
+     * the person's change. A change a human had been shown and had not decided
+     * on was thrown away by an agent that never knew it existed.
+     *
+     * Clearing it here is the smallest honest rule: nothing is live until this
+     * command stages something. The cost is that two writes in one command are
+     * two changes (which the pending list can now represent); the benefit is
+     * that no command can ever act on a session it did not open.
+     */
+    sh->stage_live = 0;
+    sh->stage_dir[0] = 0;
+    sh->n_witness = 0;
+
     const char *p = line;
     while (*p == ' ' || *p == '\t') p++;
     if (!*p || *p == '#') return 0;          /* blank / comment */

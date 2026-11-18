@@ -71,4 +71,26 @@ staged
 echo as a human, discard is available:
 discard
 
+echo boot: pending is a list (M7.5)
+# The defect this proves gone: a change a human had been SHOWN stopped being
+# mentioned as soon as anything else staged, and an unrelated agent run could
+# discard it outright -- because a live staging session was shell state, not
+# command state.
+#
+# The sequence matters and was got wrong first: `promote latest` is only
+# unambiguous with ONE change pending, and `ls` is not a builtin -- it routes to
+# the agent, which stages another file and makes this proof test itself. So the
+# earlier change is promoted by its own id, and nothing here is spelled as a
+# command that would start a run.
+machine "fs.write path=bootproof-m75.txt content=written-by-a-machine"
+echo after an agent run, the earlier change is still listed:
+machine "summarize the workspace"
+staged
+echo promoting the change that was reviewed, by name:
+promote 15406709633990357084-1
+echo the change that was named landed:
+fs.read path=bootproof-m75.txt | grep written-by-a-machine
+echo the agent did not get its own change applied:
+staged
+
 echo boot: aiosh bring-up complete
