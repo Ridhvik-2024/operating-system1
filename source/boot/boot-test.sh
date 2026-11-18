@@ -277,19 +277,17 @@ echo "------------------------------------------"
 
 have2() { grep -qE "$1" boot/build/boot-test2.log 2>/dev/null \
              && echo "  OK   $1" || explain boot/build/boot-test2.log "$1"; }
-have2 'AIOS-DUR mounted=1 jobs=[1-9] mem=[1-9] audit=[1-9]'
-# Why a MISS here needs its own explanation: the annotation that reports it
-# carries only the tail of the log, so "AIOS-DUR ... jobs=[1-9]" was all CI
-# could say -- and `jobs` is a COUNT of spawn records the governor wrote on the
-# previous boot, which is not obviously rebuild-dependent. Print the actual line
-# so the next failure names its own cause instead of costing a round trip.
-dur2=$(tr -d '\r' < boot/build/boot-test2.log 2>/dev/null | grep -m1 'AIOS-DUR' || true)
-echo "  (boot 2 said: ${dur2:-<no AIOS-DUR line>})"
-jobs2=$(printf '%s' "$dur2" | sed -n 's/.*jobs=\([0-9]*\).*/\1/p')
-if [ -n "$jobs2" ] && [ "$jobs2" -eq 0 ]; then
-    echo "       jobs=0 means no spawn record was replayed: the governor wrote none"
-    echo "       on boot 1, or stage->jobs.jsonl was not fsynced before poweroff."
-fi
+# [0-9]+ not [1-9]: this asserts that the previous session's state was REPLAYED,
+# not that each counter happens to be a single digit. Written as [1-9] it was a
+# latent contradiction with the very next assertion -- which requires the audit
+# record count to GROW across the reboot, so it must eventually reach 10. The
+# run that first reached audit=16 failed here while every counter was healthy,
+# and the assertion meant to explain the failure printed nothing useful until
+# `explain()` was taught to echo the line it was looking for.
+have2 'AIOS-DUR mounted=1 jobs=[0-9]+ mem=[0-9]+ audit=[0-9]+'
+# And non-zero, stated separately so the two claims stay distinct: replay
+# happened (above), and there was something to replay (here).
+have2 'AIOS-DUR mounted=1 jobs=[1-9][0-9]* mem=[1-9][0-9]* audit=[1-9][0-9]*'
 have2 'this is boot #2 for this data disk'
 have2 'journal entries replayed from the previous session'
 # M5 across the reboot: the file the rollback restored is still v1 on the second
