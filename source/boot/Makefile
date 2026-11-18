@@ -197,6 +197,11 @@ $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	@echo "   M10 raise: GPU/input module stack (16 gz modules, ~845KB) ships"
 	@echo "   once; new cap = first m10 image size + 128KB headroom, pinned"
 	@echo "   in boot/.m10-size-cap"
+	@echo "   M6 raise (+51,000): the chained audit (audit.c) and the supervisor add"
+	@echo "   code to three binaries, and CI's static link against a newer glibc is"
+	@echo "   ~4KB larger per binary than a developer's. The guard is enforced on"
+	@echo "   the whole image; the self-test fixtures are reported separately below"
+	@echo "   so that a future raise can say WHICH grew."
 	@if [ ! -f $(BOOT_DIR)/.m10-size-cap ]; then \
 	     s=$$(stat -c %s $@); echo $$((s + 131072)) > $(BOOT_DIR)/.m10-size-cap; \
 	     echo "   cap pinned: $$((s + 131072)) (first build + 128KB headroom)"; \
@@ -215,7 +220,13 @@ $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	     ls -lS $(STAGE)/sbin $(STAGE)/usr/bin 2>/dev/null | head -8; \
 	     exit 1; \
 	 fi; \
-	 echo "   size-guard OK ($$((cap - size)) bytes under cap)"
+	 echo "   size-guard OK ($$((cap - size)) bytes under cap)"; \
+	 tests_kb=$$(du -sk $(STAGE)/usr/lib/aios/tests 2>/dev/null | cut -f1); \
+	 whole_kb=$$(du -sk $(STAGE) | cut -f1); \
+	 echo "   of which the self-test fixtures: $${tests_kb:-0} KB of uncompressed" ; \
+	 echo "   $${whole_kb:-0} KB (they compress to a few hundred KB in the image)." ; \
+	 echo "   Stated so that 'the product grew' and 'the self-test grew' are told" ; \
+	 echo "   apart before either becomes an argument for raising the cap."
 
 boot-run: $(INITRD) boot/run-qemu.sh
 	bash boot/run-qemu.sh
