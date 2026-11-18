@@ -231,9 +231,20 @@ have2 'journal entries replayed from the previous session'
 # M5 across the reboot: the file the rollback restored is still v1 on the second
 # boot, which is what makes this a snapshot rather than a copy held in RAM.
 # M6 across the reboot: the chain on boot 2 links to records written on boot 1, so
-# it must be intact AND longer -- a log that resets itself would still "verify".
+# it must be intact AND longer -- a log that resets itself would still "verify",
+# which is the exact bug D28 records.
 have2 'boot: audit chain proof'
 have2 'audit: [0-9]+ records, chained and intact'
+n1=$(tr -d '\r' < boot/build/boot-test1.log | sed -n      's/^audit: \([0-9][0-9]*\) records, chained and intact$/\1/p' | tail -1)
+n2=$(tr -d '\r' < boot/build/boot-test2.log | sed -n      's/^audit: \([0-9][0-9]*\) records, chained and intact$/\1/p' | tail -1)
+if [ -n "$n1" ] && [ -n "$n2" ] && [ "$n2" -gt "$n1" ]; then
+    echo "  OK   the chain grew across the reboot ($n1 -> $n2 records)"
+else
+    echo "  MISS the chain did not grow across the reboot (boot1=${n1:-?} boot2=${n2:-?})"
+    echo "       a log that resets itself still verifies; this is the assertion that"
+    echo "       tells a chain from a per-session file."
+    fail=1
+fi
 have2 'AIOS-BOOT-OK selftest=PASS'
 
 echo
