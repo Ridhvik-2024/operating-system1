@@ -214,6 +214,12 @@ have1 'supervisor: pid .* serving /run/aios/supervisor.sock'
 # gone through the sandbox on the ext2 disk.
 have1 'boot: audit chain proof'
 have1 'audit: [0-9]+ records, chained and intact'
+# M7: the origin proof, both directions. A shell that refused everything would
+# pass the second line and make the OS useless; a shell that refused nothing would
+# pass the first and make the milestone a comment. The two together are the claim.
+have1 'boot: origin proof'
+have1 'nothing is staged to promote'
+have1 'not available to a machine-originated line'
 
 echo
 echo "[boot-test] phase 2: same disk — reboot and replay the journal"

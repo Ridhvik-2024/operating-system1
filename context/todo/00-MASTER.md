@@ -43,8 +43,8 @@ Read `context/RULES.md` **before** any card. Every card assumes it.
 | `M3` | staging + diff + `promote`/`discard` (overlay or copy) | L | `02-OS-CORE.md` |
 | `M4` | `tool-exec` returns an *effects* document | M | `02-OS-CORE.md` |
 | `M5` | snapshot + `rollback [micro\|session]` owned by PID 1 | L | `02-OS-CORE.md` |
-| `M6` | hash-chained audit + `audit verify` | M | `02-OS-CORE.md` |
-| `M7` | origin tagging (`HUMAN` vs `AI`) at the TTY | M | `02-OS-CORE.md` |
+| `M6` | hash-chained audit + `audit verify` — ✅ **DONE** | M | `02-OS-CORE.md` |
+| `M7` | origin tagging (`HUMAN` vs `AI`) at the TTY — ✅ **DONE** | M | `02-OS-CORE.md` |
 | `M8` | `promote`/`reject` UX on serial console **and** desktop | M | `02-OS-CORE.md` + `03-GUI-TASKS.md` |
 
 ## Phase 2 — Make the OS honest about itself (≈1 week)

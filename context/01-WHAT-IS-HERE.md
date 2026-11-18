@@ -208,5 +208,12 @@ in `source/boot/`; the root copies are the release-bundle variants.
 `M1 foundation → M2 aiproc → M3 sembus → M4 agent-runtime → M5 aiosh →
 M5.5 bootable-image → M6 kernel-bridge → M7 autopilot → M8 durable →
 M9 v1-rc (1.0.0) → M10 desktop (1.1.0)`. All marked DONE.
+
+**Then the second series, which is about *law* rather than features**
+(`context/todo/02-OS-CORE.md`): `M1` descriptor → `M2` policy law table →
+`M3` staging → `M4` effects from the worker → `M5` snapshot/rollback owned by
+PID 1 → `M6` hash-chained audit → **`M7` origin tagging (DONE 2026-11-18)**.
+The two series reuse the same numbers; the second one is the one `src/action.c`,
+`src/policy.c`, `src/stage.c`, `src/snapshot.c`, `src/audit.c` implement.
 Post-M10 backlog named but unscheduled: `mesh` (TCP transport for the semantic
 bus), `cockpit` (mission-control dashboard).

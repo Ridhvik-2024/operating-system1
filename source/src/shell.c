@@ -134,6 +134,14 @@ struct sh_shell {
     char      cortex_mode[16];
     int       last_needs_sandbox;    /* M2: host requirements from the verdict */
     int       last_needs_rollback;
+    int       last_needs_human;      /* M7: the law said a person must decide */
+    aios_origin last_origin;         /* M7: what the last line was stamped as */
+    /* M7: who can answer a NEEDS_HUMAN. The library does not assume there is
+     * anyone: a front-end installs an asker, and the absence of one is a real
+     * answer ("nobody is here"), not a reason to pick a default. */
+    ui_choice (*ui_ask)(const ui_prompt *p, void *ud);
+    void     *ui_ask_ud;
+    int       allow_ui_prompt;       /* cleared to force the refusal path */
 
     /* M3: a machine-originated write lands here instead of the jail. NULL means
      * the tool layer writes directly (a human typed the command, or the caller
@@ -462,7 +470,148 @@ static const char *SH_CAPS[] = {
 
 #define SH_N_CAPS ((int)(sizeof SH_CAPS / sizeof SH_CAPS[0]))
 
-static int action_gate(sh_shell *sh, const aios_action *act,
+
+/* ---------------- M7: the human's side of NEEDS_HUMAN ------------------- *
+ *
+ * action_gate() parks an action and says "this needs a human". This is the part
+ * that asks one. It lives here, in the library, for a reason that is not
+ * tidiness: the serial console and the desktop must ask the SAME question with
+ * the SAME three words, and two copies of a question drift. It is also the only
+ * way to test the answer without a terminal.
+ *
+ * The rule that has no exceptions is at the bottom: no answer means DISCARD.
+ * `promote` is only ever returned when a person chose it. A timeout is a person
+ * not being there, and not being there is not consent.
+ */
+
+int ui_prompt_text(const ui_prompt *p, char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = 0;
+    if (!p) return 0;
+    int n = snprintf(out, cap,
+                     "%.150s\n"
+                     "  because: %.150s\n"
+                     "  proposed by: %s\n"
+                     "%s"
+                     "  [p] promote   [d] discard   [s] show diff\n"
+                     "  (no answer = discard: nothing is promoted by waiting)\n",
+                     p->title, p->reason,
+                     p->origin == ORIGIN_AI ? "a model" : "a person",
+                     p->have_detail ? p->detail : "");
+    return n < 0 ? 0 : n;
+}
+
+ui_choice ui_present(const ui_prompt *p,
+                     ui_choice (*ask)(const ui_prompt *p, void *ud), void *ud) {
+    /* No asker means nobody to ask. Not "assume yes", and not a prompt printed
+     * into a log that a person will read later: DISCARD, which is the answer that
+     * changed nothing. */
+    if (!p || !ask) return UI_CHOICE_DISCARD;
+
+    /* SHOW_DIFF is a question, not a loop forever: a person may look as many
+     * times as they like, but an asker that keeps answering SHOW_DIFF without a
+     * human present would spin. Bound it, and then the honest default. */
+    for (int i = 0; i < 16; i++) {
+        ui_choice c = ask(p, ud);
+        if (c == UI_CHOICE_SHOW_DIFF) continue;
+        if (c == UI_CHOICE_PROMOTE) return UI_CHOICE_PROMOTE;
+        return UI_CHOICE_DISCARD;
+    }
+    return UI_CHOICE_DISCARD;
+}
+
+/* The console's asker. Reads one line; anything unrecognised is a discard.
+ *
+ * Deliberately not "the first letter": `p` is promote, and someone typing "please"
+ * at a security prompt has not asked for anything. The whole line has to be the
+ * word (or its first letter alone). */
+void sh_set_ui_asker(sh_shell *sh, ui_choice (*ask)(const ui_prompt *p, void *ud),
+                     void *ud) {
+    if (!sh) return;
+    sh->ui_ask = ask;
+    sh->ui_ask_ud = ud;
+    sh->allow_ui_prompt = ask ? 1 : 0;
+}
+
+ui_choice sh_console_ask(const ui_prompt *p, void *ud) {
+    (void)ud;
+    char text[1024];
+    ui_prompt_text(p, text, sizeof text);
+    fputs(text, stdout);
+    fflush(stdout);
+
+    char line[64];
+    if (!fgets(line, sizeof line, stdin)) return UI_CHOICE_DISCARD; /* EOF */
+    line[strcspn(line, "\r\n")] = 0;
+    for (char *q = line; *q; q++)
+        if (*q >= 'A' && *q <= 'Z') *q = (char)(*q - 'A' + 'a');
+
+    if (strcmp(line, "p") == 0 || strcmp(line, "promote") == 0 ||
+        strcmp(line, "yes") == 0 || strcmp(line, "y") == 0)
+        return UI_CHOICE_PROMOTE;
+    if (strcmp(line, "s") == 0 || strcmp(line, "show") == 0 ||
+        strcmp(line, "show diff") == 0 || strcmp(line, "diff") == 0)
+        return UI_CHOICE_SHOW_DIFF;
+    return UI_CHOICE_DISCARD;   /* including eof, including garbage */
+}
+
+static int builtin_as_machine(sh_shell *sh, sargv *a,
+                              char **text_out, json_val **json_out,
+                              char *err, size_t ecap) {
+    if (!sh) { snprintf(err, ecap, "no shell"); return 1; }
+    char *line = join_args(a->v, a->n, 1);
+    if (!line || !*line) {
+        free(line);
+        snprintf(err, ecap, "machine needs a line to run, in quotes");
+        return 1;
+    }
+    sh_result r;
+    int rc = sh_exec_origin(sh, line, ORIGIN_AI, &r);
+    free(line);
+    *text_out = r.text ? r.text : strdup("");
+    *json_out = r.json ? r.json : NULL;
+    r.text = NULL;
+    r.json = NULL;
+    /* The AI line's failure is reported as this builtin's ERROR, not as a
+     * status: the human typed `machine`, the machine's refusal is the answer. */
+    if (rc != 0 || r.status != 0) {
+        if (r.error) snprintf(err, ecap, "%s", r.error);
+        else snprintf(err, ecap, "the machine-originated line failed");
+        sh_result_free(&r);
+        return 1;
+    }
+    sh_result_free(&r);
+    return 0;
+}
+
+/* M7: "could this be undone right now?"
+ *
+ * Two callers ask it -- the gate, before it decides, and `policy check`, which
+ * exists so a person can see the decision before making it -- and they used to
+ * get the same hardcoded 0. One function so they cannot drift again: the point
+ * of an introspection builtin is to show what the gate would do, not a
+ * separately-maintained opinion about it.
+ *
+ * The question is per-state, not per-build: a COMPLETE snapshot of this store is
+ * a rollback that exists. An interrupted one has no DONE marker, is never
+ * offered for restore, and counting it would let the shell claim an undo it
+ * cannot perform.
+ */
+static int sh_rollback_available(const sh_shell *sh) {
+    if (!sh) return 0;
+    snap_list sl;
+    memset(&sl, 0, sizeof sl);
+    char err[256];
+    int have = 0;
+    if (snap_list_all(sh->store, &sl, err, sizeof err)) {
+        for (size_t i = 0; i < sl.n; i++)
+            if (sl.items[i].complete) { have = 1; break; }
+        snap_list_free(&sl);
+    }
+    return have;
+}
+
+static int action_gate(sh_shell *sh, const aios_action *act, aios_origin origin,
                        char *err, size_t ecap) {
     char why[256];
 
@@ -488,15 +637,27 @@ static int action_gate(sh_shell *sh, const aios_action *act,
      * delete is not simulated yet - that is M3/M4, and until then those stay
      * denied instead of being waved through. */
     pctx.sandbox_executed = (act->kind == ACT_TOOL || act->kind == ACT_AGENT);
-    /* No snapshot store exists yet (M5). Saying so is what makes the
-     * rollback rule bite instead of pretending. */
-    pctx.rollback_available = 0;
+    /* M7: was a hardcoded 0, which made every destructive AI action report "not
+     * undoable yet" long after M5 shipped snapshots -- a stale truth is a lie
+     * with a good excuse. sh_rollback_available() asks the real question. */
+    pctx.rollback_available = sh_rollback_available(sh);
 
     aios_decision d = aios_policy_eval(act, sh->jail, SH_CAPS, SH_N_CAPS,
                                        &pctx, aios_now_ms());
 
     char *act_json = aios_action_to_json(act);
-    if (d.v != VERDICT_ALLOW) {
+    /* THREE verdicts, and the host must treat them as three.
+     *
+     * Before M7 this was `if (d.v != VERDICT_ALLOW)` -- so NEEDS_HUMAN was
+     * collapsed into a refusal. That is the safe direction but it is not what the
+     * law says: NEEDS_HUMAN means "a person must decide", and a host that refuses
+     * instead of asking has quietly replaced the verdict with its own. It also
+     * made the whole middle of the verdict space unreachable, which is why no test
+     * noticed.
+     *
+     * DENY stays a hard refusal. NEEDS_HUMAN is now reported AS needing a human,
+     * and the caller decides what to do about it. */
+    if (d.v == VERDICT_DENY) {
         snprintf(err, ecap, "action refused by policy [%s]: %s",
                  aios_policy_reason_str(d.r), d.why);
         sembus_pub_kv(sh->bus, "sh.action.refused",
@@ -511,6 +672,89 @@ static int action_gate(sh_shell *sh, const aios_action *act,
         sembus_pub_kv(sh->bus, "sh.action.log",
                       (const char *const[]){
                           "verdict", aios_policy_verdict_str(d.v),
+                          "reason", aios_policy_reason_str(d.r),
+                          "action", act_json ? act_json : "", NULL});
+        free(act_json);
+        return 1;
+    }
+    if (d.v == VERDICT_NEEDS_HUMAN) {
+        /* Not a refusal and not an execution: a proposal parked in front of a
+         * person. Three things happen, in this order, and the order is the point:
+         *
+         *   1. the action is OFFERED through ui_present(), which cannot return
+         *      PROMOTE unless someone chose it -- no timeout counts as yes, no
+         *      asker at all means discard;
+         *   2. if a person chose promote, the gate accepts the action it already
+         *      evaluated. Not a re-run of the line: a re-run could race, or read
+         *      different arguments the second time, and the thing the person
+         *      approved would not be the thing that ran;
+         *   3. otherwise the caller is told what was held, in words that name a
+         *      person as the missing ingredient rather than the law as a wall.
+         *
+         * sh->ui_ask is set by the front-end. Unset (a library embedder, or a
+         * test that wants the refusal) means nobody can answer -- and the honest
+         * result of "nobody can answer" is that nothing happens. */
+        sh->last_needs_human = 1;
+        int accepted = 0;
+        if (sh->ui_ask && sh->allow_ui_prompt) {
+            ui_prompt up;
+            memset(&up, 0, sizeof up);
+            snprintf(up.title, sizeof up.title, "%s%s%s",
+                     aios_action_kind_name(act->kind),
+                     act->target ? " " : "", act->target ? act->target : "");
+            snprintf(up.reason, sizeof up.reason, "%s: %.140s",
+                     aios_policy_reason_str(d.r), d.why);
+            up.origin = origin;
+            /* `show diff` needs something to show. A tool action has no staged
+             * diff (M3 stages writes, not arbitrary tools), so say what it would
+             * touch rather than pretending to have a patch. */
+            snprintf(up.detail, sizeof up.detail, "  target: %.200s\n",
+                     act->target ? act->target : "(none)");
+            up.have_detail = 1;
+            ui_choice c = ui_present(&up, sh->ui_ask, sh->ui_ask_ud);
+            if (c == UI_CHOICE_PROMOTE) {
+                accepted = 1;
+                sembus_pub_kv(sh->bus, "sh.action.promoted_by_human",
+                              (const char *const[]){
+                                  "kind", aios_action_kind_name(act->kind),
+                                  "reason", aios_policy_reason_str(d.r), NULL});
+            } else {
+                sembus_pub_kv(sh->bus, "sh.action.discarded",
+                              (const char *const[]){
+                                  "kind", aios_action_kind_name(act->kind),
+                                  "why", "the human did not promote it", NULL});
+            }
+        }
+        if (accepted) {
+            /* A person said yes. Fall into the ALLOW path below rather than
+             * duplicating it: two execution paths drift, and the second one is
+             * always the one nobody tests. */
+            sembus_pub_kv(sh->bus, "sh.action.log",
+                          (const char *const[]){
+                              "verdict", "ALLOW(on human promote)",
+                              "reason", aios_policy_reason_str(d.r),
+                              "action", act_json ? act_json : "", NULL});
+            free(act_json);
+            if (d.needs_sandbox) sh->last_needs_sandbox = 1;
+            if (d.needs_rollback) sh->last_needs_rollback = 1;
+            return 0;
+        }
+        snprintf(err, ecap,
+                 "this needs a human [%s]: %s%s",
+                 aios_policy_reason_str(d.r), d.why,
+                 origin == ORIGIN_AI
+                     ? " -- a machine proposed it, and only a person can accept it"
+                     : " -- run it yourself to accept it");
+        sembus_pub_kv(sh->bus, "sh.action.needs_human",
+                      (const char *const[]){
+                          "kind", aios_action_kind_name(act->kind),
+                          "target", act->target ? act->target : "",
+                          "reason", aios_policy_reason_str(d.r),
+                          "why", d.why,
+                          "origin", origin == ORIGIN_AI ? "ai" : "human", NULL});
+        sembus_pub_kv(sh->bus, "sh.action.log",
+                      (const char *const[]){
+                          "verdict", "NEEDS_HUMAN",
                           "reason", aios_policy_reason_str(d.r),
                           "action", act_json ? act_json : "", NULL});
         free(act_json);
@@ -896,7 +1140,10 @@ static int sh_agent_guard(void *ud, const char *tool, json_val *args,
         aios_action_declare_tool_effects(act, tool, probe);
     }
 
-    if (action_gate(sh, act, err, ecap) != 0) {
+    /* The agent loop's own actions are ORIGIN_AI by construction -- the planner
+     * cannot choose an origin, which is the property that makes this line
+     * trustworthy rather than hopeful. */
+    if (action_gate(sh, act, ORIGIN_AI, err, ecap) != 0) {
         g->n_refused++;
         aios_action_free(act);
         return 1;
@@ -965,10 +1212,10 @@ static int sh_agent_after(void *ud, const char *tool, char *err, size_t ecap) {
  * This is the ONLY way a tool runs. Command execution, argv parsing and the
  * intent router all end up here (run_command -> run_tool_stage /
  * SH_ROUTE_TOOL -> exec_tool_action). */
-static int exec_tool_action(sh_shell *sh, aios_action *act,
+static int exec_tool_action(sh_shell *sh, aios_action *act, aios_origin origin,
                             char **text_out, json_val **json_out,
                             char *err, size_t ecap) {
-    if (action_gate(sh, act, err, ecap) != 0) {
+    if (action_gate(sh, act, origin, err, ecap) != 0) {
         stage_text_of(NULL, NULL, text_out);
         *json_out = NULL;
         return 1;
@@ -1073,11 +1320,11 @@ static int exec_tool_action(sh_shell *sh, aios_action *act,
 /* Build tool args from argv (key=value / {json} / positional shorthand),
  * then inject piped input where the tool wants it.
  *
- * ORIGIN_HUMAN: the human typed the tool name and the arguments. Nothing was
- * inferred, so a human is accountable for what runs. (A natural-language line
- * that the ROUTER turns into a tool is ORIGIN_AI - see run_command's router
- * branch - because there the machine chose the tool.) */
+ * The origin is the CALLER'S, not this function's to decide (M7). A human typing
+ * a tool name and a model producing the same line are different events, and the
+ * only place that knows which happened is the caller of sh_exec_origin(). */
 static int run_tool_stage(sh_shell *sh, const char *name, sargv *a,
+                          aios_origin origin,
                           const char *raw_line, const char *pipe_text,
                           char **text_out, json_val **json_out,
                           char *err, size_t ecap) {
@@ -1145,7 +1392,7 @@ static int run_tool_stage(sh_shell *sh, const char *name, sargv *a,
     /* M1: wrap the explicitly-typed command in a descriptor and validate it
      * before anything executes. The descriptor carries the effects the tool
      * implies, so the claim is on the record even when a human asked. */
-    aios_action *act = aios_action_new(ACT_TOOL, ORIGIN_HUMAN, name);
+    aios_action *act = aios_action_new(ACT_TOOL, origin, name);
     if (!act) {
         json_free(args);
         snprintf(err, ecap, "oom (descriptor)");
@@ -1166,7 +1413,7 @@ static int run_tool_stage(sh_shell *sh, const char *name, sargv *a,
         aios_action_free(act);
         return 1;
     }
-    int rc = exec_tool_action(sh, act, text_out, json_out, err, ecap);
+    int rc = exec_tool_action(sh, act, origin, text_out, json_out, err, ecap);
     aios_action_free(act);
     return rc;
 }
@@ -1380,9 +1627,9 @@ static int sh_revoke_jobs(sh_shell *sh) {
     return killed;
 }
 
-static int run_agent_fg(sh_shell *sh, const aios_action *act,
+static int run_agent_fg(sh_shell *sh, const aios_action *act, aios_origin origin,
                         char **text_out, char *err, size_t ecap) {
-    if (action_gate(sh, act, err, ecap) != 0) {
+    if (action_gate(sh, act, origin, err, ecap) != 0) {
         *text_out = strdup("");
         return 1;
     }
@@ -1549,6 +1796,8 @@ static const char HELP_TEXT[] =
     "  audit [verify]              walk the hash-chained record and say if it holds\n"
     "  snap [take LABEL]           list snapshots, or take one now (M5)\n"
     "  rollback [latest|ID]        undo to a snapshot; running jobs are revoked\n"
+    "  machine \"LINE\"               run LINE as if a MODEL had typed it (M7)\n"
+    "                              origin tagging: what a machine may and may not do\n"
     "  cortex [scripted|micro|llm] show/switch the routing cortex\n"
     "  jail [DIR] | store [DIR]    show/rebind workspace jail / OS store\n"
     "  agent GOAL...               run an agent to completion (foreground)\n"
@@ -1595,6 +1844,9 @@ static int builtin_policy(sh_shell *sh, sargv *a,
         aios_action_set_intent(act, "policy check");
         aios_policy_ctx pctx = aios_policy_ctx_default();
         pctx.sandbox_executed = (kind == ACT_TOOL || kind == ACT_AGENT);
+        /* M7: the same function the gate calls, so this builtin reports what the
+         * gate would see rather than its own guess about it. */
+        pctx.rollback_available = sh_rollback_available(sh);
         aios_decision d = aios_policy_eval(act, sh->jail, SH_CAPS, SH_N_CAPS,
                                            &pctx, aios_now_ms());
         char line[512];
@@ -1612,6 +1864,10 @@ static int builtin_policy(sh_shell *sh, sargv *a,
             sb_puts(&b, line);
             aios_action_free(h);
         }
+        snprintf(line, sizeof line, "as judged: sandbox=%s rollback=%s\n",
+                 pctx.sandbox_executed ? "done" : "none",
+                 pctx.rollback_available ? "available" : "not available");
+        sb_puts(&b, line);
         aios_action_free(act);
         *text_out = b.s ? b.s : strdup("");
         return 0;
@@ -1719,7 +1975,10 @@ static int builtin_promote(sh_shell *sh, sargv *a, char **text_out,
      * worth having a snapshot of the state before it. */
     char snapnote[160] = {0};
     sh_snap_before(sh, "before a promote", snapnote, sizeof snapnote);
-    bool ok = stage_promote_locked(&s, &n, err, ecap);
+    /* M7: the origin travels even though an AI can never get here -- the
+     * dispatcher refuses first. Belt, braces, and a reason to believe the
+     * belt is on: this is the call the acceptance test names. */
+    bool ok = stage_promote_locked(&s, sh->last_origin, &n, err, ecap);
     if (ok) {
         char line[256];
         snprintf(line, sizeof line, "promoted %zu file%s into the jail\n",
@@ -2636,9 +2895,34 @@ static int builtin_dur(sh_shell *sh, sargv *a, char **text_out,
     return 0;
 }
 
-static int spawn_job(sh_shell *sh, const char *goal,
+static int spawn_job(sh_shell *sh, const char *goal, aios_origin origin,
                      char **text_out, char *err, size_t ecap) {
     if (!*goal) { snprintf(err, ecap, "spawn needs a goal"); return 1; }
+    /* M7: a spawn INHERITS the caller's origin, and a machine may not spawn.
+     *
+     * Both halves matter. Without inheritance, an AI line that spawned work would
+     * produce a job whose origin is whatever the default happened to be -- and the
+     * background work would then be judged by a different standard than the work
+     * that asked for it. Without the refusal, "an AI may not spawn" would be a
+     * policy rule (2c) that the shell's own grammar walked around: the rule
+     * exists because an agent spawning agents is how a bounded action becomes an
+     * unbounded swarm, and the shell is where spawn is spelled.
+     *
+     * The policy still has 2c, and this is not a replacement for it: a spawn that
+     * got here by another route -- an agent loop, a routed intent -- is checked
+     * there, with a descriptor. This is the door in the wall the policy lives
+     * behind. */
+    if (origin == ORIGIN_AI) {
+        snprintf(err, ecap,
+                 "a machine-originated line may not spawn background work: "
+                 "an agent that starts agents is how a bounded request becomes "
+                 "an unbounded swarm, and how the record stops being complete");
+        sembus_pub_kv(sh->bus, "sh.action.refused_origin",
+                      (const char *const[]){
+                          "command", "spawn", "origin", "ai",
+                          "why", "policy 2c: an AI may not spawn", NULL});
+        return 1;
+    }
     if (sh->njobs >= SH_MAX_JOBS) { snprintf(err, ecap, "job table full"); return 1; }
     char jd[600];
     snprintf(jd, sizeof jd, "%s/jobs", sh->store);
@@ -2676,10 +2960,10 @@ static int spawn_job(sh_shell *sh, const char *goal,
     return 0;
 }
 
-static int builtin_spawn(sh_shell *sh, sargv *a,
+static int builtin_spawn(sh_shell *sh, sargv *a, aios_origin origin,
                          char **text_out, char *err, size_t ecap) {
     char *goal = join_args(a->v, a->n, 1);
-    int rc = spawn_job(sh, goal ? goal : "", text_out, err, ecap);
+    int rc = spawn_job(sh, goal ? goal : "", origin, text_out, err, ecap);
     free(goal);
     return rc;
 }
@@ -2780,7 +3064,82 @@ static int builtin_kill(sh_shell *sh, sargv *a,
 
 /* ---------------- dispatch ---------------- */
 
-static int run_command(sh_shell *sh, scmd *c,
+
+/* ---- M7: the human's hand on the machine ---- *
+ *
+ * Some builtins do not compute a value; they make a change real, or they end the
+ * session. `promote` accepts a machine's proposal. `rollback` rewinds the
+ * machine. `discard` throws work away. `exit` ends the accountability.
+ *
+ * A model that can type these has not been mediated, it has been given the
+ * keyboard: everything M3-M6 built assumes a person is the one accepting a
+ * proposal, and an AI that can call `promote` makes the human a formality in its
+ * own audit trail. So an AI-origin line cannot reach them, and the refusal says
+ * so in words rather than returning "unknown command" -- a model that gets
+ * "unknown" will try another spelling, and one that gets "a person has to do
+ * this" has been told something true.
+ *
+ * This is enforced HERE, in the one place a command is dispatched, not in the
+ * router: a guard that a rewrite of the router could drop is not a guard.
+ *
+ * The list is deliberately short and deliberate: it names the commands whose
+ * effect is a change in what is real, and nothing else. Note what is NOT on it:
+ * `policy` and `staged` are introspection. A model that can read the law and see
+ * what it has pending is a model that can understand its own refusal, and
+ * blinding it would make the machine less predictable without making it safer --
+ * the thing being prevented is a change, not a reading.
+ */
+/* M7: run a line AS A MACHINE, inside this shell.
+ *
+ * This exists for the boot proof and for anyone who wants to ask "what would
+ * happen if a model typed this" without spawning a second process. It is a
+ * builtin rather than a spawn for a reason: the point is to exercise the SAME
+ * shell, with its staging area and its holds, from a different origin. A
+ * subprocess would start with an empty stage and prove much less.
+ *
+ * It is deliberately NOT powerful: the line is executed at ORIGIN_AI, so a model
+ * that could reach this builtin would get nothing it does not already have --
+ * and a human using it is asking a question, not delegating.
+ */
+static int builtin_as_machine(sh_shell *sh, sargv *a,
+                              char **text_out, json_val **json_out,
+                              char *err, size_t ecap);
+
+static const char *const SH_HUMAN_ONLY[] = {
+    "promote", "discard", "rollback", "snap", "exit", "quit", "cortex",
+    "autopilot", "gc", "undelete", NULL,
+};
+
+static const char *human_only_reason(const char *name) {
+    if (!name) return NULL;
+    if (strcmp(name, "promote") == 0)
+        return "accepting a staged change is a person's decision, not a model's";
+    if (strcmp(name, "discard") == 0)
+        return "throwing away a proposal is a person's decision";
+    if (strcmp(name, "rollback") == 0)
+        return "rewinding the machine is a person's decision";
+    if (strcmp(name, "snap") == 0)
+        return "deciding when state is captured is a person's decision";
+    if (strcmp(name, "exit") == 0 || strcmp(name, "quit") == 0)
+        return "a model may not end the session it is accountable to";
+    if (strcmp(name, "cortex") == 0)
+        return "a model may not choose which model answers next";
+    if (strcmp(name, "autopilot") == 0)
+        return "a model may not change the machine's own governor";
+    if (strcmp(name, "gc") == 0)
+        return "a model may not collect the record of what happened";
+    if (strcmp(name, "undelete") == 0)
+        return "restoring a deleted file is a person's decision";
+    return NULL;
+}
+
+static bool sh_is_human_only(const char *name) {
+    for (int i = 0; SH_HUMAN_ONLY[i]; i++)
+        if (strcmp(SH_HUMAN_ONLY[i], name) == 0) return true;
+    return false;
+}
+
+static int run_command(sh_shell *sh, scmd *c, aios_origin origin,
                        const char *pipe_text, json_val *pipe_json,
                        char **text_out, json_val **json_out,
                        char *err, size_t ecap) {
@@ -2790,6 +3149,22 @@ static int run_command(sh_shell *sh, scmd *c,
     *json_out = NULL;
     if (a->n == 0) { snprintf(err, ecap, "empty command in pipeline"); return 1; }
     const char *c0 = a->v[0];
+
+    /* M7: before any builtin can run. See SH_HUMAN_ONLY above for why this is here
+     * and not in the router. */
+    if (origin == ORIGIN_AI && sh_is_human_only(c0)) {
+        const char *why = human_only_reason(c0);
+        snprintf(err, ecap,
+                 "`%.32s` is not available to a machine-originated line: %.160s.\n"
+                 "  This is the point of origin tagging: the shell knows the line "
+                 "came from a model, and a model may not do this.",
+                 c0, why ? why : "a person has to do it");
+        sembus_pub_kv(sh->bus, "sh.action.refused_origin",
+                      (const char *const[]){
+                          "command", c0, "origin", "ai",
+                          "why", why ? why : "human-only command", NULL});
+        return 1;
+    }
 
     /* ---- builtins ---- */
     if (strcmp(c0, "help") == 0)    { *text_out = strdup(HELP_TEXT); return 0; }
@@ -2819,13 +3194,16 @@ static int run_command(sh_shell *sh, scmd *c,
     if (strcmp(c0, "jail") == 0)    return builtin_jail(sh, a, text_out, err, ecap);
     if (strcmp(c0, "staged") == 0)  return builtin_staged(sh, text_out, json_out, err, ecap);
     if (strcmp(c0, "promote") == 0) return builtin_promote(sh, a, text_out, json_out, err, ecap);
+    if (strcmp(c0, "machine") == 0)
+        return builtin_as_machine(sh, a, text_out, json_out, err, ecap);
     if (strcmp(c0, "discard") == 0) return builtin_discard(sh, a, text_out, json_out, err, ecap);
     if (strcmp(c0, "gc") == 0)      return builtin_gc(sh, text_out, json_out, err, ecap);
     if (strcmp(c0, "store") == 0)   return builtin_store(sh, a, text_out, err, ecap);
     if (strcmp(c0, "jobs") == 0)    return builtin_jobs(sh, text_out);
     if (strcmp(c0, "wait") == 0)    return builtin_wait(sh, a, text_out, err, ecap);
     if (strcmp(c0, "kill") == 0)    return builtin_kill(sh, a, text_out, err, ecap);
-    if (strcmp(c0, "spawn") == 0)   return builtin_spawn(sh, a, text_out, err, ecap);
+    if (strcmp(c0, "spawn") == 0)
+        return builtin_spawn(sh, a, origin, text_out, err, ecap);
     if (strcmp(c0, "lm") == 0)      return builtin_lm(sh, a, text_out, err, ecap);
     if (strcmp(c0, "autopilot") == 0) return builtin_autopilot(sh, a, text_out, err, ecap);
     if (strcmp(c0, "tune") == 0)    return builtin_tune(sh, a, text_out, err, ecap);
@@ -2836,16 +3214,18 @@ static int run_command(sh_shell *sh, scmd *c,
     if (strcmp(c0, "agent") == 0) {
         char *goal = join_args(a->v, a->n, 1);
         if (!*goal) { free(goal); snprintf(err, ecap, "agent needs a goal"); return 1; }
-        /* The human typed `agent <goal>`: they chose the goal, so they are
-         * accountable for it. Still a descriptor - an agent always has one. */
-        aios_action *act = aios_action_new(ACT_AGENT, ORIGIN_HUMAN, goal);
+        /* Whoever typed `agent <goal>` chose the goal, so the origin is the
+         * CALLER'S and not this line's to invent. M7 caught this: an AI-origin
+         * line saying `agent x` was stamped ORIGIN_HUMAN here, which is the
+         * milestone's whole failure mode in one hardcoded constant. */
+        aios_action *act = aios_action_new(ACT_AGENT, origin, goal);
         int rc;
         if (!act) {
             snprintf(err, ecap, "oom (descriptor)");
             rc = 1;
         } else {
             aios_action_set_intent(act, c->raw ? c->raw : goal);
-            rc = run_agent_fg(sh, act, text_out, err, ecap);
+            rc = run_agent_fg(sh, act, origin, text_out, err, ecap);
             aios_action_free(act);
         }
         free(goal);
@@ -2859,8 +3239,8 @@ static int run_command(sh_shell *sh, scmd *c,
 
     /* ---- registered tools (M4 registry) ---- */
     if (tool_reg_find(sh->tools, c0))
-        return run_tool_stage(sh, c0, a, c->raw, pipe_text, text_out, json_out,
-                              err, ecap);
+        return run_tool_stage(sh, c0, a, origin, c->raw, pipe_text, text_out,
+                              json_out, err, ecap);
 
     /* ---- natural language: the intent router ----
      *
@@ -2900,16 +3280,17 @@ static int run_command(sh_shell *sh, scmd *c,
 
     switch (dec.kind) {
     case SH_ROUTE_TOOL:
-        if (act) rc = exec_tool_action(sh, act, text_out, json_out, err, ecap);
+        if (act) rc = exec_tool_action(sh, act, origin, text_out, json_out, err, ecap);
         break;
     case SH_ROUTE_AGENT:
         /* M7: background wording -> the agents cgroup, not the console */
         if (dec.bg) {
             /* A background job is its own proposal kind: it outlives the
              * command that asked for it, so it is gated as ACT_JOB_SPAWN. */
-            rc = spawn_job(sh, dec.goal ? dec.goal : "", text_out, err, ecap);
+            rc = spawn_job(sh, dec.goal ? dec.goal : "", origin, text_out,
+                           err, ecap);
         } else if (act) {
-            rc = run_agent_fg(sh, act, text_out, err, ecap);
+            rc = run_agent_fg(sh, act, origin, text_out, err, ecap);
         }
         break;
     case SH_ROUTE_REPLY:
@@ -2921,7 +3302,7 @@ static int run_command(sh_shell *sh, scmd *c,
     return rc;
 }
 
-static int run_pipeline(sh_shell *sh, spipe *pl,
+static int run_pipeline(sh_shell *sh, spipe *pl, aios_origin origin,
                         char **text_out, json_val **json_out,
                         char *err, size_t ecap) {
     *text_out = NULL;
@@ -2931,7 +3312,7 @@ static int run_pipeline(sh_shell *sh, spipe *pl,
     for (size_t i = 0; i < pl->n; i++) {
         char *ctext = NULL;
         json_val *cjson = NULL;
-        int rc = run_command(sh, &pl->cmd[i], pipe_text, pipe_json,
+        int rc = run_command(sh, &pl->cmd[i], origin, pipe_text, pipe_json,
                              &ctext, &cjson, err, ecap);
         free(pipe_text);
         json_free(pipe_json);
@@ -2971,6 +3352,10 @@ sh_shell *sh_create(const char *jail_dir, const char *store_dir) {
     sh->last_out = strdup("");
     sh->last_json = strdup("");
     sh->next_job_id = 1;
+    /* M7: a shell has not been spoken to yet. calloc would leave this 0, and 0
+     * is ORIGIN_HUMAN -- "no origin" and "a person" must not share a value, or
+     * every fresh shell silently reports that its last line came from a human. */
+    sh->last_origin = ORIGIN_UNSPECIFIED;
     jobs_restore(sh);   /* M8 durable: replay the previous session's jobs */
     return sh;
 }
@@ -3008,6 +3393,17 @@ void sh_result_free(sh_result *r) {
 }
 
 int sh_exec(sh_shell *sh, const char *line, sh_result *out) {
+    /* A shell with a prompt is a person talking. Kept as a thin name because every
+     * caller that is not a model means exactly this. */
+    return sh_exec_origin(sh, line, ORIGIN_HUMAN, out);
+}
+
+aios_origin sh_last_origin(const sh_shell *sh) {
+    return sh ? sh->last_origin : ORIGIN_UNSPECIFIED;
+}
+
+int sh_exec_origin(sh_shell *sh, const char *line, aios_origin origin,
+                   sh_result *out) {
     if (!out) return 0;
     memset(out, 0, sizeof *out);
     out->text = strdup("");
@@ -3016,6 +3412,16 @@ int sh_exec(sh_shell *sh, const char *line, sh_result *out) {
         out->error = strdup("invalid sh_exec call");
         return 0;
     }
+    /* ORIGIN_UNSPECIFIED is not a third kind of caller; it is a caller that did
+     * not say. Refusing is the only safe reading: a default would be the silent
+     * assumption this milestone exists to remove. */
+    if (origin != ORIGIN_HUMAN && origin != ORIGIN_AI) {
+        out->status = 1;
+        out->error = strdup("sh_exec_origin needs ORIGIN_HUMAN or ORIGIN_AI");
+        return 0;
+    }
+    sh->last_origin = origin;
+    sh->last_needs_human = 0;
     const char *p = line;
     while (*p == ' ' || *p == '\t') p++;
     if (!*p || *p == '#') return 0;          /* blank / comment */
@@ -3046,7 +3452,7 @@ int sh_exec(sh_shell *sh, const char *line, sh_result *out) {
     for (size_t i = 0; i < lines.n; i++) {
         char *ptext = NULL;
         json_val *pjson = NULL;
-        int rc = run_pipeline(sh, &lines.pl[i], &ptext, &pjson,
+        int rc = run_pipeline(sh, &lines.pl[i], origin, &ptext, &pjson,
                               err, sizeof err);
         if (combined.n) sb_putc(&combined, '\n');
         sb_puts(&combined, ptext ? ptext : "");

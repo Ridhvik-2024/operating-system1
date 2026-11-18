@@ -79,6 +79,18 @@ typedef struct {
     /* launcher */
     char       nl[200];             /* natural-language input             */
     int        nl_focus;
+    /* M7: WHO typed the launcher line. A person at the keyboard is the only
+     * producer today, but UI-07 adds an AI-driven input path, and the point of a
+     * field is that the future path sets it explicitly instead of inheriting a
+     * default that happens to be "human". Declared as human at creation, so the
+     * status quo is written down rather than assumed. */
+    aios_origin nl_origin;
+    /* M7: a held action, waiting for a person. `hold_win` is the window that
+     * asks; while it is open, keys go to it and nowhere else. */
+    aios_win   *hold_win;
+    ui_prompt   hold;
+    ui_choice   hold_answer;
+    int         hold_pending;
     /* toasts */
     char       toast[4][96];
     double     toast_until[4];
@@ -193,14 +205,25 @@ static void term_render(desktop *d) {
     aios_wm_damage_all(d->wm);
 }
 
+/* M7: the terminal's text box is a person typing. Spelled out once, here, so
+ * that there is exactly one place in the desktop that claims a human did
+ * something -- and so that adding a second caller makes you read this. */
+static void term_exec_origin(desktop *d, const char *cmdline,
+                             aios_origin origin);
+
 static void term_exec(desktop *d, const char *cmdline) {
+    term_exec_origin(d, cmdline, ORIGIN_HUMAN);
+}
+
+static void term_exec_origin(desktop *d, const char *cmdline,
+                             aios_origin origin) {
     aios_win *w = d->apps[APP_TERMINAL].win;
     term_buf *t = aios_win_user(w);
     char shown[LINELEN];
     snprintf(shown, sizeof shown, "aiosh> %.150s", cmdline);
     term_push(t, shown);
     sh_result r;
-    int exit_req = sh_exec(d->sh, cmdline, &r);
+    int exit_req = sh_exec_origin(d->sh, cmdline, origin, &r);
     if (r.error && *r.error) {
         term_push(t, "error:");
         term_push(t, r.error);
@@ -547,6 +570,98 @@ static void ap_render(desktop *d) {
     aios_wm_damage_all(d->wm);
 }
 
+/* ---------------- M7: a held action, asked in a window --------------- *
+ *
+ * The serial console asks the same question with the same three words (see
+ * ui_present in the shell). A desktop that decided differently -- or worse, that
+ * quietly discarded because nobody wired it up -- would make the milestone's
+ * promise depend on which front-end you happened to use.
+ *
+ * No timeout. The window stays until a key is pressed, and closing it is a
+ * discard, because closing a question is not answering it.
+ */
+static void hold_render(desktop *d) {
+    aios_win *w = d->hold_win;
+    if (!w) return;
+    int cw = aios_win_cw(w), ch = aios_win_ch(w);
+    aios_win_fill(w, 0, 0, cw, ch, 0xFF1a1410u);        /* amber-ish: attention */
+    aios_win_text(w, 6, 4, "A CHANGE IS WAITING FOR YOU", COL_ACCENT, 0, 1);
+    aios_win_text(w, 6, 26, d->hold.title, COL_TEXT, 0, 1);
+    aios_win_text(w, 6, 46, d->hold.reason, COL_DIM, 0, 0);
+    char who[80];
+    snprintf(who, sizeof who, "proposed by: %s",
+             d->hold.origin == ORIGIN_AI ? "a model" : "a person");
+    aios_win_text(w, 6, 66, who,
+                  d->hold.origin == ORIGIN_AI ? AIOS_RGB(0xe8, 0xb8, 0x6a)
+                                              : COL_DIM, 0, 0);
+    if (d->hold.have_detail)
+        aios_win_text(w, 6, 86, d->hold.detail, COL_TERM_DIM, 0, 0);
+    int y = ch - 66;
+    aios_win_text(w, 6, y, "[P] promote    [D] discard    [S] show detail",
+                  COL_TEXT, 0, 1);
+    aios_win_text(w, 6, y + 18, "closing this window = discard", COL_TERM_DIM,
+                  0, 0);
+    aios_wm_damage_all(d->wm);
+}
+
+/* The asker the shell calls. It BLOCKS? No -- it cannot, the shell runs inline
+ * on the desktop's own thread. So the desktop answers DISCARD and opens the
+ * window: the hold is reported, and the person gets the question in a window
+ * they can actually answer, on the next tick. What must not happen is the shell
+ * waiting for a keystroke that only this loop can deliver. */
+static ui_choice desktop_ask(const ui_prompt *p, void *ud) {
+    desktop *d = ud;
+    d->hold = *p;
+    d->hold_pending = 1;
+    d->hold_answer = UI_CHOICE_DISCARD;
+    return UI_CHOICE_DISCARD;
+}
+
+static void hold_open(desktop *d) {
+    if (!d->hold_pending || d->hold_win) return;
+    int W = aios_fb_w(d->fb);
+    aios_rect r = { W / 2 - 240, 160, 480, 240 };
+    d->hold_win = aios_wm_open(d->wm, r, "confirm a held action", NULL);
+    d->hold_pending = 0;
+    hold_render(d);
+}
+
+static void hold_key(desktop *d, int key) {
+    if (key == 'p' || key == 'P') {
+        d->hold_answer = UI_CHOICE_PROMOTE;
+    } else if (key == 's' || key == 'S') {
+        /* "show detail" here is rendering the detail the prompt already carried;
+         * there is no content diff until M8, and inventing one would be worse
+         * than saying so. */
+        d->hold_answer = UI_CHOICE_SHOW_DIFF;
+        return;
+    } else if (key == 'd' || key == 'D' || key == 27) {  /* 27 = ESC */
+        d->hold_answer = UI_CHOICE_DISCARD;
+    } else {
+        return;
+    }
+
+    ui_choice c = d->hold_answer;
+    aios_wm_close(d->wm, d->hold_win);
+    d->hold_win = NULL;
+
+    /* The person chose. Say so on the bus, and say which way: an audit that
+     * records "a human was involved" without recording the answer is a record of
+     * a conversation, not of a decision. */
+    char ev[320];
+    snprintf(ev, sizeof ev, "{\"what\":\"%.120s\",\"choice\":\"%s\"}",
+             d->hold.title,
+             c == UI_CHOICE_PROMOTE ? "promote"
+             : c == UI_CHOICE_SHOW_DIFF ? "show_detail" : "discard");
+    sembus_pub(d->bus, "sh.ui.hold_answered", ev);
+    toast(d, "you chose: %s",
+          c == UI_CHOICE_PROMOTE ? "promote"
+          : c == UI_CHOICE_SHOW_DIFF ? "show detail" : "discard");
+    if (c == UI_CHOICE_PROMOTE)
+        toast(d, "answered -- re-run the command to apply it");
+    aios_wm_damage_all(d->wm);
+}
+
 /* ---------------- launcher bar -------------------------------------- */
 
 static void bar_render(desktop *d) {
@@ -629,7 +744,10 @@ static void nl_key(desktop *d, int key) {
             term_buf *t = aios_win_user(d->apps[APP_TERMINAL].win);
             term_push(t, shown);
             sh_result r;
-            sh_exec(d->sh, cmd, &r);
+            /* M7: d->nl_origin, not ORIGIN_HUMAN. When UI-07 lets the model
+             * drive this box, the only line that has to change is the one that
+             * sets the field -- the execution path already asks. */
+            sh_exec_origin(d->sh, cmd, d->nl_origin, &r);
             if (r.error && *r.error) term_push(t, r.error);
             if (r.text && *r.text) term_push(t, r.text);
             else if ((!r.text || !*r.text) && (!r.error || !*r.error))
@@ -805,6 +923,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[desktop] shell engine failed\n");
         return 3;
     }
+    /* M7: the launcher is a person typing. Written here, at the one place the
+     * desktop is built, so it is a decision in the source rather than a zero in a
+     * memset that happens to mean "human". */
+    d->nl_origin = ORIGIN_HUMAN;
+    /* M7: the desktop answers a hold by showing a window. The asker returns
+     * DISCARD synchronously (the shell is on this thread and must not block);
+     * hold_open() puts the question in front of the person on the next tick. */
+    sh_set_ui_asker(d->sh, desktop_ask, d);
     /* M7 LLM-first: init exports AIOS_SHELL_CORTEX=micro - the desktop
      * launcher speaks through the OS's own language model too */
     const char *cortex = getenv("AIOS_SHELL_CORTEX");
@@ -891,6 +1017,16 @@ int main(int argc, char **argv) {
                                 my >= cb.y && my < cb.y + cb.h) {
                                 /* close: terminal/files stay (front-ends);
                                  * utility windows may close */
+                                if (hit == d->hold_win) {
+                                    /* M7: closing the question is not answering
+                                     * it. Discard, and say so. */
+                                    d->hold_win = NULL;
+                                    sembus_pub(d->bus, "sh.ui.hold_answered",
+                                               "{\"choice\":\"discard\","
+                                               "\"why\":\"closed\"}");
+                                    aios_wm_close(d->wm, hit);
+                                    break;
+                                }
                                 for (int i = 0; i < APP_COUNT; i++)
                                     if (d->apps[i].win == hit)
                                         d->apps[i].win = NULL;
@@ -908,7 +1044,12 @@ int main(int argc, char **argv) {
                     break;
                 case AIOS_EV_KEY:
                     if (ev.key_down) {
-                        if (d->nl_focus) nl_key(d, ev.key);
+                        /* M7: while a held action is being asked about, nothing
+                         * else gets the keyboard. A key that both answers the
+                         * question and types into a terminal would be a
+                         * confirmation dialog you can type through. */
+                        if (d->hold_win) hold_key(d, ev.key);
+                        else if (d->nl_focus) nl_key(d, ev.key);
                         else key_to_app(d, ev.key);
                     }
                     break;
@@ -920,6 +1061,7 @@ int main(int argc, char **argv) {
             /* periodic refresh: autopilot + agents tick on idle */
             static int frames;
             frames++;
+            if (d->hold_pending) hold_open(d);
             if (frames % 25 == 0) {
                 if (d->apps[APP_AUTOPILOT].win) refresh_app(d, APP_AUTOPILOT);
                 if (d->apps[APP_AGENTS].win) refresh_app(d, APP_AGENTS);

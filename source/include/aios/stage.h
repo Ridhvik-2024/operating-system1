@@ -29,6 +29,7 @@
 #ifndef AIOS_STAGE_H
 #define AIOS_STAGE_H
 
+#include "aios/action.h"   /* aios_origin (M7) */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -131,8 +132,15 @@ bool stage_promote_one(stage_session *s, const char *rel,
                        char *err, size_t ecap);
 
 /* Promote every note in the manifest. Idempotent and re-runnable: a second call
- * after an interruption completes the remaining renames. */
-bool stage_promote(stage_session *s, size_t *n_promoted,
+ * after an interruption completes the remaining renames.
+ *
+ * M7: the origin is REQUIRED. Promotion is the moment a machine's proposal
+ * becomes real, so the one function that makes it real must be told who is
+ * asking. A shell with an AI-origin line gets a refusal here even if some future
+ * caller forgets to check -- the guard is in the implementation, not only in the
+ * dispatcher that happens to call it today. There is no default argument and no
+ * `stage_promote_trusted()`; a caller that cannot say who it is cannot promote. */
+bool stage_promote(stage_session *s, aios_origin origin, size_t *n_promoted,
                    char *err, size_t ecap);
 
 /* Discard: move the whole directory under <store>/staging/.trash/<seq>-<intent>.
@@ -171,7 +179,8 @@ bool stage_gc(const char *store, long long now_ms, long long max_age_ms,
  * This variant loads every note first, then writes files named by notes it
  * validated, and only from inside upper/. Anything else in the directory is
  * ignored and reported. Use this one wherever a human is the trigger. */
-bool stage_promote_locked(stage_session *s, size_t *n_promoted,
+bool stage_promote_locked(stage_session *s, aios_origin origin,
+                          size_t *n_promoted,
                           char *err, size_t ecap);
 
 /* ---- introspection, used by the shell and by tests ---- */

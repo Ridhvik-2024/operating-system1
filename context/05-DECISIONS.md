@@ -447,3 +447,52 @@ refusing to work because the log is unwritable trades a missing record for a bro
 machine, and the log's own "busy" error tells a caller which happened.
 **Reverse if:** the record becomes a precondition for the effect (it should, once
 the write is in PID 1 and can be made transactional with the action).
+
+## D31 — 2026-11-18 — The origin is a parameter, and the guard is where the effect is
+M7 could have been a flag threaded through a few call sites. It is instead three
+load-bearing choices, each of which was found by *doing* the milestone rather than
+reading the card:
+1. `sh_exec_origin()` has **no default**. `ORIGIN_UNSPECIFIED` is refused, and
+   `sh_exec()` exists as an explicit name for the human case. A default would have
+   been `ORIGIN_HUMAN` (the enum value is 0), so every caller that forgot would have
+   silently claimed to be a person. It happened once already: a fresh `sh_shell` is
+   `calloc`'d, so `last_origin` read 0 = HUMAN before any line ran.
+2. The human-only builtin gate is in **`run_command`**, at dispatch, not in the
+   router — `promote`/`discard`/`rollback` are builtins that never touch the
+   router, which is exactly the hole the acceptance test names.
+3. `stage_promote()` takes an `aios_origin` and refuses anything but HUMAN **in its
+   own body**. Every layer above it already refuses; that is a claim about callers,
+   and callers get rewritten. The test asserts the jail's tree digest is unchanged
+   after the refusal, because a promote that renamed half the files and then
+   returned false would pass a return-value test.
+**Also corrected:** `pctx.rollback_available` was hardcoded `0` since M2, so every
+destructive AI action reported "not undoable yet (no snapshot store)" for a whole
+milestone after M5 shipped one. A stale truth is a lie with a good excuse. It now
+asks the store, through one function shared with `policy check`.
+**Not fixed, and now visible:** policy rule 4c ("AI write outside the jail is
+NEEDS_HUMAN") is dead code — step 2d denies any outside path for every origin
+first. The behaviour is correct (nobody writes outside the jail); the *rule* is
+unreachable, and the M7 acceptance sentence that relies on it cannot be true as
+written. Recorded rather than papered over; the fix is D32-territory (make the jail
+rule origin-aware, which is a policy change, not a plumbing one).
+**Reverse if:** a third origin appears (e.g. a signed system service). Then the
+enum and the "not UNSPECIFIED" check become a table, and `stage_promote`'s
+condition becomes "the origin is on the list of origins that may accept", not
+`!= ORIGIN_AI`.
+
+## D32 — 2026-11-18 — Silence is a discard, and nobody can answer for you
+The card says "no timeout auto-promote — timeout = discard". Implemented as a
+stronger property: **there is no code path from "no answer" to promote at all.**
+`ui_present()` returns DISCARD when the asker is NULL, when the asker exists but
+`fgets` hits EOF, when the input is unrecognised, and after the look-at-it-again
+loop is exhausted. "Please" is not "promote" even though it starts with `p`.
+The console installs an asker **only for human-origin runs**. If `--as-ai` could
+reach the prompt, "only a person can accept it" would be a sentence with nothing
+behind it: a model that can answer its own confirmation dialog has not been
+mediated, it has been given a form to fill in.
+**Cost:** a non-interactive run (a script, `-c`, the boot proof) can never promote
+a held action. That is the intended reading of "a human must decide": a batch job
+that could promote would be a batch job that can approve itself.
+**Reverse if:** never for the "no answer = discard" half. The "install an asker"
+half reverses if a genuinely authenticated human channel exists (a signed tty, a
+physical presence token) — then the asker is installed for *that*, not for a uid.

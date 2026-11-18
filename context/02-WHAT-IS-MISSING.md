@@ -148,7 +148,7 @@ not.
   disable it. Minimum viable: snapshot the store dir + the staging upper dir
   before each agent run; restore = swap dirs + relaunch agents.
 
-### G6 — Authority model is not enforced · **S1**
+### G6 — Authority model is not enforced · **S1** — ◐ **HALVED (M7), the other half is the uid split**
 - **Claim**: strict ordering **Human > Host control plane > Shared VM > AI >
   Sandbox**, enforced structurally; the AI may not escalate, delegate upward or
   retain authority after revocation.
@@ -165,6 +165,17 @@ not.
   (3) Human-originated lines are tagged at the TTY (the shell knows whether the
   bytes came from the console or from a model) and only human-tagged descriptors
   may ever get `promote`.
+- **Done in M7 (2026-11-18)**: clause (3), and more than it asked for. The origin
+  is a required argument (`sh_exec_origin`, no default), it is stamped on every
+  descriptor, and the things that make a change real are refused to a
+  machine-origin line **at three separate layers**: the builtin dispatcher
+  (`promote`/`discard`/`rollback`/`snap`/`exit`/…), `spawn` itself, and
+  `stage_promote()`'s own body. So an AI cannot promote, cannot spawn, cannot end
+  the session, and cannot reach the function that renames a staged file into the
+  jail even if every caller above it were wrong. **What is still missing, and it
+  is the S1 half:** the origin tag is still a *voluntary* argument in one process
+  that runs as one uid — a compromised `aiosh` could call `sh_exec()` and claim to
+  be a person. Clause (2) is what makes the tag unforgeable, and it is not done.
 
 ### G7 — Input arbitration: MISSING · **S2**
 - **Claim**: human input always preempts AI input, mediated by a host arbiter;
@@ -363,7 +374,7 @@ prerequisite for that and is currently zero (all modules are x86_64 `.ko`).
 | G3 | Sandbox result + diff | S1 | promotion decisions |
 | G4 | Staged writes / tombstones | S1 | "AI never writes reality" |
 | G5 | Snapshots + rollback | S1 | "rollback is physics" |
-| G6 | Authority model / trust split | S1 | human override |
+| G6 | Authority model / trust split | S1 | human override — ◐ **origin tagging done (M7); uid split + unforgeable tag still open** |
 | G8 | Tamper-evident audit | S1 | auditability |
 | G9 | Consent / capability gates | S1 | hardware + irreversible actions |
 | G7 | Input arbitration | S2 | safe GUI automation (not yet built) |

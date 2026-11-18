@@ -654,9 +654,18 @@ bool stage_promote_one(stage_session *s, const char *rel, char *err, size_t ecap
     return promote_one_ex(s, rel, err, ecap) >= 0;
 }
 
-bool stage_promote(stage_session *s, size_t *n_promoted, char *err, size_t ecap) {
+bool stage_promote(stage_session *s, aios_origin origin, size_t *n_promoted,
+                   char *err, size_t ecap) {
     if (n_promoted) *n_promoted = 0;
     if (!s) return set_err(err, ecap, "no session"), false;
+    /* M7: this is the function that makes a proposal real, so it is where the
+     * origin has to matter. Everything above it -- the dispatcher, the builtin,
+     * the console -- is a caller, and callers can be rewritten. */
+    if (origin != ORIGIN_HUMAN)
+        return set_err(err, ecap,
+                       "refusing to promote: the request is not from a human "
+                       "(origin %d). A staged change is accepted by a person.",
+                       (int)origin), false;
 
     stage_state st = stage_manifest_state(s->dir);
     if (st == STAGE_MANIFEST_NONE)
@@ -691,10 +700,14 @@ bool stage_promote(stage_session *s, size_t *n_promoted, char *err, size_t ecap)
     return true;
 }
 
-bool stage_promote_locked(stage_session *s, size_t *n_promoted,
-                          char *err, size_t ecap) {
+bool stage_promote_locked(stage_session *s, aios_origin origin,
+                          size_t *n_promoted, char *err, size_t ecap) {
     if (n_promoted) *n_promoted = 0;
     if (!s) return set_err(err, ecap, "no session"), false;
+    if (origin != ORIGIN_HUMAN)
+        return set_err(err, ecap,
+                       "refusing to promote: the request is not from a human "
+                       "(origin %d).", (int)origin), false;
 
     stage_state st = stage_manifest_state(s->dir);
     if (st == STAGE_MANIFEST_NONE)

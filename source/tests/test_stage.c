@@ -12,6 +12,7 @@
 #include "aios/stage.h"
 #include "aios/types.h"
 #include "aios/json.h"
+#include "aios/snapshot.h"   /* snap_tree_digest, to prove the jail is untouched */
 
 #include <dirent.h>
 #include <stdio.h>
@@ -186,7 +187,7 @@ static void test_promote(void) {
     CHECK(!exists(jp), "before promote: not in the jail");
 
     size_t n = 0;
-    CHECK(stage_promote(&s, &n, err, sizeof err), "promote succeeds");
+    CHECK(stage_promote(&s, ORIGIN_HUMAN, &n, err, sizeof err), "promote succeeds");
     CHECK(n == 2, "two files promoted");
     CHECK(exists(jp), "a.txt is now in the jail");
     char *c = slurp(jp);
@@ -203,7 +204,7 @@ static void test_promote(void) {
     CHECK(stage_manifest_state(s.dir) == STAGE_MANIFEST_DONE, "manifest says done");
 
     /* promote again: must be a no-op, not an error */
-    CHECK(stage_promote(&s, &n, err, sizeof err), "a second promote is not an error");
+    CHECK(stage_promote(&s, ORIGIN_HUMAN, &n, err, sizeof err), "a second promote is not an error");
     CHECK(n == 0, "and promotes nothing new");
     c = slurp(jp);
     CHECK(c && strcmp(c, "aaa\n") == 0, "content is unchanged by the second promote");
@@ -269,7 +270,7 @@ static void test_interrupted_promote(void) {
 
     /* A re-run must finish the job. */
     size_t n = 0;
-    CHECK(stage_promote(&s, &n, err, sizeof err), "promote re-runs after interruption");
+    CHECK(stage_promote(&s, ORIGIN_HUMAN, &n, err, sizeof err), "promote re-runs after interruption");
     CHECK(n == 1, "it promotes exactly the file that was missing");
     CHECK(exists(jp1) && exists(jp2), "both files are in the jail");
     char *c = slurp(jp1);
@@ -335,7 +336,7 @@ static void test_delete_and_undelete(void) {
 
     /* promote must never unlink: a delete note is skipped */
     size_t n = 0;
-    CHECK(stage_promote(&s, &n, err, sizeof err), "promote runs with a delete note present");
+    CHECK(stage_promote(&s, ORIGIN_HUMAN, &n, err, sizeof err), "promote runs with a delete note present");
     CHECK(exists(jp), "promote did not remove the file the note described");
     stage_end(&s);
 }
@@ -467,7 +468,7 @@ static void test_manifest_survives_roundtrip(void) {
     CHECK(stage_manifest_state(re.dir) == STAGE_MANIFEST_OPEN, "state survives");
 
     size_t n = 0;
-    CHECK(stage_promote(&re, &n, err, sizeof err), "and it can promote");
+    CHECK(stage_promote(&re, ORIGIN_HUMAN, &n, err, sizeof err), "and it can promote");
     CHECK(n == 2, "both files promoted from the reopened session");
     stage_end(&re);
 }
@@ -544,7 +545,7 @@ static void test_locked_promote_refuses_orphan(void) {
     CHECK(mn > 0 && (size_t)mn < sizeof s.manifest, "fixture paths fit");
 
     size_t n = 0;
-    CHECK(!stage_promote_locked(&s, &n, err, sizeof err),
+    CHECK(!stage_promote_locked(&s, ORIGIN_HUMAN, &n, err, sizeof err),
           "promote_locked refuses without a manifest");
     CHECK_STR(err, "manifest", "and says why");
     CHECK(n == 0, "nothing was promoted");
@@ -565,7 +566,7 @@ static void test_locked_promote_ignores_unlisted_files(void) {
     write_text(sneaky, "not listed\n");
 
     size_t n = 0;
-    CHECK(stage_promote_locked(&s, &n, err, sizeof err), "promote_locked succeeds");
+    CHECK(stage_promote_locked(&s, ORIGIN_HUMAN, &n, err, sizeof err), "promote_locked succeeds");
     CHECK(n == 1, "it promoted exactly the one listed file");
 
     char jp[600], js[600];
@@ -596,7 +597,7 @@ static void test_locked_promote_refuses_symlink_escape(void) {
     if (symlink(secret, link) == 0) {
         stage_note(&s, "leak.txt", STAGE_OP_ADD, err, sizeof err);
         size_t n = 0;
-        (void)stage_promote_locked(&s, &n, err, sizeof err);
+        (void)stage_promote_locked(&s, ORIGIN_HUMAN, &n, err, sizeof err);
         char jp[600];
         snprintf(jp, sizeof jp, "%s/leak.txt", jail);
         if (exists(jp)) {
@@ -611,6 +612,74 @@ static void test_locked_promote_refuses_symlink_escape(void) {
         CHECK(true, "symlink unavailable on this filesystem (skipped)");
     }
     stage_end(&s);
+}
+
+/* M7: the last door.
+ *
+ * Every layer above this one already refuses an AI-origin promotion -- the
+ * dispatcher refuses the builtin, the shell refuses the line. This test exists
+ * because "every layer above refuses" is a claim about callers, and callers are
+ * the part of a program that gets rewritten. stage_promote() is the function
+ * that moves a file into the jail; if a future caller forgets to ask, the answer
+ * still has to be no.
+ *
+ * The check is not that promote returns false. It is that the jail is UNCHANGED
+ * -- a refusal that renamed half the files first would pass a return-value test.
+ */
+static void test_promote_refuses_machine_origin(void) {
+    printf("promote refuses a non-human origin, and changes nothing\n");
+    char jail[512], store[512];
+    fixture("mo", jail, sizeof jail, store, sizeof store);
+    char err[256] = {0};
+
+    stage_session s;
+    CHECK(stage_begin(jail, store, 0xb007, 1, &s, err, sizeof err),
+          "a machine's write can be staged");
+    CHECK(stage_write(&s, "machine.txt", "written by a model\n", err, sizeof err),
+          "the file is in the staging area, not the jail");
+
+    unsigned long long before = 0, after = 0;
+    size_t nf = 0;
+    unsigned long long nb = 0;
+    CHECK(snap_tree_digest(jail, &before, &nf, &nb, err, sizeof err),
+          "the empty jail has a digest");
+
+    size_t n = 1;
+    err[0] = 0;
+    CHECK(!stage_promote(&s, ORIGIN_AI, &n, err, sizeof err),
+          "stage_promote REFUSES on its own, with no dispatcher above it");
+    CHECK_STR(err, "not from a human", "and says the origin is the reason");
+    CHECK(n == 0, "and reports that it promoted nothing");
+
+    /* ORIGIN_UNSPECIFIED is not "probably a person". */
+    err[0] = 0;
+    CHECK(!stage_promote(&s, ORIGIN_UNSPECIFIED, &n, err, sizeof err),
+          "an unspecified origin is refused too, not defaulted to human");
+
+    CHECK(snap_tree_digest(jail, &after, &nf, &nb, err, sizeof err),
+          "and it can be read again");
+    CHECK(before == after, "the jail is byte-for-byte unchanged after the refusals");
+    {
+        char jp[600];
+        snprintf(jp, sizeof jp, "%s/machine.txt", jail);
+        FILE *f = fopen(jp, "r");
+        CHECK(f == NULL, "the file did NOT land in the jail");
+        if (f) fclose(f);
+    }
+
+    /* and the human still can, so the refusal is about WHO not about a broken
+     * promote: the same session, the same staged file, one different argument. */
+    err[0] = 0;
+    CHECK(stage_promote(&s, ORIGIN_HUMAN, &n, err, sizeof err),
+          "the same staged file promotes when a human asks");
+    CHECK(n == 1, "...and it promoted it");
+    {
+        char jp[600];
+        snprintf(jp, sizeof jp, "%s/machine.txt", jail);
+        FILE *f = fopen(jp, "r");
+        CHECK(f != NULL, "...into the jail this time");
+        if (f) fclose(f);
+    }
 }
 
 int main(void) {
@@ -638,6 +707,7 @@ int main(void) {
     test_locked_promote_refuses_orphan();
     test_locked_promote_ignores_unlisted_files();
     test_locked_promote_refuses_symlink_escape();
+    test_promote_refuses_machine_origin();
 
     snprintf(cmd, sizeof cmd, "rm -rf %s", g_root);
     if (system(cmd) != 0) { /* best effort */ }

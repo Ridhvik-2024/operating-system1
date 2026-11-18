@@ -40,4 +40,19 @@ echo boot: audit chain proof (M6)
 # after real tool calls have gone through the sandbox -- and prints the head hash
 # so the next boot can tell whether it is looking at the same history.
 audit verify
+echo boot: origin proof (M7)
+# The claim M7 makes is not "there is a flag". It is that the shell KNOWS who
+# spoke, and that a model cannot do what a person can. Both halves run here, on
+# the real image, through the real shell:
+#
+#   1. as a HUMAN, `promote` is a command that answers -- an empty stage makes it
+#      say so, which is a different outcome from being refused;
+#   2. as a MACHINE, the very same word is refused, and the refusal names the
+#      origin rather than pretending the command does not exist.
+#
+# A proof that only ran (2) would pass on a shell where `promote` was deleted.
+echo as a human, promote is available:
+promote
+echo as a machine, promote is not:
+machine "promote"
 echo boot: aiosh bring-up complete

@@ -427,7 +427,13 @@ reported as a torn tail, not as tampering; two writers cannot interleave
 
 ---
 
-## M7 — Origin tagging (human vs AI) · **M** · closes G6
+## M7 — Origin tagging (human vs AI) · **M** · closes G6 — ✅ **DONE 2026-11-18**
+
+> `sh_exec_origin()` (no default), the human-only builtin gate, `stage_promote()`
+> taking an origin, the three-choice hold in both front-ends, and the stale
+> `rollback_available = 0` replaced by a real question. **300 checks in
+> `test_shell`** (up 76), 122 in `test_stage`, plus a two-direction boot proof.
+> Three defects found by doing it rather than by reading the card — see D31.
 
 **Goal.** The OS knows whether a request came from a human or from a model, and
 only human-origin actions may ever be promoted without confirmation.
@@ -448,6 +454,55 @@ only human-origin actions may ever be promoted without confirmation.
 `ORIGIN_AI` that writes outside `/workspace` gets `NEEDS_HUMAN` and is not
 written; the same line with `ORIGIN_HUMAN` (after `promote`) succeeds. A test
 that an AI-origin action can never reach `stage_promote()` directly.
+
+**What landed, and what the card got wrong.**
+
+1. `sh_exec_origin(sh, line, origin, out)` is the only entry point;
+   `sh_exec()` is *defined* as `ORIGIN_HUMAN` and nothing else. `ORIGIN_UNSPECIFIED`
+   is refused, not defaulted — a default is the silent assumption the milestone
+   exists to remove. `sh_last_origin()` reports what the last line was stamped as,
+   and a fresh shell reports `UNSPECIFIED` (it was `calloc`'d to 0, and 0 is
+   `ORIGIN_HUMAN` — the first bug this milestone found).
+2. The builtin gate (`SH_HUMAN_ONLY`) refuses `promote`, `discard`, `rollback`,
+   `snap`, `exit`, `quit`, `cortex`, `autopilot`, `gc`, `undelete` on an
+   AI-origin line, **at dispatch, not in the router** — a guard a router rewrite
+   could drop is not a guard. `policy`, `staged`, and `machine` are deliberately
+   allowed: introspection makes a refusal understandable, and blinding a model
+   does not make it safer.
+3. `spawn` refuses `ORIGIN_AI` at the door *and* inherits the caller's origin
+   otherwise, so a spawned job is judged by the same standard as the line that
+   asked for it.
+4. `stage_promote()`/`stage_promote_locked()` now **require** an `aios_origin` and
+   refuse anything but `ORIGIN_HUMAN` in the implementation. This is the
+   acceptance test's "can never reach `stage_promote()`": enforced where the
+   rename happens, not only where it is called from.
+5. The hold. `action_gate` used to collapse `NEEDS_HUMAN` into a refusal
+   (`if (d.v != VERDICT_ALLOW)`), which made the middle of the verdict space
+   unreachable. It now offers the action via `ui_present()`: three choices,
+   bounded, and **no path from "nobody answered" to promote** — no asker at all
+   means discard, EOF means discard, and an asker that only ever says "show me"
+   eventually gets "no". The console installs `sh_console_ask` **only for
+   human-origin runs**, because an asker reachable from `--as-ai` would be a
+   prompt a model can answer.
+6. The desktop gets the same window (`hold_open`/`hold_key`), same three words,
+   and closing it is a discard. Keys go to it exclusively while it is open.
+7. `pctx.rollback_available` was hardcoded `0` long after M5 shipped snapshots.
+   It now asks `snap_list_all()` for a **complete** snapshot (no DONE marker = no
+   rollback), through one `sh_rollback_available()` shared by the gate and
+   `policy check` — so the introspection builtin cannot drift from the gate.
+
+**Two lessons the card could not have taught, both now comments in the code:**
+
+- Rule 4c ("an AI write outside the jail is `NEEDS_HUMAN`") is **unreachable**:
+  step 2d denies any outside path for *every* origin first, so `/etc/x` is a
+  DENY before 4c is consulted. The acceptance line "an AI write outside
+  `/workspace` gets `NEEDS_HUMAN`" therefore cannot be satisfied as written —
+  the write is refused, which is stronger, and the test says *which rule* did it
+  rather than claiming the wrong one.
+- Taking a snapshot does not unhold an AI delete: "an AI may not delete without a
+  human" is its own tier-1 rule, independent of undoability. What the snapshot
+  changes is the fact the rollback rule is fed, and that is what
+  `policy check … as judged: rollback=available` now shows.
 
 ---
 
