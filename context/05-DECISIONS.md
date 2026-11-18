@@ -686,3 +686,36 @@ meant. `all` has to be typed.
 repeatedly, which also means each is gated and counted separately.
 **Reverse if:** the pending list grows past what a person can read, at which
 point a selection syntax with explicit ids is the answer — not a wildcard.
+
+## D38 — 2026-11-20 — M10 is the exact half, and says so in the code
+**Status:** decided
+**Decision.** The conservation-law firewall ships the half that can be proven and
+names the half that cannot. Every chain is mapped to an authored species model
+(bytes, dollars, one-shot permissions) and checked against the conservation laws
+that model implies, computed by an exact stoichiometric engine. The "learned
+neural conservation critic" from the proposal is **not in the decision path**:
+there is no corpus, it cannot be shown to hold, and a learned gate that is wrong
+fails silently — it does not throw.
+
+Three things are deliberately not claimed:
+
+- **Feinberg's deficiency-zero theorem.** What transfers is the structural
+  reading (complexes, linkage, rank, δ). The theorem is a long-run result for
+  continuous-time mass-action systems; this is a discrete, finite-horizon,
+  adversarial chain. δ=0 is reported as a computed integer, not as a guarantee.
+- **"Energy barriers."** Replaced by an authored box per species. A barrier one
+  can cross by construction is not a barrier.
+- **Conservation is not authorisation.** `wire_out` breaks no law. The laws catch
+  value appearing and disappearing, not value moving where someone did not want
+  it to move.
+
+**Why ship the half.** A proven engine that refuses correctly on a model you can
+read is a usable component. A neural critic asserted to be the second half is a
+claim, and the whole point of this milestone is that claims about agent safety
+should be checkable.
+**Cost.** The mapping is authored, so the mathematics is only as honest as the
+model — a wrong species can make a real attack conserve. Nothing is wired into
+`sh_exec()` yet; this is the engine and its proof, not the enforcement point.
+**Reverse if:** a corpus exists with a held-out adversarial split and the critic
+can be shown to refuse the chains the exact half misses. Until then the neural
+component is a documented gap, not a placeholder with a comment calling it one.
