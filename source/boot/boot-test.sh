@@ -189,7 +189,10 @@ explain() {
     fail=1
 }
 
-have1() { grep -q "$1" boot/build/boot-test1.log 2>/dev/null \
+# -E: patterns in this file use '+' and '?', and a bare grep reads those as
+# literals. That cost a CI cycle on the M6 assertion, which was correct about the
+# log and wrong about the tool it checked the log with.
+have1() { grep -qE "$1" boot/build/boot-test1.log 2>/dev/null \
              && echo "  OK   $1" || explain boot/build/boot-test1.log "$1"; }
 have1 'AI-OS 1.1.0-m10 (v1.1 desktop)'
 have1 'durable: /dev/vda on /data (ext2)'
@@ -220,7 +223,7 @@ echo "------------------------------------------"
 tail -30 boot/build/boot-test2.log 2>/dev/null
 echo "------------------------------------------"
 
-have2() { grep -q "$1" boot/build/boot-test2.log 2>/dev/null \
+have2() { grep -qE "$1" boot/build/boot-test2.log 2>/dev/null \
              && echo "  OK   $1" || explain boot/build/boot-test2.log "$1"; }
 have2 'AIOS-DUR mounted=1 jobs=[1-9] mem=[1-9] audit=[1-9]'
 have2 'this is boot #2 for this data disk'
