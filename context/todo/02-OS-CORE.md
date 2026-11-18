@@ -370,7 +370,36 @@ rollback, reboot, assert the first content.
 
 ---
 
-## M6 — Hash-chained audit + `audit verify` · **M** · closes G8
+## M6 — Hash-chained audit + `audit verify` · **M** · closes G8 — ✅ **DONE 2026-11-17**
+
+> `include/aios/audit.h` + `src/audit.c` (**77 checks**), `audit [verify]` builtin,
+> `dur` reports chain health, boot proof verifies the chain in the image on every
+> CI run.
+>
+> **The card's promise needed splitting into two claims**, because only one of them
+> is true and the other is what "tamper-evident" quietly implies:
+> - **true:** a changed record, a removed middle record, a reordering and a forged
+>   append are all detected, at the right seq (D27);
+> - **NOT true and cannot be:** a wholesale rewrite, or a cleanly removed final
+>   record, is undetectable from the file alone. The card asked for the deleted tail
+>   to be reported as "torn"; it is not, because nothing about it is unfinished
+>   (D27). `audit verify` prints the head hash so a future milestone can commit to
+>   it somewhere the writer cannot reach.
+>
+> **The bug that makes the point better than the feature does:** the first version
+> truncated the log to zero before every append, so it held one record, always
+> `seq 1`, always chaining to genesis — and `verify()` said "1 records, chained and
+> intact". A verifier's opinion about a log it has seen one record of is not
+> evidence (D28). Tests now assert the chain GREW.
+>
+> **Also honest:** the write is still made by the component being audited
+> (`tools.c`, on the AI-facing path). Policy denies writes to `audit.log`, so the
+> AI cannot edit it through a tool, but moving the writer into PID 1's supervisor
+> is M7's work and is the only thing that makes suppression impossible rather than
+> merely visible.
+>
+> **In the image, on the ext2 disk, after real sandboxed calls:** boot 1 → 6 records
+> intact; boot 2 → 14 records intact. The count rising is the assertion.
 
 **Goal.** Tamper-evident record of every decision and every effect.
 

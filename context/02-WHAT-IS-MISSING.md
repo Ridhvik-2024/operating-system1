@@ -177,7 +177,28 @@ not.
   `AI_INPUT` source with (a) a hard rate limit, (b) instant drop on any human
   evdev event, (c) a visible "AI is driving" indicator, (d) a cooldown.
 
-### G8 — Immutable audit / tamper evidence: PARTIAL · **S1→S2**
+### G8 — Immutable audit: **CHAINED** (M6, 2026-11-17) · **S1→S2**
+- **Was**: `src/tools.c:140 audit_log()` appended JSONL. Append-only by convention
+  only: no hash chain, no signature, and the AI-facing process could in principle
+  edit it.
+- **Now**: every record carries `prev` (the previous record's hash) and its own
+  `hash`, written under an exclusive lock with one `write()` and an fsync'd
+  directory entry. `audit verify` walks the chain and reports the first bad seq,
+  distinguishing a **torn tail** (a crash) from a **broken link or bad hash** (an
+  edit) from **absent** (no evidence at all — which is not the same as clean).
+  Verified in the image across a reboot: 6 records → 14 records, intact.
+- **What is still missing, and must not be glossed:**
+  - **fnv1a64 is not cryptographic.** It catches accidents and careless edits, not
+    an adversary who has read the header. sha256 replaces it when a verified
+    implementation can be shipped in an initramfs.
+  - **The chain is only checked against itself.** A wholesale rewrite verifies. The
+    head hash is printed so a later milestone can commit to it elsewhere; nothing
+    checks it yet (D27).
+  - **The writer is the audited component.** `audit_append()` runs in `tools.c`, on
+    the AI-facing path. Moving it to PID 1's supervisor is M7.
+  - **Nothing rotates**, so the 8 MiB disk is a hard ceiling.
+
+### G8 (original statement, kept for the record) — Immutable audit / tamper evidence: PARTIAL · **S1→S2**
 - **Claim**: every action is logged immutably; vetoes logged; the host verifies.
 - **Reality**: `src/tools.c:140 audit_log()` appends JSONL to
   `<store>/audit.log`. Append-only by convention only: no hash chain, no

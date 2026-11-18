@@ -200,10 +200,24 @@ static void test_deleted_tail(void) {
     free(log);
 
     audit_check c = audit_verify(ROOT, 0);
-    /* A whole line removed cleanly is NOT a torn tail: the file is well-formed and
-     * a record is missing. Calling that "torn" would hide a deletion. */
-    CHECK(c.v == AUDIT_OK, "a cleanly removed final record leaves a valid chain");
-    CHECK(c.records == 9, "and 9 records remain");
+    /* THE CARD ASKED FOR THIS TO BE A TORN TAIL, AND IT CANNOT BE.
+     *
+     * Removing a whole final line leaves a file that is well-formed, shorter, and
+     * internally consistent: every remaining record links correctly to the one
+     * before it, and nothing in the file says how many records there should be. So
+     * "torn" would be a lie (nothing is unfinished) and "tampered" would be a
+     * guess (nothing in the bytes is inconsistent).
+     *
+     * This is the one deletion the chain cannot see -- and it is exactly why
+     * `audit verify` prints the head hash. A value committed somewhere else (the
+     * next boot's record, the host, a signature) is what turns "9 records, all
+     * consistent" into "9 records, but I expected 10". That is M7's job and the
+     * header says so; asserting the honest answer here is what keeps this from
+     * looking like a finished guarantee.
+     *
+     * A genuinely torn tail is the case below. */
+    CHECK(c.v == AUDIT_OK, "a cleanly removed final record is undetectable from the file alone");
+    CHECK(c.records == 9, "and the remaining 9 records verify");
 
     /* Now the actual torn case: a partial line. */
     rmrf(ROOT);

@@ -389,3 +389,61 @@ on this machine and the fallback is correct.
 asserts the snapshot came from the supervisor's jail, not the shell's.
 **Reverse if:** the supervisor ever becomes optional on a booted image, in which
 case absence should be an error, not a fallback.
+
+## D27 — 2026-11-17 — A chain that only checks itself is a chain the attacker can rewrite
+`audit_verify()` reads the file and recomputes every link. That catches a changed
+record, a removed middle record, a reordering and a forged append. It cannot catch
+one thing: the whole file being rewritten consistently, or the last record being
+removed cleanly. Nothing outside the file says how many records there should be.
+**Why it matters:** "tamper-evident" is a phrase that invites overclaiming. The
+honest statement is "partial tampering is evident, wholesale rewriting is not",
+and the difference is a value committed somewhere the writer cannot reach.
+**What the code does about it:** `audit verify` prints the head hash, and
+`audit_head()` exists so a later session can pin that value somewhere else (the
+next boot's first record, the supervisor, a host signature). Until one of those
+exists, the head is printed and not checked, and the output says so.
+**Card divergence:** the M6 card said a deleted last line should be reported as a
+torn tail. It cannot be, and asserting it would be a lie: a cleanly removed final
+record leaves a well-formed, shorter, internally consistent file. `test_audit.c`
+asserts the honest answer (undetectable from the file alone) with the reason
+written down, so the gap is recorded rather than papered over.
+**Reverse if:** never. Add the off-file commitment; do not weaken the wording.
+
+## D28 — 2026-11-17 — An amnesiac log verifies perfectly
+`trim_torn_tail()` scanned backwards in a way that never examined the final byte,
+so every well-formed log looked torn and was truncated to zero before each append.
+The result: one record, always `seq 1`, always chaining to genesis — and
+`verify()` reported "1 records, chained and intact". Self-consistent, tested, and
+useless.
+**Why:** the tests asserted that the chain VERIFIED, never that it GREW. A
+verifier's opinion about a log it has only ever seen one record of is not evidence.
+**Fix:** check the last byte first (that is the whole definition of torn), and the
+test now asserts `records == 100` after 100 appends, plus that all 100 hashes
+differ. The in-image proof asserts the count rises across a reboot (6 → 14).
+**Reverse if:** never. Any "chain is intact" claim must be paired with a claim
+about its length.
+
+## D29 — 2026-11-17 — A promise in a header is a requirement on the code
+`audit.h` said a caller cannot supply its own `hash` or `prev`. The code appended
+its own fields *after* the caller's, so a body containing `{"hash":"deadbeef"}`
+produced a record with two hash fields, kept the caller's `prev`, and failed to
+verify — a record this module had just written, unable to pass its own check.
+**Why:** relying on a JSON parser's duplicate-key behaviour to discard a forged
+field is not a defence; it is an accident that happens to work until the parser
+changes.
+**Fix:** `strip_field()` removes `hash`, `prev` and `seq` from the body before the
+real ones are computed, and the test asserts the caller's values appear nowhere in
+the written line.
+**Reverse if:** never. When the header and the code disagree, one of them is a
+bug; it is never "documentation".
+
+## D30 — 2026-11-17 — A failed record is reported, not swallowed
+M4's `audit_log()` ignored every error from `fopen`/`fwrite`/`fsync`. A full disk
+meant actions happened and left no trace, silently.
+**Why:** for a log whose purpose is to make suppression visible, "no record" and
+"the record was lost" must not look alike afterwards.
+**Cost:** a failed record now prints to stderr. The tool call still completes:
+refusing to work because the log is unwritable trades a missing record for a broken
+machine, and the log's own "busy" error tells a caller which happened.
+**Reverse if:** the record becomes a precondition for the effect (it should, once
+the write is in PID 1 and can be made transactional with the action).
