@@ -9,6 +9,7 @@
 #include "aios/policy.h"
 #include "aios/snapshot.h"
 #include "aios/sembus.h"
+#include "aios/audit.h"
 #include "../src/shroute.h"
 
 #include <stdio.h>
@@ -1555,6 +1556,375 @@ static void pending_tests(void) {
     sh_free(o);
 }
 
+/* ---- M8: promote/reject UX, console half --------------------------------
+ *
+ * What is being tested here is not "does a window draw". It is the two claims a
+ * person depends on, in the order they depend on them:
+ *
+ *   1. a person can find out what is about to happen (pending / diff <id>);
+ *   2. saying yes applies EXACTLY the change they were shown, and saying no
+ *      applies nothing.
+ *
+ * The second is where the interesting failures live. Before M8 the desktop
+ * answered a held action with DISCARD and then asked the person anyway, so their
+ * "promote" went to a window nobody was reading. That is not a missing feature;
+ * it is a yes that does nothing. The deferred-action tests below are the ones
+ * that would have caught it.
+ */
+
+typedef struct { int ask; int defer; } count_asker;
+
+static ui_choice counting_ask(const ui_prompt *p, void *ud) {
+    (void)p;
+    count_asker *c = ud;
+    c->ask++;
+    return c->defer ? UI_CHOICE_DEFER : UI_CHOICE_DISCARD;
+}
+
+static void promote_ux_tests(void) {
+    sh_result r;
+    const char *jail  = "build/test-m8/jail";
+    const char *store = "build/test-m8/store";
+    if (system("rm -rf build/test-m8") != 0) { /* best effort */ }
+    CHECK(aios_mkdirs(jail) == AIOS_OK, "m8: fresh jail");
+    CHECK(aios_mkdirs(store) == AIOS_OK, "m8: fresh store");
+
+    sh_shell *o = sh_create(jail, store);
+    CHECK(o != NULL, "m8: shell");
+    if (!o) return;
+
+    /* ---- diff <id> reads ONE change, and pending names the ids ---- */
+    int rc = sh_exec_origin(o, "fs.write path=SHOWN.txt content=seen", ORIGIN_AI, &r);
+    CHECK(rc == 0, "m8: an AI write stages");
+    sh_result_free(&r);
+
+    rc = sh_exec_origin(o, "pending", ORIGIN_AI, &r);
+    CHECK(rc == 0, "m8: pending lists without error");
+    CHECK_STR_CONTAINS(r.text, "SHOWN.txt", "m8: pending names the staged file");
+    CHECK_STR_CONTAINS(r.text, "diff <id>", "m8: and tells a person how to read it");
+    /* the id is the session directory name; grab it from the list */
+    char id[80] = {0};
+    if (r.text) {
+        const char *b = strchr(r.text, '[');
+        const char *e = b ? strchr(b, ']') : NULL;
+        if (b && e && (size_t)(e - b - 1) < sizeof id) {
+            memcpy(id, b + 1, (size_t)(e - b - 1));
+            id[e - b - 1] = 0;
+        }
+    }
+    CHECK(id[0] != 0, "m8: pending prints a usable id");
+    sh_result_free(&r);
+
+    {
+        char cmd[160];
+        snprintf(cmd, sizeof cmd, "diff %s", id);
+        rc = sh_exec_origin(o, cmd, ORIGIN_AI, &r);
+        CHECK(rc == 0, "m8: diff <id> succeeds for a real change");
+        CHECK_STR_CONTAINS(r.text, "SHOWN.txt", "m8: and shows the file that will be added");
+        CHECK_STR_CONTAINS(r.text, "+", "m8: with a signed line count a person can read");
+        sh_result_free(&r);
+    }
+    /* A verb where an id belongs must fail, and say why: this is the exact class
+     * of mistake D34 was about. */
+    rc = sh_exec_origin(o, "diff promote", ORIGIN_AI, &r);
+    CHECK(rc == 0 && r.status != 0, "m8: diff <verb> is refused");
+    sh_result_free(&r);
+    rc = sh_exec_origin(o, "diff", ORIGIN_AI, &r);
+    CHECK(rc == 0 && r.status != 0, "m8: bare diff is a usage error");
+    CHECK_STR_CONTAINS(r.error, "usage", "m8: and says so instead of guessing");
+    sh_result_free(&r);
+
+    /* ---- promote <id> applies it, and the jail really changes ---- */
+    {
+        char cmd[160];
+        snprintf(cmd, sizeof cmd, "promote %s", id);
+        rc = sh_exec_origin(o, cmd, ORIGIN_HUMAN, &r);
+        CHECK(rc == 0, "m8: promote <id> succeeds");
+        CHECK_STR_CONTAINS(r.text, "promoted", "m8: and says what it did");
+        sh_result_free(&r);
+        char p[600];
+        snprintf(p, sizeof p, "%s/SHOWN.txt", jail);
+        FILE *f = fopen(p, "r");
+        CHECK(f != NULL, "m8: the file is in the jail after promote");
+        if (f) fclose(f);
+    }
+
+    /* ---- the promote gate, at the shell ----
+     *
+     * The chain is broken by editing a byte inside a record's own body. What
+     * must happen is a refusal that names the reason, and a jail that does not
+     * move: a promote that half-applies a change is worse than one that fails. */
+    {
+        char log[600];
+        snprintf(log, sizeof log, "%s/audit.log", store);
+        rc = sh_exec_origin(o, "fs.write path=GATED.txt content=no", ORIGIN_AI, &r);
+        CHECK(rc == 0, "m8/gate: a second change stages");
+        sh_result_free(&r);
+
+        /* Stage a SECOND change, and remove its record. Two changes are needed
+         * to tell "stops at the first refusal" from "keeps going": with one
+         * pending change, a promote-all that breaks out early and one that
+         * continues look identical.
+         *
+         * The order matters -- promote all walks newest-first, so the unrecorded
+         * change is refused first and the earlier one must be left alone. */
+        rc = sh_exec_origin(o, "write tail to LATER.txt", ORIGIN_AI, &r);
+        CHECK(rc == 0 && r.status == 0, "m8/gate: a third change stages");
+        sh_result_free(&r);
+        {
+            char nid[80] = {0};
+            rc = sh_exec_origin(o, "pending", ORIGIN_AI, &r);
+            const char *b = r.text ? strchr(r.text, '[') : NULL;
+            const char *e = b ? strchr(b, ']') : NULL;
+            if (b && e && (size_t)(e - b - 1) < sizeof nid) {
+                memcpy(nid, b + 1, (size_t)(e - b - 1));
+                nid[e - b - 1] = 0;
+            }
+            sh_result_free(&r);
+            CHECK(nid[0] != 0, "m8/gate: the newest change is named");
+            /* rewrite the log without that change's stage record: the chain
+             * still verifies (no line is corrupted), and nothing names it */
+            if (nid[0]) {
+                char logp[600], tmp[640];
+                snprintf(logp, sizeof logp, "%s/audit.log", store);
+                snprintf(tmp, sizeof tmp, "%s/audit.log.cut", store);
+                FILE *in = fopen(logp, "r"), *out = fopen(tmp, "w");
+                CHECK(in && out, "m8/gate: the log can be copied");
+                if (in && out) {
+                    char line[8192];
+                    while (fgets(line, sizeof line, in))
+                        if (!strstr(line, nid)) fputs(line, out);
+                    fclose(in); fclose(out);
+                    CHECK(rename(tmp, logp) == 0, "m8/gate: and replaced");
+                }
+            }
+        }
+        rc = sh_exec_origin(o, "promote all", ORIGIN_HUMAN, &r);
+        CHECK(rc == 0 && r.status != 0, "m8/unrecorded: promote all refuses");
+        CHECK_STR_CONTAINS(r.error, "no audit record names it",
+                           "m8/unrecorded: because nothing names that change");
+        CHECK_STR_CONTAINS(r.text, "0 changes applied",
+                           "m8/unrecorded: nothing was applied");
+        CHECK_STR_CONTAINS(r.text, "the rest were not touched",
+                           "m8/unrecorded: ...and the run says it stopped");
+        sh_result_free(&r);
+        {
+            char p2[600];
+            snprintf(p2, sizeof p2, "%s/LATER.txt", jail);
+            FILE *h = fopen(p2, "r");
+            CHECK(h == NULL, "m8/unrecorded: the refused change did not land");
+            if (h) fclose(h);
+        }
+
+        /* stage record exists, so the refusal we get is about the CHAIN */
+        long long seq = audit_stage_record(store, "GATED.txt");
+        (void)seq;
+
+        /* corrupt one byte of the first record's body */
+        FILE *f = fopen(log, "r+");
+        CHECK(f != NULL, "m8/gate: the audit log can be opened to tamper with");
+        if (f) {
+            char buf[4096];
+            size_t got = fread(buf, 1, sizeof buf, f);
+            if (got > 40) {
+                buf[20] = (char)('A' + (buf[20] % 26));   /* one byte, on purpose */
+                fseek(f, 0, SEEK_SET);
+                (void)!fwrite(buf, 1, got, f);
+                fflush(f);
+            }
+            fclose(f);
+        }
+        rc = sh_exec_origin(o, "promote all", ORIGIN_HUMAN, &r);
+        CHECK(rc == 0 && r.status != 0, "m8/gate: promote all refuses when the chain does not verify");
+        CHECK_STR_CONTAINS(r.text, "refused", "m8/gate: the per-change line says refused");
+        CHECK_STR_CONTAINS(r.error, "does not verify",
+                           "m8/gate: and the error names the reason, not just 'error'");
+        CHECK_STR_CONTAINS(r.text, "0 changes applied",
+                           "m8/gate: nothing was applied");
+        sh_result_free(&r);
+        char p[600];
+        snprintf(p, sizeof p, "%s/GATED.txt", jail);
+        FILE *g = fopen(p, "r");
+        CHECK(g == NULL, "m8/gate: and the gated file did NOT land in the jail");
+        if (g) fclose(g);
+    }
+
+    /* ---- the router must not overflow on a two-word write ----
+     *
+     * `write one` reaches the "write <text> to <path>" route with only ONE space,
+     * at index 5 -- before the content start at t+6. The content length was
+     * computed as `last_sp - (t + 6)`, which underflowed to SIZE_MAX, and the
+     * memcpy wrote a 10-byte string into a 0-byte allocation. Typing two words at
+     * a prompt corrupted the heap.
+     *
+     * The check is that the line either fails cleanly or is handled as text --
+     * never that it crashes, and never that it silently writes a file. Under
+     * ASAN the assertion is moot because the process dies first, which is exactly
+     * the point of having it here. */
+    {
+        static const char *short_writes[] = {
+            "write one", "write  x", "write a b", "write   ", "write", NULL
+        };
+        for (int i = 0; short_writes[i]; i++) {
+            rc = sh_exec_origin(o, short_writes[i], ORIGIN_AI, &r);
+            char msg[128];
+            snprintf(msg, sizeof msg,
+                     "m8/router: '%s' is handled without corruption",
+                     short_writes[i]);
+            CHECK(rc == 0, msg);
+            sh_result_free(&r);
+        }
+        /* and a well-formed write still works, so the guard rejects only the
+         * underflow and not the route itself */
+        rc = sh_exec_origin(o, "write content to ROUTED.txt", ORIGIN_AI, &r);
+        CHECK(rc == 0 && r.status == 0, "m8/router: a real write still stages");
+        CHECK_STR_CONTAINS(r.text, "ROUTED.txt", "m8/router: ...and names the file");
+        sh_result_free(&r);
+        rc = sh_exec_origin(o, "discard all", ORIGIN_HUMAN, &r);
+        (void)rc;
+        sh_result_free(&r);
+    }
+
+    sh_free(o);
+
+    /* ---- promote all, on a clean store ---- */
+    const char *jail2  = "build/test-m8/b-jail";
+    const char *store2 = "build/test-m8/b-store";
+    CHECK(aios_mkdirs(jail2) == AIOS_OK, "m8/all: fresh jail");
+    CHECK(aios_mkdirs(store2) == AIOS_OK, "m8/all: fresh store");
+    sh_shell *o2 = sh_create(jail2, store2);
+    if (o2) {
+        sh_result t;
+        /* `write <content>` stages real bytes; `fs.write path=..` declares an
+         * effect without staging any (a pre-existing gap recorded as D35's
+         * neighbour). Both are exercised, because "2 changes applied" must not
+         * be printed for changes that moved nothing. */
+        rc = sh_exec_origin(o2, "write one to ONE.txt", ORIGIN_AI, &t);
+        CHECK(rc == 0 && t.status == 0, "m8/all: first change stages");
+        sh_result_free(&t);
+        rc = sh_exec_origin(o2, "write two to TWO.txt", ORIGIN_AI, &t);
+        CHECK(rc == 0 && t.status == 0, "m8/all: second change stages");
+        sh_result_free(&t);
+
+        rc = sh_exec_origin(o2, "promote", ORIGIN_HUMAN, &t);
+        CHECK(rc == 0 && t.status != 0, "m8/all: a BARE promote refuses while several are pending");
+        CHECK_STR_CONTAINS(t.error, "pending",
+                           "m8/all: ...and names them rather than guessing (D34)");
+        sh_result_free(&t);
+
+        rc = sh_exec_origin(o2, "promote all", ORIGIN_HUMAN, &t);
+        CHECK(rc == 0, "m8/all: promote all applies every pending change");
+        CHECK_STR_CONTAINS(t.text, "2 changes applied", "m8/all: and counts them");
+        CHECK_STR_CONTAINS(t.text, "nothing left pending",
+                           "m8/all: and says the queue is empty");
+        sh_result_free(&t);
+
+        char p[600];
+        snprintf(p, sizeof p, "%s/ONE.txt", jail2);
+        FILE *f = fopen(p, "r"); CHECK(f != NULL, "m8/all: the first change landed");
+        if (f) fclose(f);
+        snprintf(p, sizeof p, "%s/TWO.txt", jail2);
+        f = fopen(p, "r"); CHECK(f != NULL, "m8/all: the second change landed");
+        if (f) fclose(f);
+
+        rc = sh_exec_origin(o2, "pending", ORIGIN_HUMAN, &t);
+        CHECK_STR_CONTAINS(t.text, "nothing is pending",
+                           "m8/all: and the list agrees afterwards");
+        sh_result_free(&t);
+
+        /* `all` is a word, not a prefix: nothing else may reach it. */
+        rc = sh_exec_origin(o2, "promote all extra", ORIGIN_HUMAN, &t);
+        CHECK(rc == 0 && t.status != 0, "m8/all: promote all with extra arguments is refused");
+        CHECK_STR_CONTAINS(t.error, "either a change id or the word all",
+                           "m8/all: and explains the ambiguity rather than picking");
+        sh_result_free(&t);
+        sh_free(o2);
+    }
+
+    /* ---- the deferred action: a front-end that says DEFER ---- */
+    const char *jail3  = "build/test-m8/c-jail";
+    const char *store3 = "build/test-m8/c-store";
+    CHECK(aios_mkdirs(jail3) == AIOS_OK, "m8/defer: fresh jail");
+    CHECK(aios_mkdirs(store3) == AIOS_OK, "m8/defer: fresh store");
+    sh_shell *o3 = sh_create(jail3, store3);
+    if (o3) {
+        sh_result t;
+        count_asker ca = { 0, 1 };
+        sh_set_ui_asker(o3, counting_ask, &ca);
+
+        /* `_describe delete ...` is the test seam: it runs a descriptor through
+         * the REAL gate with an AI origin, so the NEEDS_HUMAN branch is the one
+         * a real command would take, not a mock of it. */
+        rc = sh_exec_origin(o3, "_describe delete victim.txt", ORIGIN_AI, &t);
+        CHECK(ca.ask == 1, "m8/defer: the gate asked a person");
+        CHECK(rc == 0 && t.status != 0, "m8/defer: and the machine's command did not proceed");
+        CHECK_STR_CONTAINS(t.error, "has not answered yet",
+                           "m8/defer: the refusal says asked-and-waiting, not refused");
+        sh_result_free(&t);
+
+        char title[160];
+        aios_origin who;
+        CHECK(sh_deferred(o3, title, sizeof title, &who) == 1,
+              "m8/defer: the action is HELD, not discarded");
+        CHECK_STR_CONTAINS(title, "victim.txt", "m8/defer: the hold is the action asked about");
+        CHECK(who == ORIGIN_AI, "m8/defer: and it remembers who proposed it");
+
+        /* SHOW_DIFF is a question: it must not execute and must not clear */
+        rc = sh_resume(o3, UI_CHOICE_SHOW_DIFF, &t);
+        CHECK(sh_deferred(o3, NULL, 0, NULL) == 1,
+              "m8/defer: asking to look does not drop the hold");
+        CHECK(t.text != NULL && t.text[0] == 0,
+              "m8/defer: ...and the result is empty, not undefined");
+        sh_result_free(&t);
+
+        /* PROMOTE carries the person's yes out */
+        rc = sh_resume(o3, UI_CHOICE_PROMOTE, &t);
+        CHECK(rc != 0, "m8/defer: promote is attempted (and honestly reports no path)");
+        CHECK_STR_CONTAINS(t.error, "recorded, not run",
+                           "m8/defer: ...as recorded-but-not-run, not as silence");
+        sh_result_free(&t);
+        CHECK(sh_deferred(o3, NULL, 0, NULL) == 0,
+              "m8/defer: and answering clears the hold");
+
+        /* DISCARD executes nothing, and says it discarded */
+        rc = sh_exec_origin(o3, "_describe delete other.txt", ORIGIN_AI, &t);
+        sh_result_free(&t);
+        CHECK(sh_deferred(o3, NULL, 0, NULL) == 1, "m8/defer: a second hold exists");
+        rc = sh_resume(o3, UI_CHOICE_DISCARD, &t);
+        CHECK(rc == 0 && t.status == 0, "m8/defer: discard is not an error");
+        CHECK_STR_CONTAINS(t.text, "discarded", "m8/defer: and says nothing was run");
+        sh_result_free(&t);
+        CHECK(sh_deferred(o3, NULL, 0, NULL) == 0, "m8/defer: ...and the hold is gone");
+
+        /* Closing the hold window publishes "discard" -- so the shell has to
+         * agree, or the bus records a decision nobody can make. This is the
+         * desktop's close-box path, and it is DISCARD, not "leave it held": the
+         * window told the person "closing this window = discard". */
+        rc = sh_exec_origin(o3, "_describe delete fourth.txt", ORIGIN_AI, &t);
+        sh_result_free(&t);
+        CHECK(sh_deferred(o3, NULL, 0, NULL) == 1, "m8/close: a hold exists");
+        rc = sh_resume(o3, UI_CHOICE_DISCARD, &t);
+        CHECK(rc == 0 && sh_deferred(o3, NULL, 0, NULL) == 0,
+              "m8/close: closing the window drops the hold, matching the promise");
+        CHECK_STR_CONTAINS(t.text, "nothing was run",
+                           "m8/close: ...and what it says is what happened");
+        sh_result_free(&t);
+
+        /* An asker that does not defer still discards, so the old behaviour is
+         * unchanged for a console: this is a new answer, not a new default. */
+        count_asker cd = { 0, 0 };
+        sh_set_ui_asker(o3, counting_ask, &cd);
+        rc = sh_exec_origin(o3, "_describe delete third.txt", ORIGIN_AI, &t);
+        CHECK(rc == 0 && t.status != 0, "m8/defer: a non-deferring asker still stops the action");
+        sh_result_free(&t);
+        CHECK(sh_deferred(o3, NULL, 0, NULL) == 0,
+              "m8/defer: ...and holds nothing, which is the old console behaviour");
+        sh_set_ui_asker(o3, NULL, NULL);
+        sh_free(o3);
+    }
+
+    if (system("rm -rf build/test-m8") != 0) { /* best effort */ }
+}
 
 int main(int argc, char **argv) {
     (void)argc; g_argv0 = argv[0];
@@ -1563,6 +1933,7 @@ int main(int argc, char **argv) {
     origin_tests();
     pending_tests();
     ui_tests();
+    promote_ux_tests();
     printf("%s: %d checks, %d failed\n",
            g_failed ? "FAIL" : "PASS", g_checks, g_failed);
     return g_failed ? 1 : 0;

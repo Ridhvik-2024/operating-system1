@@ -711,6 +711,85 @@ static void test_promote_refuses_machine_origin(void) {
     }
 }
 
+/* ---- M8: what the pending LIST has to say -------------------------------
+ *
+ * The list is the thing a person decides from, so the two facts it must carry
+ * are: which change (an id that promote will accept), and what it does (a
+ * summary, not just a count). "1 file" is not something anyone can decide on.
+ *
+ * The summary lives on stage_pending, written by the scan, so both front-ends
+ * read one description of one change instead of each deriving their own.
+ */
+static void test_pending_summary(void) {
+    printf("-- pending list: id and summary --\n");
+    char jail[600], store[600];
+    snprintf(jail,  sizeof jail,  "%s/m8-jail",  g_root);
+    snprintf(store, sizeof store, "%s/m8-store", g_root);
+    mkdirs(jail);
+    mkdirs(store);
+
+    /* two sessions, so the list has to keep them apart */
+    stage_session a;
+    char err[256] = {0};
+    CHECK(stage_begin(jail, store, 0x1111, 1, &a, err, sizeof err),
+          "a session opens");
+    char up[600];
+    CHECK(stage_path_for(&a, "report.txt", up, sizeof up), "a staged path resolves");
+    write_text(up, "hello\n");
+    CHECK(stage_note(&a, "report.txt", STAGE_OP_ADD, err, sizeof err), "noted");
+    CHECK(stage_manifest_sync(&a, STAGE_MANIFEST_OPEN, err, sizeof err), "synced");
+    stage_end(&a);
+
+    stage_pending_list l;
+    memset(&l, 0, sizeof l);
+    CHECK(stage_pending_scan(store, &l, err, sizeof err), "the scan succeeds");
+    CHECK(l.n == 1, "one change is pending");
+    if (l.n == 1) {
+        CHECK(l.items[0].id[0] != 0, "the change has an id");
+        /* the id must be the directory name promote/discard take */
+        char want[900];
+        snprintf(want, sizeof want, "%s/staging/%s", store, l.items[0].id);
+        CHECK(strcmp(l.items[0].dir, want) == 0,
+              "...and it is the name a promote will resolve");
+        CHECK_STR(l.items[0].summary, "report.txt",
+                  "the summary names the file the change touches");
+        CHECK_STR(l.items[0].summary, "add", "and says what it does to it");
+        CHECK(l.items[0].n_files == 1, "...consistent with the file count");
+        CHECK(l.items[0].n_notes == 1, "...and with the manifest's note count");
+    }
+    stage_pending_free(&l);
+
+    /* Several notes: the summary names the first and admits there are more,
+     * rather than pretending the change is one file. */
+    stage_session b;
+    CHECK(stage_begin(jail, store, 0x2222, 1, &b, err, sizeof err), "second session");
+    const char *names[] = { "one.txt", "two.txt", "three.txt" };
+    for (int i = 0; i < 3; i++) {
+        char p[600];
+        CHECK(stage_path_for(&b, names[i], p, sizeof p), "path for a multi-file change");
+        write_text(p, "x\n");
+        CHECK(stage_note(&b, names[i], STAGE_OP_ADD, err, sizeof err), "noted");
+    }
+    CHECK(stage_manifest_sync(&b, STAGE_MANIFEST_OPEN, err, sizeof err), "synced");
+    stage_end(&b);
+
+    memset(&l, 0, sizeof l);
+    CHECK(stage_pending_scan(store, &l, err, sizeof err), "rescan");
+    CHECK(l.n == 2, "both changes are listed");
+    {
+        const stage_pending *multi = NULL;
+        for (size_t i = 0; i < l.n; i++)
+            if (l.items[i].n_notes == 3) multi = &l.items[i];
+        CHECK(multi != NULL, "the three-file change is in the list");
+        if (multi) {
+            CHECK_STR(multi->summary, "+2 more",
+                      "and its summary admits the two files it does not name");
+            CHECK(multi->n_files == 3, "...while the count is the whole truth");
+        }
+    }
+    stage_pending_free(&l);
+}
+
 int main(void) {
     snprintf(g_root, sizeof g_root, "/tmp/aios-stage-test-%d", (int)getpid());
     char cmd[600];
@@ -737,6 +816,7 @@ int main(void) {
     test_promote_refuses_unlisted_files();
     test_locked_promote_refuses_symlink_escape();
     test_promote_refuses_machine_origin();
+    test_pending_summary();
 
     snprintf(cmd, sizeof cmd, "rm -rf %s", g_root);
     if (system(cmd) != 0) { /* best effort */ }
