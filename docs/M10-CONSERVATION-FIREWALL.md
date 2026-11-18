@@ -179,6 +179,32 @@ load-bearing should know exactly which of the two properties they are getting.
 - `test_stoich` — 83 checks, clean under AddressSanitizer
 - every new file clean under `-Werror` with `-Wshadow -Wformat-security`
 - `./firewall-demo.sh` — 10 scenario checks, exit 0
+- CI run `44347019770` — build, test (22.04), test (24.04) and boot all pass
+
+### Where `test_stoich` runs, and why it is not in the image
+
+`test_stoich` is built and **statically linked** by `boot/Makefile` but not
+installed into the initramfs. The distinction is deliberate: the link is the
+check that catches "the image's own `LIB_SRCS` does not know about the new
+source", which is exactly how this milestone first failed CI. The 35,024 bytes
+it costs in the compressed image (measured by building both ways) are what keep
+it out, and the suite has no business in there anyway — it is integer arithmetic
+over tables it builds itself. It reads no `/dev`, opens no socket, and asserts
+nothing about the booted machine. Running it inside the initramfs would re-test
+the host build with the same compiler and libc.
+
+The first attempt at this exclusion silently did nothing:
+`$(filter-out $(LINK_ONLY_TESTS),$(TEST_BINS))` filtered `test_stoich` against a
+list of `boot/build/test_stoich`, and `filter-out` compares whole words, so the
+pattern matched nothing while the Makefile read as if the suite were excluded.
+The image size not moving was the only clue. It is fixed by spelling the built
+path once in `LINK_ONLY_BINS`.
+
+The size guard is toolchain-dependent — the same tree is 2,741,492 bytes here
+and roughly 200 KB larger on CI's static glibc — so the cap is pinned from the
+larger toolchain. Do not compare a local delta against a CI delta: xz is not
+additive across toolchains, and one draft of the Makefile comment did exactly
+that and produced a confident, wrong number.
 
 ## What is not done
 
