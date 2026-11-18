@@ -41,12 +41,19 @@ LIB       := boot/build/libaios.a
 #
 # M10 adds test_stoich, for a different reason, and the numbers are the argument:
 #
-#   test_stoich is 782,768 bytes on disk and 35,024 bytes IN THE COMPRESSED
-#   IMAGE. The M10 cap is pinned at 2,950,000 and CI's toolchain produces an
-#   image 38,700 bytes larger than the cap — so this single suite is 91% of the
-#   overage. Locally the same image is 173,484 bytes UNDER the cap, i.e. a 211 KB
-#   toolchain difference; the cap is pinned from the larger toolchain, which is
-#   CI.
+#   test_stoich is 782,768 bytes on disk and 35,024 bytes IN THIS SANDBOX'S
+#   COMPRESSED IMAGE (2,776,516 -> 2,741,492, measured by building both ways).
+#   CI's image was 2,988,700 against a 2,950,000 cap, i.e. 38,700 over.
+#
+#   Do NOT subtract one from the other: 35,024 is a local delta and 38,700 is a
+#   CI delta, and xz is not additive across toolchains. The first draft of this
+#   comment did exactly that and concluded "91% of the overage, ~3.7 KB still
+#   over" -- and CI then passed comfortably, so the arithmetic was wrong in the
+#   safe direction but wrong. The honest statement is: removing the suite
+#   cleared CI's overage, and locally it is worth 35,024 bytes.
+#
+#   Locally the same image is 173,484 bytes UNDER the cap; the cap is pinned from
+#   the larger toolchain, which is CI.
 #
 # It is the right exclusion beyond the size, though: the suite is pure integer
 # arithmetic over tables it builds itself. It reads no /dev, opens no socket,
