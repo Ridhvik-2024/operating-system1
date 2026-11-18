@@ -215,6 +215,12 @@ typedef struct {
     size_t      n_files;              /* files actually in upper/ (recursive)  */
     size_t      n_unnoted;            /* files in upper/ that no note names    */
     long long   mtime_ms;             /* used only to order the list           */
+    /* A one-line summary of WHAT this change does, so a list of changes can be
+     * read without opening each one. `n_files` answers "how much"; this answers
+     * "what", which is the question a person deciding actually has. First note's
+     * path and operation, with "+N more" when there are others. Empty when the
+     * manifest could not be read -- absence is reported as absence. */
+    char        summary[96];
 } stage_pending;
 
 typedef struct {

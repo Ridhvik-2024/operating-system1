@@ -253,6 +253,35 @@ size_t stage_manifest_count(const char *dir) {
     return n;
 }
 
+/* One line saying WHAT a change does, for the list a person reads before
+ * deciding. Counts answer "how big"; this answers "which file", which is the
+ * question that makes a list usable. Written by the scan, so `pending` and the
+ * desktop window say the same thing without either re-reading the manifest.
+ *
+ * An unreadable or empty manifest leaves this empty rather than filling it with
+ * a guess. */
+static void manifest_summary(const char *dir, char *out, size_t cap) {
+    out[0] = 0;
+    char path[AIOS_STAGE_PATH_MAX + 64];
+    if (!join(path, sizeof path, dir, MANIFEST_NAME)) return;
+    json_val *root = json_parse_file(path);
+    if (!root) return;
+    json_val *nv = json_obj_get(root, "notes");
+    size_t n = (nv && json_type_of(nv) == JSON_ARR) ? json_arr_len(nv) : 0;
+    if (n > 0) {
+        json_val *e = json_arr_get(nv, 0);
+        const char *p = e ? json_str(json_obj_get(e, "path")) : NULL;
+        const char *op = e ? json_str(json_obj_get(e, "op")) : NULL;
+        if (p && *p) {
+            if (n > 1)
+                snprintf(out, cap, "%s %s (+%zu more)", op ? op : "change", p, n - 1);
+            else
+                snprintf(out, cap, "%s %s", op ? op : "change", p);
+        }
+    }
+    json_free(root);
+}
+
 /* ---------------- session lifecycle ---------------- */
 
 void stage_end(stage_session *s) {
@@ -589,6 +618,7 @@ bool stage_pending_scan(const char *store, stage_pending_list *out,
         snprintf(p->id, sizeof p->id, "%.79s", de->d_name);
         p->state = state;
         p->n_notes = stage_manifest_count(dir);
+        manifest_summary(dir, p->summary, sizeof p->summary);
         p->mtime_ms = (long long)st.st_mtime * 1000LL;
 
         stage_session s;
