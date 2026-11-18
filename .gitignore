@@ -3,6 +3,10 @@ source/*.o
 source/*.d
 source/*.a
 source/build/
+# firewall-demo.sh compiles its driver into build/ at the repo ROOT (it runs
+# from the root so that `./firewall-demo.sh` works). The source/build/ line
+# above does not cover it, so the driver was showing up as an untracked file.
+/build/
 source/aiosh
 source/aios-demo
 source/aios-memctl
