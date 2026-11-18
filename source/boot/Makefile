@@ -38,7 +38,38 @@ LIB       := boot/build/libaios.a
 # socket path would fight it -- so the image skips it and the host runs it.
 # An exclusion has to be argued for, which is why it is named here and not a
 # wildcard.
+#
+# M10 adds test_stoich, for a different reason, and the numbers are the argument:
+#
+#   test_stoich is 782,768 bytes on disk and 35,024 bytes IN THE COMPRESSED
+#   IMAGE. The M10 cap is pinned at 2,950,000 and CI's toolchain produces an
+#   image 38,700 bytes larger than the cap — so this single suite is 91% of the
+#   overage. Locally the same image is 173,484 bytes UNDER the cap, i.e. a 211 KB
+#   toolchain difference; the cap is pinned from the larger toolchain, which is
+#   CI.
+#
+# It is the right exclusion beyond the size, though: the suite is pure integer
+# arithmetic over tables it builds itself. It reads no /dev, opens no socket,
+# starts no supervisor and asserts nothing about THIS machine. Running it inside
+# the initramfs re-tests the host's build with the same compiler on the same
+# libc; it cannot observe anything the image does differently. The boot proof
+# tests the image; this tests the mathematics. `make test` still runs it, and the
+# static binary is still built and linked here — so a change that breaks the image
+# link (which is exactly how this file was found) still fails the build.
 HOST_ONLY_TESTS := test_supervisor
+
+# Built and LINKED statically, but not installed into the image.
+#
+# The distinction matters: the link is what catches "boot/Makefile's source list
+# does not know about the new .c", which is precisely how M10 announced itself.
+# Keeping test_stoich out of HOST_ONLY keeps that check alive. Only the 35,024
+# bytes of its compressed payload stay out of the capped image.
+LINK_ONLY_TESTS := test_stoich
+# TEST_BINS holds `boot/build/test_x`, not `test_x`, so filtering on the bare
+# name silently matched nothing. Spell the prefix once, here, so the install
+# rule cannot get this wrong again -- the first version did, and the suite was
+# installed into the image while the Makefile appeared to exclude it.
+LINK_ONLY_BINS  := $(addprefix boot/build/,$(LINK_ONLY_TESTS))
 TEST_BINS := $(patsubst tests/%.c,boot/build/%,$(filter-out \
               $(addprefix tests/,$(addsuffix .c,$(HOST_ONLY_TESTS))), \
               $(wildcard tests/test_*.c)))
@@ -178,7 +209,8 @@ $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	@install -s -m 0755 $(BLD)/aios-governor $(STAGE)/sbin/aios-governor
 	@install -s -m 0755 $(BLD)/aios-desktop $(STAGE)/sbin/aios-desktop
 	@install -m 0644 $(MODULES) $(STAGE)/lib/modules/
-	@install -s -m 0755 $(TEST_BINS)      $(STAGE)/usr/lib/aios/tests/
+	@install -s -m 0755 $(filter-out $(LINK_ONLY_BINS),$(TEST_BINS)) \
+	   $(STAGE)/usr/lib/aios/tests/
 	@install -s -m 0755 $(FIXTURE_BINS)  $(STAGE)/usr/lib/aios/tests/
 	@install -m 0755 $(BOOT_DIR)/aios-selftest.sh $(STAGE)/usr/bin/aios-selftest
 	@install -m 0644 $(BOOT_DIR)/boot.aiosh $(STAGE)/etc/aios/boot.aiosh
