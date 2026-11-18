@@ -2153,12 +2153,11 @@ static int builtin_staged(sh_shell *sh, char **text_out, json_val **json_out,
  * an error that names them. */
 static bool sh_pick_session(sh_shell *sh, sargv *a, const char *verb,
                             char *dir, size_t dcap, char *err, size_t ecap) {
-    const char *what = (a && a->n >= 2) ? a->v[1] : "latest";
-    if (!stage_resolve(sh->store, what, dir, dcap, err, ecap)) {
-        /* stage_resolve's text is the message; make the verb fit it. */
-        char msg[512];
-        snprintf(msg, sizeof msg, "%s", err);
-        snprintf(err, ecap, "cannot %s: %s", verb, msg);
+    const char *what = (a && a->n >= 2) ? a->v[1] : NULL;
+    if (!stage_resolve(sh->store, verb, what, dir, dcap, err, ecap)) {
+        /* The message from stage_resolve already names the verb and says what
+         * was pending, so it is used as-is rather than wrapped: "cannot promote:
+         * cannot promote: ..." is how a wrapper makes a clear refusal unclear. */
         return false;
     }
     return true;

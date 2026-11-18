@@ -607,7 +607,7 @@ bool stage_pending_scan(const char *store, stage_pending_list *out,
     return true;
 }
 
-bool stage_resolve(const char *store, const char *what,
+bool stage_resolve(const char *store, const char *verb, const char *what,
                    char *dir_out, size_t cap, char *err, size_t ecap) {
     if (!store || !dir_out) return set_err(err, ecap, "bad arguments"), false;
 
@@ -637,7 +637,12 @@ bool stage_resolve(const char *store, const char *what,
 
     bool ok = false;
     if (l.n == 0) {
-        set_err(err, ecap, "nothing is staged");
+        /* The verb is preserved from before M7.5 (`promote` on an empty stage
+         * has always said "nothing is staged to promote") because the boot
+         * proof asserts that exact sentence, and because "nothing is staged"
+         * alone would not tell a person which command just found nothing. */
+        set_err(err, ecap, "nothing is staged to %s",
+                (verb && *verb) ? verb : "act on");
         ok = false;
     } else if (!what || strcmp(what, "latest") == 0) {
         /* "latest" is a convenience for the unambiguous case only. */

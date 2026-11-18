@@ -242,7 +242,7 @@ void stage_pending_free(stage_pending_list *l);
  * a way to pick one of several. Ambiguity is an ERROR here rather than a
  * choice, because a promote is not a place to guess: see the file comment.
  * On error the reason names the ids that were pending. */
-bool stage_resolve(const char *store, const char *what,
+bool stage_resolve(const char *store, const char *verb, const char *what,
                    char *dir_out, size_t cap, char *err, size_t ecap);
 
 /* Files inside the session's upper/ that the manifest does not name, as
