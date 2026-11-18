@@ -194,8 +194,8 @@ explain() {
 # log and wrong about the tool it checked the log with.
 have1() { grep -qE "$1" boot/build/boot-test1.log 2>/dev/null \
              && echo "  OK   $1" || explain boot/build/boot-test1.log "$1"; }
-have1 'AI-OS 1.1.0-m10 (v1.1 desktop)'
-have1 'durable: /dev/vda on /data (ext2)'
+have1 'AI-OS 1\.1\.0-m10 \(v1\.1 desktop\)'
+have1 'durable: /dev/vda on /data \(ext2\)'
 have1 'AIOS-DUR mounted=1'
 # M5: the rollback proof. The boot script writes v1, snapshots, writes v2, rolls
 # back and reads the file -- so "v1" appearing AFTER the rollback line is the
