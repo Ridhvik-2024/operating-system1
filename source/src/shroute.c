@@ -188,7 +188,16 @@ static aios_status scripted_route(const char *line, sh_decision *out,
             bool one_word = true;
             for (const char *q = path; q && *q; q++)
                 if (isspace((unsigned char)*q)) one_word = false;
-            if (one_word && path[0]) {
+            /* The last space must leave ROOM for content: "write one" has its
+             * only space at index 5, which is before t+6, so `last_sp - (t+6)`
+             * underflows to SIZE_MAX and the memcpy that follows writes a 10-byte
+             * string into a 0-byte allocation. That is not a routing mistake, it
+             * is a heap overflow reachable by typing two words.
+             *
+             * Guarding here means the phrase simply does not match this route and
+             * falls through to the text reply, which is the honest answer: there
+             * is no content/path split to be found in "write one". */
+            if (one_word && path[0] && last_sp > t + 6) {
                 size_t clen = (size_t)(last_sp - (t + 6));
                 char *content = (char *)malloc(clen + 1);
                 if (content) {
