@@ -577,6 +577,59 @@ front-ends, with the same engine underneath.
 API; GUI: add `gui_check.py` assertions for the pending window title bar and a
 `+`/`-` diff row.
 
+**Done.** ✅ all four, plus four defects the work uncovered (D36):
+1. `pending` / `diff <id>` / `promote <id|all>` / `discard <id>`. `pending` rows
+   are `[id] <summary> seq N` — the summary is written by
+   `stage_pending_scan()` into a new `stage_pending.summary` field, so the console
+   and the window describe a change with the same string instead of each deriving
+   its own. `promote all` is a whole word matched before id resolution, gated per
+   change, and stops at the first refusal, stating how far it got (D37).
+2. Sixth **window** (`bar_pend_x()` badge → window at `W/2-260, 90, 520, …`), not
+   a sixth launcher slot: rows = id tail + summary, `AI` badge read from the audit
+   record, `up`/`down` select, `p`/`d` act, `esc`/close-box closes the *list*
+   (which decides nothing). `p`/`d` run the same builtins the console uses.
+3. The origin badge is the audit-record lookup from `pending`, not a directory
+   name.
+4. `sh_promote_gate()`: two refusals (chain does not verify; no record names the
+   id), before any snapshot, in both `promote` and `promote all`.
+5. **Held actions actually resume.** `UI_CHOICE_DEFER` + `sh_deferred()` /
+   `sh_resume()`; the desktop asker defers instead of discarding, and `hold_key()`
+   routes the answer through `sh_resume()` instead of a false
+   "re-run the command" toast.
+
+**Acceptance.** `docs/M8-PROMOTE-UX.md` (manual script, including the two refusal
+cases proved by removal); `tests/test_shell.c::promote_ux_tests` (65 checks:
+list/diff/id, both gate refusals with the jail proved untouched, `promote all`
+counting and stopping *at the first refusal with a second change still pending*,
+the two-word router overflow, and the full DEFER → SHOW_DIFF(no-op) → PROMOTE →
+DISCARD → close-box cycle); `tests/test_stage.c::test_pending_summary` (19 checks
+on the list's id/summary contract). Suite is now **1507 checks / 18 suites**.
+`gui_check.py` gains `pending_window` (title ink, accent heading, and green `+` /
+red `-` rows by **hue**, not brightness — canvas origin is `AIOS_TITLE_H` below
+the window origin) and a `click` command; the check was validated against a
+headless render of the window **and seen to fail** on a frame where the window is
+absent.
+
+**Each guard was sabotaged and seen to fail** (D36's method, applied to this
+milestone's claims):
+
+| sabotage | checks that failed |
+|---|---|
+| `ui_present()` collapses DEFER into DISCARD again | 12 |
+| gate trusts a verifying chain only (drop the stage-record half) | 10 |
+| `promote all` continues past a refusal (`break` → `continue`) | 2 |
+| `stage_pending_scan()` stops filling `summary` | 1 |
+| router underflow guard removed | heap corruption / abort |
+
+The fourth row is the reason the refusals are tested with **two** pending changes:
+with one, "stops" and "continues" look identical, and the sabotage passed.
+
+**Not fixed here, and it is the remaining honest gap.** The gate proves *a record
+names this change*; it does not prove *these are the bytes the person read*. That
+needs a content hash in the manifest (D35). Also: `fs.write path=…` declares an
+effect and stages no bytes, so a promote of such a session moves nothing — now
+reported as `nothing staged to apply` rather than counted as applied.
+
 ---
 
 ## Sequencing (do not reorder)

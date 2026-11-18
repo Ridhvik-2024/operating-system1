@@ -597,3 +597,92 @@ that can omit. Cheap at any price this milestone would pay.
 session — e.g. if upper/ becomes a real overlay and the kernel can enumerate it.
 Even then the refusal must stay: "the diff showed everything" is the property,
 not "the manifest names everything".
+
+## D35 — 2026-11-19 — A promote proves a record names the change, not that these are the bytes you saw
+**Status:** open — deliberately not closed in M8
+**Decision.** The M8 promote gate refuses in two cases: the audit chain does not
+verify, and no record names this change. Both are needed, and the second is the
+load-bearing one — a chain can verify perfectly while containing nothing about the
+change in front of you (proved by deleting the stage record: `audit verify` says
+"chained and intact", and the promote must still be refused).
+
+What the gate still cannot do: **bind the diff a person read to the bytes that get
+applied.** `promote` reads `upper/` at the moment it runs. Anyone who can write the
+store can change `upper/` between `staged` and `promote`, and the record will still
+verify, because the record names the change and not its content.
+
+So the honest claim is: *a record names this change, so an approval can be shown to
+have happened.* The stronger claim — *these are the bytes you approved* — needs a
+content hash in the manifest, recomputed and compared at promote.
+**Why not now.** It changes the manifest format and every writer of it, and doing it
+inside a UX milestone would mean shipping the hash without the review of the layer
+that owns the format.
+**Cost.** A person with store write access can get a different change applied than
+the one they read. In a one-uid process where the audit writer is itself audited,
+that is one of a family of gaps rather than an exotic one.
+**Reverse if:** never; this is closed by adding the hash, not by deciding against it.
+
+## D36 — 2026-11-19 — The four bugs M8 found, and why each was invisible
+**Status:** fixed
+**Decision.** M8 was scoped as UX — a list, a diff, two words — and it kept
+uncovering defects underneath, because a front-end is the first code that has to
+*ask* the engine questions the tests never asked. Four, in the order they bite:
+
+1. **`ui_present()` collapsed every non-PROMOTE answer into DISCARD.** Correct
+   while there were three answers; a lie the moment a front-end could say "asked,
+   not yet answered". `UI_CHOICE_DEFER` was swallowed, so the desktop's hold
+   branch never ran and every hold silently became a refusal. *A function that
+   rewrites its caller's answer must be told about every answer there is.*
+2. **The desktop could not answer a hold.** `desktop_ask()` returned DISCARD
+   synchronously (it must not block — the shell is on the desktop's own thread),
+   so `action_gate()` discarded the action *before* `hold_open()` drew the window.
+   A person read a proposal, pressed `P`, got "re-run the command to apply it",
+   and nothing happened. The question was real; the answer went nowhere. Fixed by
+   deferring and resuming (`sh_deferred()` / `sh_resume()`), not by re-running:
+   a re-run takes a new descriptor id and applies whatever the store looks like
+   *now* rather than what the person was shown.
+3. **`write one` was a heap overflow.** In the intent router the content length
+   was computed as `last_sp - (t + 6)` after only checking that a space existed.
+   For two words, the only space is at index 5 — before `t+6` — so the length
+   underflowed to `SIZE_MAX` and `memcpy` wrote a 10-byte string into a 0-byte
+   allocation. **Reachable by typing two words at the prompt**, and the same heap
+   corruption showed up in the test suite as `double free or corruption`. Found
+   only because a new test happened to stage a file with a two-word phrase.
+4. **A builtin's return code was rendered as an `aios_status`.** `sh_exec_origin`
+   fell back to `aios_status_str(AIOS_ERR)` when a builtin set no message, but
+   `AIOS_ERR` is `-1` while a builtin returns `1` — so the fallback returned
+   `"unknown"` and the front-end printed `error: error`. A shell's `0/1` and the
+   library's status enum are different vocabularies, and the boundary is exactly
+   where they were being confused.
+
+**Cost.** Each fix is small; the cost is the class of bug. All four needed a
+front-end or a new scenario to surface, and none was caught by 1406 passing
+checks. The tests were a sequence of single-change, single-answer, happy-path
+stories.
+**Reverse if:** never — but note the pattern: the next front-end will find the
+next one, and the answer is more scenarios, not more mocks.
+
+## D37 — 2026-11-19 — `promote all` is a word, and it stops at the first refusal
+**Status:** decided
+**Decision.** `promote all` applies every pending change, and is spelled as a
+whole word matched before id resolution — an id is hex digits and a dash, so
+`all` can never be a legal id or a prefix of one. Two consequences, both
+deliberate:
+- It runs `sh_promote_gate()` **per change**, not once. A chain that verifies says
+  nothing about whether each individual change is on the record.
+- It **stops at the first refusal.** Applying the rest would apply changes in an
+  order the person did not choose and cannot see. The output always states how far
+  it got, and a partial run exits non-zero: `0 changes applied; stopped at the
+  first refusal -- the rest were not touched`.
+
+A session that promotes zero files is reported as `nothing staged to apply
+(effects declared, no bytes)` and is **not** counted — `2 changes applied` over a
+jail that gained nothing is a number that flatters the command.
+
+**Why a word and not a bare `promote`.** D34 is the record of what happens when
+the one command that makes a change real is allowed to guess which change you
+meant. `all` has to be typed.
+**Cost.** No way to promote a chosen subset in one line; it is `promote <id>`
+repeatedly, which also means each is gated and counted separately.
+**Reverse if:** the pending list grows past what a person can read, at which
+point a selection syntax with explicit ids is the answer — not a wildcard.
