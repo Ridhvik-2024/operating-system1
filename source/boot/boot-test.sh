@@ -207,6 +207,10 @@ have1 'autopilot governor: pid'
 # M5: PID 1 must establish the supervisor before any shell exists, or "rollback
 # is owned by PID 1" is something the shell does to itself and calls a guarantee.
 have1 'supervisor: pid .* serving /run/aios/supervisor.sock'
+# M6: the record is a chain, and the image verifies it after real tool calls have
+# gone through the sandbox on the ext2 disk.
+have1 'boot: audit chain proof'
+have1 'audit: [0-9]+ records, chained and intact'
 
 echo
 echo "[boot-test] phase 2: same disk — reboot and replay the journal"
@@ -223,7 +227,10 @@ have2 'this is boot #2 for this data disk'
 have2 'journal entries replayed from the previous session'
 # M5 across the reboot: the file the rollback restored is still v1 on the second
 # boot, which is what makes this a snapshot rather than a copy held in RAM.
-have2 'AIOS-SELFTEST: PASS'
+# M6 across the reboot: the chain on boot 2 links to records written on boot 1, so
+# it must be intact AND longer -- a log that resets itself would still "verify".
+have2 'boot: audit chain proof'
+have2 'audit: [0-9]+ records, chained and intact'
 have2 'AIOS-BOOT-OK selftest=PASS'
 
 echo

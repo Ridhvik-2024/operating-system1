@@ -22,6 +22,7 @@
 #include "aios/autopilot.h"
 #include "aios/durable.h"
 #include "aios/policy.h"
+#include "aios/audit.h"
 #include "aios/snapshot.h"
 #include "aios/supervisor.h"
 #include "aios/stage.h"
@@ -435,11 +436,11 @@ static void stage_text_of(const char *tool, json_val *v, char **text_out) {
 /* ---- M1 gate ----------------------------------------------------------
  * The single place where a proposal stops being a proposal.
  *
- * M2 will put policy_eval() here; M3/M4 will put the stage-and-diff around
- * the call; M6 will hash the record into the audit chain. Today it exists to
- * make ONE thing true, which is the whole point of M1: no tool call can be
- * constructed anywhere in this file without first having been a validated,
- * origin-stamped, effect-declared aios_action.
+ * policy_eval() was put here by M2, the stage-and-diff by M3/M4, and M6's chained
+ * record is written at the point the call actually executes (tools.c), because a
+ * decision that never runs is not an effect. What stays true, and is the whole
+ * point of M1: no tool call can be constructed anywhere in this file without
+ * first having been a validated, origin-stamped, effect-declared aios_action.
  *
  * Note what is NOT here: no execution, no permission. The descriptor does not
  * get to decide anything; the host code below decides, having read it.
@@ -530,9 +531,12 @@ static int action_gate(sh_shell *sh, const aios_action *act,
     return 0;
 }
 
-/* Build (and publish) the record of an action we accepted. The audit chain
- * proper is M6; this is the descriptor being made observable NOW so that the
- * later milestones have something to chain. */
+/* Build (and publish) the record of an action we accepted.
+ *
+ * This is the decision being made observable on the bus; the durable, chained
+ * record of what actually EXECUTED is written by tools.c through audit.c. Both
+ * matter and they are not the same record: this one says "a proposal was accepted",
+ * that one says "a tool ran and here is what it did". */
 static void action_accept(sh_shell *sh, const aios_action *act) {
     char *j = aios_action_to_json(act);
     if (!j) return;
@@ -1542,6 +1546,7 @@ static const char HELP_TEXT[] =
     "  tune [k=v ...]              show/rewrite the autopilot conf (M7)\n"
     "  lm [classify|gen|selftest]  the OS micro language model (M7)\n"
     "  dur [sync]                  durable-store status (ext2 side disk, M8)\n"
+    "  audit [verify]              walk the hash-chained record and say if it holds\n"
     "  snap [take LABEL]           list snapshots, or take one now (M5)\n"
     "  rollback [latest|ID]        undo to a snapshot; running jobs are revoked\n"
     "  cortex [scripted|micro|llm] show/switch the routing cortex\n"
@@ -2464,6 +2469,65 @@ static int builtin_rollback(sh_shell *sh, sargv *a, char **text_out,
     return 0;
 }
 
+
+/* `audit [verify]` -- read the record the way a stranger would.
+ *
+ * The point of a hash chain is that verification needs nothing but the file. So
+ * this builtin does not ask the recorder whether the recorder was honest: it walks
+ * the bytes.
+ *
+ * The output distinguishes four answers that are easy to conflate:
+ *   - intact: every record links and hashes
+ *   - a torn tail: a crash (the last record was never finished)
+ *   - a broken link or a bad hash: some record does not match its neighbours
+ *   - absent: there is no log at all, which is NOT the same as a clean one
+ */
+static int builtin_audit(sh_shell *sh, sargv *a, char **text_out,
+                         char *err, size_t ecap) {
+    if (a->n >= 2 && strcmp(a->v[1], "verify") != 0 && strcmp(a->v[1], "check") != 0) {
+        snprintf(err, ecap, "usage: audit [verify]");
+        return 1;
+    }
+
+    audit_check c = audit_verify(sh->store, 0);
+    char head[AIOS_AUDIT_HEX + 1] = {0};
+    (void)audit_head(sh->store, head);
+
+    char line[768];
+    switch (c.v) {
+    case AUDIT_OK:
+        snprintf(line, sizeof line,
+                 "audit: %lld records, chained and intact\n"
+                 "  head: %.16s  (the value a next session could commit to)\n"
+                 "  limit: fnv1a64 is not cryptographic, and this chain is checked "
+                 "only against itself -- an attacker who can rewrite the whole "
+                 "file can rewrite the chain. See include/aios/audit.h",
+                 c.records, head[0] ? head : "(none)");
+        *text_out = strdup(line);
+        return 0;
+
+    case AUDIT_TORN_TAIL:
+        snprintf(line, sizeof line,
+                 "audit: unverified -- %.200s\n"
+                 "  %lld complete records before the break, and that is all this "
+                 "can say about them\n"
+                 "  a torn tail is what a crash looks like; it is not reported as "
+                 "tampering", c.why, c.records);
+        *text_out = strdup(line);
+        return 1;
+
+    default:
+        snprintf(line, sizeof line,
+                 "audit: BROKEN at seq %lld -- %s: %.200s\n"
+                 "  records before the break: %lld\n"
+                 "  the file has been changed somewhere this cannot explain; the "
+                 "only honest next step is to compare it with a copy you trust",
+                 c.seq, audit_verdict_str(c.v), c.why, c.records);
+        *text_out = strdup(line);
+        return 1;
+    }
+}
+
 static int builtin_dur(sh_shell *sh, sargv *a, char **text_out,
                        char *err, size_t ecap) {
     (void)err; (void)ecap;
@@ -2507,8 +2571,32 @@ static int builtin_dur(sh_shell *sh, sargv *a, char **text_out,
     sb_puts(&b, line);
     snprintf(line, sizeof line, "\n  memory:     %zu entries", mem_n);
     sb_puts(&b, line);
-    snprintf(line, sizeof line, "\n  audit:      %zu tool calls", audit_n);
-    sb_puts(&b, line);
+    {
+        /* A count is not a health report. "N tool calls" says the file has lines
+         * in it; verification says whether those lines are the ones that were
+         * written. The difference is the whole milestone. */
+        audit_check ac = audit_verify(sh->store, 0);
+        if (ac.v == AUDIT_OK) {
+            char head[AIOS_AUDIT_HEX + 1] = {0};
+            (void)audit_head(sh->store, head);
+            /* %.16s was meant for a hash and got handed a sentence, so it printed
+             * "(6 records, chain)" -- a diagnostic that looks truncated is worse
+             * than none, because the reader assumes the rest was unimportant. */
+            snprintf(line, sizeof line,
+                     "\n  audit:      %zu tool calls, chain intact, head %.16s",
+                     audit_n, head[0] ? head : "(none)");
+        } else if (ac.v == AUDIT_TORN_TAIL) {
+            snprintf(line, sizeof line,
+                     "\n  audit:      %zu tool calls, tail torn (a crash, not an edit)",
+                     audit_n);
+        } else {
+            snprintf(line, sizeof line,
+                     "\n  audit:      %zu tool calls, CHAIN BROKEN at seq %lld "
+                     "(%s) -- run `audit verify`", audit_n, ac.seq,
+                     audit_verdict_str(ac.v));
+        }
+        sb_puts(&b, line);
+    }
     snprintf(line, sizeof line, "\n  jobs:       %zu spawned / %zu journal records",
              spawns, jrecs);
     sb_puts(&b, line);
@@ -2742,6 +2830,7 @@ static int run_command(sh_shell *sh, scmd *c,
     if (strcmp(c0, "autopilot") == 0) return builtin_autopilot(sh, a, text_out, err, ecap);
     if (strcmp(c0, "tune") == 0)    return builtin_tune(sh, a, text_out, err, ecap);
     if (strcmp(c0, "dur") == 0)     return builtin_dur(sh, a, text_out, err, ecap);
+    if (strcmp(c0, "audit") == 0)   return builtin_audit(sh, a, text_out, err, ecap);
     if (strcmp(c0, "snap") == 0)    return builtin_snap(sh, a, text_out, err, ecap);
     if (strcmp(c0, "rollback") == 0) return builtin_rollback(sh, a, text_out, err, ecap);
     if (strcmp(c0, "agent") == 0) {

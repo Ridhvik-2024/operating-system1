@@ -369,6 +369,10 @@ static void shell_tests(void) {
         if (data) {
             CHECK_STR_CONTAINS(data, "\"tool\":\"calc\"", "audit has calc");
             CHECK_STR_CONTAINS(data, "\"tool\":\"fs.write\"", "audit has fs.write");
+            /* M6: and the records are a chain, not a pile. */
+            CHECK_STR_CONTAINS(data, "\"prev\":\"0000000000000000\"",
+                               "the first record chains to genesis");
+            CHECK_STR_CONTAINS(data, "\"hash\":\"", "records carry a hash");
             free(data);
         }
     }
@@ -588,6 +592,74 @@ static void shell_tests(void) {
         CHECK_STR_CONTAINS(r.text, "revoked", "and reports the revocation");
         sh_result_free(&r);
         CHECK(sh_jobs_alive(sh) == 0, "no job is left alive afterwards");
+    }
+
+
+    /* ---- M6: the record is a chain a stranger can check ---- */
+    {
+        run("audit verify", &r);
+        CHECK(r.status == 0, "audit verify passes on a log this shell wrote");
+        CHECK_STR_CONTAINS(r.text, "chained and intact", "and says the chain holds");
+        CHECK_STR_CONTAINS(r.text, "not cryptographic",
+                           "and states its own limit rather than implying more");
+        sh_result_free(&r);
+
+        run("audit nonsense", &r);
+        CHECK(r.status != 0, "an unknown audit subcommand is refused");
+        CHECK_STR_CONTAINS(r.error, "usage", "with the usage");
+        sh_result_free(&r);
+    }
+
+    /* ---- M6: a changed byte is caught, and the shell says where ---- */
+    {
+        /* Do the tampering at the file level, the way an attacker or a bug would:
+         * the shell must notice from the bytes alone, without being told. */
+        char *data = NULL;
+        size_t len = 0;
+        char *pristine = NULL;
+        size_t plen = 0;
+        CHECK(aios_read_file("build/test-shell/store/audit.log", &data, &len,
+                             1u << 20) == AIOS_OK && data,
+              "the audit log can be read to tamper with it");
+        /* Keep the ORIGINAL bytes, before touching anything. */
+        if (data) {
+            pristine = malloc(len ? len : 1);
+            CHECK(pristine != NULL, "the original bytes are saved");
+            if (pristine) { memcpy(pristine, data, len); plen = len; }
+        }
+        if (data) {
+            char *hit = strstr(data, "\"ok\":true");
+            CHECK(hit != NULL, "found something to change");
+            if (hit) hit[6] = 'f';      /* true -> frue: a complete, valid JSON
+                                         * string in place, so this is a HASH
+                                         * mismatch and not a parse error */
+            FILE *f = fopen("build/test-shell/store/audit.log", "wb");
+            CHECK(f != NULL, "the log can be rewritten");
+            if (f) { fwrite(data, 1, len, f); fclose(f); }
+            free(data);
+        }
+
+        run("audit verify", &r);
+        CHECK(r.status != 0, "verification fails after the edit");
+        CHECK_STR_CONTAINS(r.text, "BROKEN", "and says the chain is broken");
+        CHECK_STR_CONTAINS(r.text, "seq", "and names the sequence number");
+        CHECK_STR_CONTAINS(r.text, "compare it with a copy you trust",
+                           "and says what the only honest next step is");
+        sh_result_free(&r);
+
+        /* Put the exact bytes back. The point is not tidiness: if restoring the
+         * bytes restores the chain, then the hash covers exactly what is on disk.
+         * If it did not, the hash would be covering something else and the whole
+         * idea would be wrong. So keep an untouched copy and write it back. */
+        FILE *restored = fopen("build/test-shell/store/audit.log", "wb");
+        if (restored) { fwrite(pristine, 1, plen, restored); fclose(restored); }
+        CHECK(restored != NULL, "the original bytes are written back");
+        free(pristine);
+
+        run("audit verify", &r);
+        CHECK(r.status == 0, "restoring the bytes restores the chain");
+        CHECK_STR_CONTAINS(r.text, "intact", "and it verifies as intact again");
+        sh_result_free(&r);
     }
 
     /* ---- exit (last: it makes the shell want to terminate) ---- */

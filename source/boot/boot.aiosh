@@ -34,4 +34,10 @@ snap take before-wreck
 fs.write path=bootproof.txt content=v2
 rollback latest
 fs.read path=bootproof.txt
+echo boot: audit chain proof (M6)
+# The record is a chain: every line carries the hash of the one before it. This
+# verifies the log the boot has just written -- in the image, on the ext2 disk,
+# after real tool calls have gone through the sandbox -- and prints the head hash
+# so the next boot can tell whether it is looking at the same history.
+audit verify
 echo boot: aiosh bring-up complete

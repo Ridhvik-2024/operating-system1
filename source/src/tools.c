@@ -1,5 +1,6 @@
 /* aios/tools.c — M4: tool registry, native tools, audit journal. */
 #include "aios/tools.h"
+#include "aios/audit.h"
 #include "sandbox.h"
 
 #include <stdio.h>
@@ -150,37 +151,28 @@ char *tool_reg_help_json(tool_reg *tr) {
 
 /* ---------------- audit ---------------- */
 
+/* M6: the record is a link in a chain, written by src/audit.c.
+ *
+ * What changed here is not the fields -- `dur` counts lines and the shell's test
+ * looks for "tool":"calc", so those had to keep working -- but that a failure to
+ * record is now reported. M4's version opened the file, wrote, and ignored every
+ * error on the way out: a full disk meant actions happened and left no trace, and
+ * nothing said so. That is the exact failure a tamper-evident log must not have,
+ * because "no record" and "the record was lost" look identical afterwards.
+ *
+ * It still does not abort the tool call. Refusing to do work because the log is
+ * unwritable would trade a missing record for a broken machine, and the log's own
+ * 'busy' error tells a caller which happened. */
 static void audit_log(tool_reg *tr, const char *tool, const char *args_json,
                       bool ok, double ms, const char *result_json) {
     if (!tr || !tr->store[0]) return;
-    char path[600];
-    snprintf(path, sizeof path, "%s/audit.log", tr->store);
-    FILE *f = fopen(path, "ab");
-    if (!f) return;
-    uint64_t dig = aios_fnv1a(result_json ? result_json : "",
-                              result_json ? strlen(result_json) : 0);
-    /* embed args as JSON value if it parses, else as a JSON string */
-    json_val *a = json_parse(args_json ? args_json : "null",
-                             args_json ? strlen(args_json) : 4);
-    char *args_embedded;
-    if (a) {
-        args_embedded = strdup(args_json ? args_json : "null");
-        json_free(a);
-    } else {
-        json_val *s = json_new_str(args_json ? args_json : "");
-        args_embedded = json_dump(s);
-        json_free(s);
+    char err[256] = {0};
+    if (!audit_append_tool(tr->store, tool, args_json, tr->agent, ok, ms,
+                           result_json, err, sizeof err)) {
+        /* Visible, not silent. The tool ran; the record of it did not land. */
+        fprintf(stderr, "audit: could not record %.60s: %.160s\n",
+                tool ? tool : "?", err);
     }
-    fprintf(f,
-        "{\"ts\":%.0f,\"agent\":\"%s\",\"tool\":\"%s\",\"args\":%s,"
-        "\"ok\":%s,\"ms\":%.1f,\"digest\":\"%016llx\"}\n",
-        aios_now_ms(), tr->agent, tool,
-        args_embedded ? args_embedded : "null",
-        ok ? "true" : "false", ms,
-        (unsigned long long)dig);
-    if (fflush(f) != 0 || fsync(fileno(f)) != 0) { /* best effort */ }
-    fclose(f);
-    free(args_embedded);
 }
 
 /* ---------------- execution ---------------- */
