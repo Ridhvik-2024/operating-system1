@@ -280,6 +280,63 @@ static int read_head(int fd, char prev[AIOS_AUDIT_HEX + 1], long long *seq,
     return 1;
 }
 
+/* M8: which record, if any, names this staged change?
+ *
+ * Read forward, line by line, and look at the "stage" member of each record. A
+ * line that does not parse is skipped rather than fatal: audit_verify is the
+ * function that judges a broken chain, and a promote must not report "the log is
+ * corrupt" for a file it merely could not parse one line of -- it reports that it
+ * found no record, and the verify gate says separately whether the chain holds.
+ */
+long long audit_stage_record(const char *store, const char *stage_id) {
+    if (!stage_id || !*stage_id) return -1;
+    char path[600];
+    if (!audit_path(path, sizeof path, store)) return -1;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    char *line = malloc(AIOS_AUDIT_LINE_MAX + 2);
+    if (!line) { fclose(f); return -1; }
+
+    long long found = -1;
+    size_t used = 0;
+    int overlong = 0;
+    for (;;) {
+        int c = fgetc(f);
+        if (c == EOF && used == 0) break;
+        if (c == '\n' || c == EOF) {
+            line[used] = 0;
+            if (!overlong && used > 1) {
+                json_val *o = json_parse(line, used);
+                if (o && json_type_of(o) == JSON_OBJ) {
+                    const char *sid = json_str(json_obj_get(o, "stage"));
+                    if (sid && strcmp(sid, stage_id) == 0) {
+                        json_val *sv = json_obj_get(o, "seq");
+                        found = sv ? (long long)json_num(sv) : 0;
+                    }
+                }
+                json_free(o);
+                if (found >= 0 && c == '\n') {
+                    /* Keep scanning? No: the FIRST record naming this change is
+                     * the one that made it promotable, and reporting the newest
+                     * would hide a change recorded twice. */
+                    break;
+                }
+            }
+            used = 0;
+            overlong = 0;
+            if (c == EOF) break;
+            continue;
+        }
+        if (used < AIOS_AUDIT_LINE_MAX) line[used++] = (char)c;
+        else overlong = 1;
+    }
+    free(line);
+    fclose(f);
+    return found;
+}
+
 /* ---- append ---- */
 
 bool audit_append(const char *store, audit_kind kind, const char *body_json,

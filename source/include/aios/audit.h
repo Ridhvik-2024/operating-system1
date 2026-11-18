@@ -141,6 +141,24 @@ audit_check audit_verify(const char *store, long long max_records);
 /* Count complete records only, for `dur`. A torn tail is not a record. */
 size_t audit_count(const char *store);
 
+/* M8: the seq of the newest record whose "stage" field names `stage_id`, or -1
+ * when no record does.
+ *
+ * A staged change must be in the record BEFORE it can be promoted. Two reasons,
+ * and only the second is about trust:
+ *
+ *   1. the diff a human approves is a claim about the future; the record is what
+ *      makes it reviewable afterwards, and an unrecorded promotion is an action
+ *      with no account of itself;
+ *   2. if the chain does not verify, then what the record says about this change
+ *      is exactly what is in question -- so "the record is broken" and "there is
+ *      no record of this change" both mean the same thing for a promote: nobody
+ *      can say what was approved.
+ *
+ * A substring search would be cheaper and wrong: it would match an id mentioned
+ * in some other field. This parses each line and compares the "stage" field. */
+long long audit_stage_record(const char *store, const char *stage_id);
+
 /* The last `hash`, or "0" when the log is empty — the anchor a next session
  * could commit to. Exposed so a future milestone can pin it somewhere else
  * instead of having to re-read and re-parse the whole file. */
