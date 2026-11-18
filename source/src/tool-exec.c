@@ -275,13 +275,29 @@ static json_val *tool_fs_write(json_val *args, char *err, size_t ecap) {
         /* jail-relative containment inside the staging dir, again: the parent
          * validated this, and we do not trust the parent.
          *
-         * realpath() writes up to PATH_MAX bytes, so it gets its own
-         * PATH_MAX-sized buffer. Handing it `dest` (2048) overflowed the stack
-         * the first time this ran. */
+         * M7: this used to realpath() the staging dir HERE, and under the M6
+         * sandbox that was a crash, not a check. The staging dir is outside the
+         * jail, so resolving it performs a readlink under a path Landlock was
+         * only just told about, and the worker died with SIGSYS before reaching
+         * the write -- presenting as "the AI write did nothing", which is the
+         * worst possible way to fail: it looks like policy working.
+         *
+         * The path does not need resolving at this point. The parent passes an
+         * ABSOLUTE staging directory that it created with realpath() before the
+         * worker ever started (see sh_stage_begin), and it is checked before the
+         * request is sent. Resolving it again inside the sandbox bought nothing
+         * and cost the whole feature. What still matters is the containment check
+         * below, which does not touch the filesystem: the joined path must stay
+         * under the staging root. */
         char stageabs[PATH_MAX];
-        if (!realpath(g_stage, stageabs)) {
-            snprintf(err, ecap, "an AI write was refused: staging dir %.120s "
-                                "does not exist", g_stage);
+        if (strlen(g_stage) >= sizeof stageabs) {
+            snprintf(err, ecap, "an AI write was refused: staging path too long");
+            return NULL;
+        }
+        memcpy(stageabs, g_stage, strlen(g_stage) + 1);
+        if (stageabs[0] != '/') {
+            snprintf(err, ecap, "an AI write was refused: staging dir %.120s is "
+                                "not absolute", g_stage);
             return NULL;
         }
         size_t alen = strlen(stageabs);
@@ -448,14 +464,6 @@ int main(int argc, char **argv) {
     aios_ksched_register(AIOS_KS_BATCH);
     aios_cgroup_move_pid((long)getpid(), AIOS_KS_BATCH);
 
-    /* M6 hardening: seccomp allowlist + Landlock jail (env-gated). */
-    if (getenv("AIOS_SANDBOX_HARD")) {
-        char why[128] = {0};
-        int bits = aios_hardening_apply(jailabs, why, sizeof why);
-        fprintf(stderr, "tool-exec: hardening %s (%s)\n",
-                (bits & 3) == 3 ? "full" : "partial", why);
-    }
-
     /* read full request from stdin */
     char *buf = NULL;
     size_t cap = 0, len = 0;
@@ -495,6 +503,28 @@ int main(int argc, char **argv) {
         g_stage[0] = 0;
         if (stage_dir && *stage_dir && strlen(stage_dir) < sizeof g_stage)
             memcpy(g_stage, stage_dir, strlen(stage_dir) + 1);
+
+        /* M6 hardening: seccomp allowlist + Landlock jail (env-gated).
+         *
+         * M7 moved this from before the read to HERE, and the reason is the
+         * whole point of the exercise: the staging directory arrives in the
+         * request, and Landlock has to be told about it or every honest machine
+         * write is EACCES. Applying the lock before knowing what to lock out is
+         * how the sandbox came to forbid the one directory M3 writes to.
+         *
+         * It is applied AFTER a full read of the request and BEFORE any tool
+         * runs, so nothing the tool does escapes it. Nothing between here and
+         * the dispatch line is tool code. */
+        if (getenv("AIOS_SANDBOX_HARD")) {
+            char why[192] = {0};
+            char stageabs[PATH_MAX];
+            const char *rw = NULL;
+            if (g_stage[0] && realpath(g_stage, stageabs)) rw = stageabs;
+            int bits = aios_hardening_apply(jailabs, rw, why, sizeof why);
+            fprintf(stderr, "tool-exec: hardening %s (%s)%s\n",
+                    (bits & 3) == 3 ? "full" : "partial", why,
+                    (g_stage[0] && rw) ? " + staging" : "");
+        }
         json_val *args = json_obj_take(req, "args");
         if (!args) args = json_new_obj();
         json_val *result = NULL;

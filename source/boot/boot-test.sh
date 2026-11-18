@@ -215,11 +215,23 @@ have1 'supervisor: pid .* serving /run/aios/supervisor.sock'
 have1 'boot: audit chain proof'
 have1 'audit: [0-9]+ records, chained and intact'
 # M7: the origin proof, both directions. A shell that refused everything would
-# pass the second line and make the OS useless; a shell that refused nothing would
-# pass the first and make the milestone a comment. The two together are the claim.
+# pass the second line and make the OS useless; a shell that refused nothing
+# would pass the first and make the milestone a comment. The two together are
+# the claim -- and they are why the proof prints "nothing is staged to promote"
+# for a HUMAN (a command that answers) and "not available to a
+# machine-originated line" for a MACHINE (an origin, not a missing command).
 have1 'boot: origin proof'
 have1 'nothing is staged to promote'
 have1 'not available to a machine-originated line'
+# M7 staging under the sandbox: the staged write went through the SANDBOXED
+# worker (init exports AIOS_SANDBOX_HARD=1), so this is the assertion that
+# Landlock was told about the staging root. Without it every honest AI write
+# died with SIGSYS while `staged` still showed a row -- a change that never
+# happened, offered for promotion.
+have1 'boot: staging under the sandbox'
+have1 'bootproof\-m7\.txt'
+have1 'nothing was written to the jail'
+have1 'discarded; the jail was never touched'
 
 echo
 echo "[boot-test] phase 2: same disk — reboot and replay the journal"

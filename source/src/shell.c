@@ -908,6 +908,27 @@ static void sh_stage_drop(sh_shell *sh) {
     sh->stage_dir[0] = 0;
 }
 
+/* M7: is there anything in the staging area, or is the manifest all there is?
+ *
+ * The shell pre-notes every declared write, so a session can have rows and no
+ * files. Ask the directory, not the notes: this is the difference between "a
+ * change is waiting for you" and "a change was declared". */
+static int sh_stage_has_bytes(const char *stage_dir) {
+    char up[700];
+    snprintf(up, sizeof up, "%s/upper", stage_dir);
+    DIR *d = opendir(up);
+    if (!d) return 0;
+    int have = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        have = 1;
+        break;
+    }
+    closedir(d);
+    return have;
+}
+
 /* After a staged tool run: turn the session into a diff for the human. */
 static int sh_stage_report(sh_shell *sh, char **text_out, char *err, size_t ecap) {
     stage_session s;
@@ -921,12 +942,40 @@ static int sh_stage_report(sh_shell *sh, char **text_out, char *err, size_t ecap
     if (stage_diff_compute(&s, &d, err, ecap)) {
         char *body = stage_diff_text(&d);
         char *msg = NULL;
+
+        /* M7: a staged session can be EMPTY and still look full.
+         *
+         * The shell pre-notes every declared write so `staged` has rows even if
+         * the worker never ran -- which is a good property (a refused worker
+         * still owes the human an explanation). But it means the diff has a row
+         * for a file that does not exist in upper/, and the report below used to
+         * say "nothing was written to the jail, promote to apply it" over an
+         * empty stage. A human who read that and typed `promote` got "promoted 0
+         * files into the jail" and no file: a promise the shell could not keep,
+         * made in the one place whose whole job is to be trustworthy about what
+         * did and did not happen.
+         *
+         * So ask the staging area, not the manifest. If nothing is in upper/,
+         * say that the write did not happen and why it matters, rather than
+         * offering to promote an emptiness. This fired in the boot image, where
+         * the sandbox worker could not be found -- an environment problem that
+         * presented as a successful agent run. */
+        int have_bytes = sh_stage_has_bytes(s.dir);
         if (asprintf(&msg,
                      "%s"
-                     "  nothing was written to the jail.\n"
-                     "  promote            apply it\n"
-                     "  discard            throw it away\n",
-                     body ? body : "") < 0)
+                     "%s",
+                     body ? body : "",
+                     have_bytes
+                         ? "  nothing was written to the jail.\n"
+                           "  promote            apply it\n"
+                           "  discard            throw it away\n"
+                         : "  NOTHING WAS STAGED. The write did not happen, so "
+                           "there is\n"
+                           "  nothing to promote -- the rows above are the "
+                           "declared\n"
+                           "  effects, not files. A staged set that is empty "
+                           "usually\n"
+                           "  means the sandbox worker could not be run.\n") < 0)
             msg = NULL;
         free(body);
         *text_out = msg ? msg : strdup("(staged)\n");
@@ -1948,6 +1997,21 @@ static int builtin_staged(sh_shell *sh, char **text_out, json_val **json_out,
     stage_diff d;
     if (!stage_diff_compute(&s, &d, err, ecap)) { stage_end(&s); return 1; }
     char *body = stage_diff_text(&d);
+    /* M7: the same honesty as the report after a run. `staged` is where a human
+     * goes to decide, so it must not show a pending change that has no bytes
+     * behind it -- the rows come from the manifest, and the manifest is written
+     * before the worker runs. */
+    if (!sh_stage_has_bytes(dir) && body) {
+        char *msg = NULL;
+        if (asprintf(&msg, "%s"
+                           "  nothing is actually staged: the rows above are "
+                           "declared effects,\n"
+                           "  not files. There is nothing here to promote.\n",
+                     body) >= 0) {
+            free(body);
+            body = msg;
+        }
+    }
     *text_out = body;
     stage_diff_free(&d);
     stage_end(&s);

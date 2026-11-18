@@ -496,3 +496,41 @@ that could promote would be a batch job that can approve itself.
 **Reverse if:** never for the "no answer = discard" half. The "install an asker"
 half reverses if a genuinely authenticated human channel exists (a signed tty, a
 physical presence token) — then the asker is installed for *that*, not for a uid.
+
+## D33 — 2026-11-18 — Two "only writable place" rules cannot both be true
+M3 says a machine's write lands in `<store>/staging/<id>/upper`, which is
+deliberately outside the jail. M6's Landlock sandbox says the worker's filesystem
+view is the jail and nothing else. Both shipped. Both are right. Neither was ever
+run against the other, because the host tests ran with `AIOS_SANDBOX_HARD` unset
+and the image sets it — so the image was the only place the contradiction lived.
+**Symptom:** under the sandbox, every honest AI write died with SIGSYS before
+touching a file. The shell pre-notes declared writes, so `staged` still showed a
+row and `promote` answered "promoted 0 files into the jail" with status 0. A
+person was told a change was waiting that had never existed, in the one place
+whose entire purpose is to be trustworthy about what did and did not happen.
+**Why nobody noticed:** the in-image selftest suite had *already* been failing at
+`the agent's write is reported as staged` — an M3 assertion — and the boot job
+only checked `AIOS-SELFTEST: PASS`, which was false, so the run stopped there.
+The M7 origin test is what narrowed it to one line.
+**Fix:** three parts, and each was necessary.
+1. `aios_hardening_apply()` takes a second writable root (`extra_rw`) and adds
+   ONE rule for it — the staging directory the parent names, not the store it
+   lives in. `test_kernel` asserts the store's other directories stay refused.
+2. Hardening moved from before the request is read to after it is parsed, because
+   the staging path is *in* the request. Locking before knowing what to lock out
+   is how the sandbox came to forbid the one directory M3 writes to.
+3. `tool-exec` no longer `realpath()`s the staging dir. The parent already passes
+   an absolute, resolved path (`stage_begin` guarantees it), and re-resolving it
+   under the lock performed a readlink that the seccomp filter killed — the
+   SIGSYS that started all this. The containment check that matters (the joined
+   path stays under the staging root) never needed the filesystem.
+**Also:** `fopen` under seccomp needed `__NR_open` (glibc uses it, not `openat`),
+and Landlock needed `MAKE_REG`/`MAKE_DIR` — `WRITE_FILE` overwrites an existing
+file and does NOT create a new one. Two allowlists that were each one entry short
+in a way that only showed up when a file did not already exist.
+**Cost:** an AI write now has two things to get right instead of one. In exchange,
+the failure mode changed from "silent, and lies about it" to "either works or
+says NOTHING WAS STAGED".
+**Reverse if:** never for the rule itself. If staging ever moves inside the jail
+(the overlayfs design in the M3 card), the second root disappears — and the test
+that proves the store is still refused should be deleted with it, not before.

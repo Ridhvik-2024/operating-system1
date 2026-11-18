@@ -55,4 +55,20 @@ echo as a human, promote is available:
 promote
 echo as a machine, promote is not:
 machine "promote"
+
+echo boot: staging under the sandbox (M7)
+# M3 stages a machine's writes OUTSIDE the jail; M6's Landlock allows writes
+# only INSIDE it. Both are right, so the sandbox has to be told about the second
+# writable root -- and when it was not, every honest AI write died with SIGSYS
+# while `staged` still showed a row and `promote` said "promoted 0 files": a
+# human told a change was waiting that had never existed.
+#
+# This runs LAST because it legitimately leaves a file pending. The next line
+# throws it away so the boot ends with an empty stage, which is also how the
+# image should hand over.
+machine "fs.write path=bootproof-m7.txt content=written-by-a-machine"
+staged
+echo as a human, discard is available:
+discard
+
 echo boot: aiosh bring-up complete

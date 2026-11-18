@@ -718,6 +718,8 @@ static size_t complete_snapshots(const char *store) {
 
 static void origin_tests(void) {
     sh_result r;
+    char promote_text[256];
+    size_t procap = sizeof promote_text;
     const char *jail  = "build/test-origin/jail";
     const char *store = "build/test-origin/store";
 
@@ -900,14 +902,33 @@ static void origin_tests(void) {
           "origin: a machine may still SEE what is staged");
     sh_result_free(&r);
 
-    /* the human still can, which is the other half of the claim */
+    /* the human still can, which is the other half of the claim.
+     *
+     * This is the M7 acceptance line -- "the same line with ORIGIN_HUMAN (after
+     * promote) succeeds" -- and it has to be asserted honestly. A `promote` that
+     * reports success over an EMPTY stage is not a success, so check what the
+     * shell said it promoted, not just the return code. That distinction is not
+     * pedantry: the first version of this test passed here and failed in the boot
+     * image, where the sandbox worker could not be run, nothing was staged, and
+     * `promote` still answered "promoted 0 files into the jail" with a status of
+     * 0. The failure message now says which of the two it was. */
     sh_exec(o, "promote", &r);
-    CHECK(r.status == 0, "origin: the human can still promote");
-    sh_result_free(&r);
+    CHECK(r.status == 0, "origin: the human can still promote 0");
+    *promote_text = 0;
+    if (r.text) snprintf(promote_text, procap, "%s", r.text);
+    CHECK(r.text && strstr(r.text, "promoted 1 file") != NULL,
+          "origin: ...and it promoted ONE file, not zero over an empty stage");
     {
+        sh_result_free(&r);
         FILE *f = fopen("build/test-origin/jail/summary.md", "r");
         CHECK(f != NULL, "origin: ...and it landed");
         if (f) fclose(f);
+    }
+    if (!promote_text[0] || !strstr(promote_text, "promoted 1 file")) {
+        CHECK(0, "origin: THE AGENT'S WRITE WAS NEVER STAGED (worker problem, "
+                 "not an origin problem) -- if the text above says "
+                 "'NOTHING WAS STAGED', the sandbox worker could not run in this "
+                 "environment and this test cannot judge origin tagging");
     }
 
     /* ---- 5. every human-only builtin, not just the one that was named ---- */

@@ -431,9 +431,11 @@ reported as a torn tail, not as tampering; two writers cannot interleave
 
 > `sh_exec_origin()` (no default), the human-only builtin gate, `stage_promote()`
 > taking an origin, the three-choice hold in both front-ends, and the stale
-> `rollback_available = 0` replaced by a real question. **300 checks in
-> `test_shell`** (up 76), 122 in `test_stage`, plus a two-direction boot proof.
-> Three defects found by doing it rather than by reading the card — see D31.
+> `rollback_available = 0` replaced by a real question. **301 checks in
+> `test_shell`** (up 77), 135 in `test_stage`, plus a two-direction boot proof and
+> a staged-write-under-the-sandbox proof. **Four defects found by doing it rather
+> than by reading the card** — D31, D32, D33 — one of them a feature that had been
+> silently dead in the boot image since M6.
 
 **Goal.** The OS knows whether a request came from a human or from a model, and
 only human-origin actions may ever be promoted without confirmation.
