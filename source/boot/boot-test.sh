@@ -179,12 +179,33 @@ explain() {
         printf '%s\n' "$fails" | fold -w 120 | sed 's/^/    | /'
     fi
 
+    # The lines that the assertion was ABOUT, in the assertion's own words.
+    # Without this, a miss on a counting assertion ("jobs=[1-9]") reports the
+    # last eight log lines, which say nothing about the count -- three CI round
+    # trips on this file alone have been spent on that gap.
+    # The distinctive token: an ALL-CAPS word, which in this log is always the
+    # name of the line the assertion is about (AIOS-DUR, SELFTEST, AIOS-BOOT-OK).
+    # Matching on "KEY=value" was the wrong shape: the interesting keys are
+    # lower-case (jobs=, audit=) and not unique, while the upper-case prefix is
+    # both unique and exactly what a reader would grep for.
+    probe=$(printf '%s' "$what" | grep -oE '[A-Z][A-Z0-9]+(-[A-Z0-9]+)*' | head -1)
+    if [ -n "$probe" ]; then
+        key=${probe%%=*}
+        echo "  --- every line mentioning $key ---"
+        tr -d '\r' < "$log" 2>/dev/null | grep -F "$key" | head -6 | sed 's/^/    | /'
+    fi
+
     if [ -n "$GITHUB_ACTIONS" ]; then
         # One line, and never empty: an annotation that says only "missed:" has
         # cost CI cycles on this change alone.
         flat="$fails $marks"
         flat=$(printf '%s' "$flat" | tr '\n' ' ' | tr -s ' ' | cut -c1-600)
         echo "::error title=boot test::missed $what :: $flat"
+        if [ -n "$probe" ]; then
+            wanted=$(tr -d '\r' < "$log" 2>/dev/null | grep -F "${probe%%=*}" \
+                     | head -3 | tr '\n' ' ' | tr -s ' ' | cut -c1-400)
+            echo "::error title=boot test::$what saw :: ${wanted:-no line mentioning ${probe%%=*}}"
+        fi
     fi
     fail=1
 }
@@ -257,6 +278,18 @@ echo "------------------------------------------"
 have2() { grep -qE "$1" boot/build/boot-test2.log 2>/dev/null \
              && echo "  OK   $1" || explain boot/build/boot-test2.log "$1"; }
 have2 'AIOS-DUR mounted=1 jobs=[1-9] mem=[1-9] audit=[1-9]'
+# Why a MISS here needs its own explanation: the annotation that reports it
+# carries only the tail of the log, so "AIOS-DUR ... jobs=[1-9]" was all CI
+# could say -- and `jobs` is a COUNT of spawn records the governor wrote on the
+# previous boot, which is not obviously rebuild-dependent. Print the actual line
+# so the next failure names its own cause instead of costing a round trip.
+dur2=$(tr -d '\r' < boot/build/boot-test2.log 2>/dev/null | grep -m1 'AIOS-DUR' || true)
+echo "  (boot 2 said: ${dur2:-<no AIOS-DUR line>})"
+jobs2=$(printf '%s' "$dur2" | sed -n 's/.*jobs=\([0-9]*\).*/\1/p')
+if [ -n "$jobs2" ] && [ "$jobs2" -eq 0 ]; then
+    echo "       jobs=0 means no spawn record was replayed: the governor wrote none"
+    echo "       on boot 1, or stage->jobs.jsonl was not fsynced before poweroff."
+fi
 have2 'this is boot #2 for this data disk'
 have2 'journal entries replayed from the previous session'
 # M5 across the reboot: the file the rollback restored is still v1 on the second

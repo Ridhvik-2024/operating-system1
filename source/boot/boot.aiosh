@@ -92,5 +92,13 @@ echo the change that was named landed:
 fs.read path=bootproof-m75.txt | grep written-by-a-machine
 echo the agent did not get its own change applied:
 staged
+# Hand over with an EMPTY stage, as the M7 block does. A pending change left on
+# the data disk is not just untidy: on the next boot the M7 origin proof's bare
+# `promote` would resolve `latest` to the previous session's leftover and apply
+# it, so boot 2 would prove something about boot 1's change instead of the one
+# it staged. Cross-boot state has to be deliberate or it is a lie.
+discard 15723575368199243237-1
+echo the stage is empty for the next boot:
+staged
 
 echo boot: aiosh bring-up complete
