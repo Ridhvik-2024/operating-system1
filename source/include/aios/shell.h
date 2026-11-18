@@ -101,7 +101,15 @@ int  sh_exec_origin(sh_shell *sh, const char *line, aios_origin origin,
 typedef enum {
     UI_CHOICE_DISCARD = 0,   /* do nothing -- the default, and the timeout    */
     UI_CHOICE_PROMOTE = 1,   /* accept: run it                                  */
-    UI_CHOICE_SHOW_DIFF = 2  /* show what it would change, then ask again       */
+    UI_CHOICE_SHOW_DIFF = 2, /* show what it would change, then ask again       */
+    /* M8: "a person has been asked, and has not answered". For a front-end whose
+     * event loop cannot stop to wait -- the desktop -- this is the only honest
+     * answer available while the question is on screen. It is NOT a fourth kind
+     * of consent: the action stays unexecuted until sh_resume() is told a person
+     * chose. Before this existed the desktop answered DISCARD and opened the
+     * window anyway, so the human's later "promote" applied to nothing while the
+     * shell had already decided. */
+    UI_CHOICE_DEFER = 3
 } ui_choice;
 
 typedef struct {
@@ -135,6 +143,30 @@ void sh_set_ui_asker(sh_shell *sh,
  * anything unrecognised as DISCARD. Exposed so aiosh can install it and the
  * tests can call it with a pipe. */
 ui_choice sh_console_ask(const ui_prompt *p, void *ud);
+
+/* M8: the other half of a DEFER.
+ *
+ * After an asker returns UI_CHOICE_DEFER, the action is held by the shell and
+ * NOTHING has run. `sh_deferred()` says whether one is waiting and what it is, so
+ * a front-end can draw it. `sh_resume()` takes a person's answer:
+ *
+ *   PROMOTE  -> the held action is executed, with the same descriptor that was
+ *               judged -- not by re-running the line, which could read different
+ *               arguments the second time;
+ *   DISCARD  -> the hold is dropped and the action never happens;
+ *   anything else -> no change at all.
+ *
+ * There is still no timeout. A hold that nobody answers stays a hold, which is
+ * the safe direction: the alternative is an action that executes because the
+ * window was closed, and that is exactly what "no auto-promote" forbids.
+ *
+ * Returns 1 only if the resume FAILED -- the held action could not be applied
+ * (e.g. it expired between the question and the answer). A clean discard and a
+ * clean promote both return 0, so a caller can tell "the person said no" from
+ * "the person's yes went wrong"; `out` carries what to say in either case. */
+int  sh_deferred(sh_shell *sh, char *title, size_t tcap,
+                 aios_origin *origin_out);
+int  sh_resume(sh_shell *sh, ui_choice choice, sh_result *out);
 
 /* What the last line executed was stamped as. For the desktop's status line and
  * for tests that assert the stamping actually happened, rather than trusting the

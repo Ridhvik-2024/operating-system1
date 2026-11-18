@@ -27,6 +27,8 @@
 #include "aios/fb.h"
 #include "aios/win.h"
 #include "aios/input.h"
+#include "aios/stage.h"
+#include "aios/audit.h"
 #include "aios/shell.h"
 #include "aios/sembus.h"
 #include "aios/json.h"
@@ -36,6 +38,13 @@
 /* ---------------- palette ------------------------------------------ */
 
 #define COL_BAR_BG     0xFF161c2au
+/* M8: the pending badge sits immediately left of the five app slots, which
+ * begin at w-440. It is a badge and a click target, NOT a sixth slot with an
+ * icon: RULES §2.4 pins the launcher at five, and i=5 would land off a 1280
+ * screen. Computed from the width because the bar is laid out from the right. */
+#define BAR_PEND_GAP   8
+#define BAR_PEND_W     96
+static int bar_pend_x(int w) { return w - 440 - BAR_PEND_GAP - BAR_PEND_W; }
 #define COL_BAR_LINE   AIOS_RGB(0x4a, 0xe0, 0x8a)
 #define COL_TEXT       AIOS_RGB(0xe8, 0xee, 0xf8)
 #define COL_DIM        AIOS_RGB(0x8a, 0x98, 0xb2)
@@ -91,6 +100,14 @@ typedef struct {
     ui_prompt   hold;
     ui_choice   hold_answer;
     int         hold_pending;
+    /* M8: the pending-changes window. A sixth WINDOW, not a sixth launcher slot:
+     * RULES §2.4 pins the launcher at five at `w-440+i*86`, and i=5 would land
+     * off a 1280-wide screen. It opens over everything when changes are waiting,
+     * which is where a decision belongs -- not in a bar you have to go looking
+     * in. */
+    aios_win   *pend_win;
+    int         pend_sel;
+    int         pend_open_req;
     /* toasts */
     char       toast[4][96];
     double     toast_until[4];
@@ -599,22 +616,32 @@ static void hold_render(desktop *d) {
     int y = ch - 66;
     aios_win_text(w, 6, y, "[P] promote    [D] discard    [S] show detail",
                   COL_TEXT, 0, 1);
-    aios_win_text(w, 6, y + 18, "closing this window = discard", COL_TERM_DIM,
+    aios_win_text(w, 6, y + 18, "closing this window = discard (nothing runs)", COL_TERM_DIM,
                   0, 0);
     aios_wm_damage_all(d->wm);
 }
 
 /* The asker the shell calls. It BLOCKS? No -- it cannot, the shell runs inline
- * on the desktop's own thread. So the desktop answers DISCARD and opens the
- * window: the hold is reported, and the person gets the question in a window
- * they can actually answer, on the next tick. What must not happen is the shell
- * waiting for a keystroke that only this loop can deliver. */
+ * on the desktop's own thread, and a blocking asker would deadlock against the
+ * very event loop that reads the keystroke.
+ *
+ * So the answer is DEFER, and it is a real answer: the shell keeps the pending
+ * action alive (sh_deferred()) instead of discarding it. The window opens now,
+ * the loop keeps running, and the keystroke arrives later -- on the next tick,
+ * through hold_key(), which calls sh_resume() to apply the person's answer to the
+ * action the shell actually held.
+ *
+ * This used to answer DISCARD and open a window anyway. That was worse than a
+ * missing feature: action_gate() discarded the action *before* the window
+ * opened, so a person could read a proposal, press P, watch a toast say "re-run
+ * the command to apply it", and have nothing happen. The question was real; the
+ * answer went nowhere. */
 static ui_choice desktop_ask(const ui_prompt *p, void *ud) {
     desktop *d = ud;
     d->hold = *p;
     d->hold_pending = 1;
-    d->hold_answer = UI_CHOICE_DISCARD;
-    return UI_CHOICE_DISCARD;
+    d->hold_answer = UI_CHOICE_DEFER;
+    return UI_CHOICE_DEFER;
 }
 
 static void hold_open(desktop *d) {
@@ -630,9 +657,15 @@ static void hold_key(desktop *d, int key) {
     if (key == 'p' || key == 'P') {
         d->hold_answer = UI_CHOICE_PROMOTE;
     } else if (key == 's' || key == 'S') {
-        /* "show detail" here is rendering the detail the prompt already carried;
-         * there is no content diff until M8, and inventing one would be worse
-         * than saying so. */
+        /* "show detail" re-renders the detail the prompt already carried. It is
+         * deliberately NOT a content diff: a held ACTION has a descriptor, not a
+         * staging session, so there are no bytes to compare. The pending-changes
+         * window (`pending` / `diff <id>`) is where a staged change gets read, and
+         * it is a different question: "what would this change?" versus "what did
+         * this proposal ask to do?".
+         *
+         * Note the return: asking to look must not close the window, and must not
+         * be mistaken for an answer. */
         d->hold_answer = UI_CHOICE_SHOW_DIFF;
         return;
     } else if (key == 'd' || key == 'D' || key == 27) {  /* 27 = ESC */
@@ -648,18 +681,272 @@ static void hold_key(desktop *d, int key) {
     /* The person chose. Say so on the bus, and say which way: an audit that
      * records "a human was involved" without recording the answer is a record of
      * a conversation, not of a decision. */
+    const char *cname = c == UI_CHOICE_PROMOTE ? "promote"
+                      : c == UI_CHOICE_SHOW_DIFF ? "show_detail" : "discard";
     char ev[320];
     snprintf(ev, sizeof ev, "{\"what\":\"%.120s\",\"choice\":\"%s\"}",
-             d->hold.title,
-             c == UI_CHOICE_PROMOTE ? "promote"
-             : c == UI_CHOICE_SHOW_DIFF ? "show_detail" : "discard");
+             d->hold.title, cname);
     sembus_pub(d->bus, "sh.ui.hold_answered", ev);
-    toast(d, "you chose: %s",
-          c == UI_CHOICE_PROMOTE ? "promote"
-          : c == UI_CHOICE_SHOW_DIFF ? "show detail" : "discard");
-    if (c == UI_CHOICE_PROMOTE)
-        toast(d, "answered -- re-run the command to apply it");
+    toast(d, "you chose: %s", cname);
+
+    /* The answer has to reach the action, not just the screen.
+     *
+     * sh_resume() is where the held descriptor lives: PROMOTE runs it, DISCARD
+     * drops it, and anything else leaves it held. The desktop does not re-run the
+     * command and does not re-derive the action -- a re-run would have to be
+     * gated again, would take a different descriptor id, and would quietly apply
+     * whatever the store looked like *now* rather than what the person was shown.
+     * ("Show detail" never gets here: hold_key() returns before closing.) */
+    if (c == UI_CHOICE_PROMOTE || c == UI_CHOICE_DISCARD) {
+        sh_result r;
+        memset(&r, 0, sizeof r);
+        int rc = sh_resume(d->sh, c, &r);
+        /* rc is "did the answer get applied", not "was the answer yes": a
+         * discard applies cleanly and still has something to say. The message
+         * is what the person reads either way. */
+        if (r.error && *r.error)
+            toast(d, "%.150s", r.error);
+        else if (r.text && *r.text)
+            toast(d, "%.150s", r.text);
+        else if (rc != 0)
+            toast(d, "the held action could not be applied");
+        sh_result_free(&r);
+        aios_wm_damage_all(d->wm);
+    }
+}
+
+/* ---------------- M8: pending changes --------------------------------- *
+ *
+ * In the console the same information is `pending` / `diff <id>`: a list of
+ * changes, and one change read on its own. This window is that, and it uses the
+ * same engine calls -- stage_pending_scan() and stage_diff_compute() -- so the
+ * two front-ends cannot drift into describing different changes.
+ *
+ * Layout is on the 8x16 text grid, as everything else is: one row per change
+ * (id, origin, summary), and the selected change's diff underneath with a green
+ * "+" per added line and a red "-" per removed one. The counts come out of
+ * stage_diff; the row itself is drawn as the files it names, because inventing
+ * line content here would be a picture of a diff rather than a diff.
+ */
+
+/* The store the shell was built with. The desktop already reads this env var in
+ * main() and in agents_reload(); one accessor keeps the window from inventing a
+ * third spelling of the same path. */
+static const char *desk_store(void) {
+    const char *s = getenv("AIOS_STORE");
+    return (s && *s) ? s : "/var/lib/aios/store";
+}
+
+#define PEND_MAX_ROWS 32
+
+typedef struct {
+    stage_pending_list l;
+    stage_diff         diff;
+    int                diff_ok;    /* diff below belongs to `diff_for` */
+    int                diff_for;   /* index in l.items               */
+    char               err[200];
+} pend_buf;
+
+/* An id like "1737...-1" is stable but unreadable. Show the tail, which is the
+ * part that distinguishes two changes in the same run, and keep the whole thing
+ * for the promote call. */
+static const char *pend_short_id(const char *id) {
+    size_t n = strlen(id);
+    return n > 18 ? id + n - 18 : id;
+}
+
+static void pend_reload(desktop *d, pend_buf *pb) {
+    stage_pending_free(&pb->l);
+    memset(&pb->l, 0, sizeof pb->l);
+    char err[200] = {0};
+    if (!stage_pending_scan(desk_store(), &pb->l, err, sizeof err)) {
+        snprintf(pb->err, sizeof pb->err, "cannot list pending: %.150s", err);
+        pb->l.n = 0;
+        return;
+    }
+    pb->err[0] = 0;
+    if (d->pend_sel < 0) d->pend_sel = 0;
+    if (pb->l.n == 0) d->pend_sel = 0;
+    else if ((size_t)d->pend_sel >= pb->l.n) d->pend_sel = (int)pb->l.n - 1;
+}
+
+static void pend_diff_load(desktop *d, pend_buf *pb) {
+    stage_diff_free(&pb->diff);
+    memset(&pb->diff, 0, sizeof pb->diff);
+    pb->diff_ok = 0;
+    pb->diff_for = -1;
+    if (pb->l.n == 0) return;
+    int i = d->pend_sel;
+    if (i < 0 || (size_t)i >= pb->l.n) return;
+    stage_session s;
+    char err[200] = {0};
+    if (!stage_open(pb->l.items[i].dir, &s, err, sizeof err)) return;
+    if (stage_diff_compute(&s, &pb->diff, err, sizeof err)) {
+        pb->diff_ok = 1;
+        pb->diff_for = i;
+    }
+    stage_end(&s);
+}
+
+static void pend_render(desktop *d) {
+    aios_win *w = d->pend_win;
+    if (!w) return;
+    pend_buf *pb = aios_win_user(w);
+    int cw = aios_win_cw(w), ch = aios_win_ch(w);
+    aios_win_fill(w, 0, 0, cw, ch, 0xFF121826u);
+
+    if (pb->l.n == 0) {
+        aios_win_text(w, 8, 8, "nothing is pending", COL_TEXT, 0, 1);
+        aios_win_text(w, 8, 28, "a staged change appears here before it can",
+                      COL_DIM, 0, 0);
+        aios_win_text(w, 8, 44, "be promoted into the jail.", COL_DIM, 0, 0);
+        aios_win_text(w, 8, ch - 20, "esc closes", COL_TERM_DIM, 0, 0);
+        aios_wm_damage_all(d->wm);
+        return;
+    }
+
+    char head[96];
+    snprintf(head, sizeof head, "%zu pending change%s", pb->l.n,
+             pb->l.n == 1 ? "" : "s");
+    aios_win_text(w, 8, 4, head, COL_ACCENT, 0, 1);
+
+    /* rows */
+    int y = 26;
+    size_t nshow = pb->l.n < PEND_MAX_ROWS ? pb->l.n : PEND_MAX_ROWS;
+    int list_h = (int)nshow * 16;
+    for (size_t i = 0; i < nshow; i++) {
+        stage_pending *p = &pb->l.items[i];
+        int sel = ((int)i == d->pend_sel);
+        int ry = y + (int)i * 16;
+        if (sel) aios_win_fill(w, 4, ry - 2, cw - 8, 15, 0xFF223048u);
+        /* id, what it does, and the AI badge. The badge is a separate draw at
+         * the right edge so it reads as a mark on the row rather than as part of
+         * the change's name. */
+        char row[240];
+        if (p->summary[0])
+            snprintf(row, sizeof row, "%-18s  %.36s", pend_short_id(p->id),
+                     p->summary);
+        else
+            snprintf(row, sizeof row, "%-18s  %zu file%s", pend_short_id(p->id),
+                     p->n_files, p->n_files == 1 ? "" : "s");
+        aios_win_text(w, 8, ry, row,
+                      sel ? COL_TEXT : COL_DIM, 0, sel);
+        if (audit_stage_record(desk_store(), p->id) >= 0)
+            aios_win_text(w, cw - 40, ry, "AI", AIOS_RGB(0xe8, 0xb8, 0x6a), 0, 1);
+    }
+
+    /* diff pane: the selected change, read on its own */
+    int dy = y + list_h + 8;
+    if (dy + 40 < ch) {
+        aios_win_fill(w, 4, dy - 4, cw - 8, 1, 0x3a4458u);
+        if (pb->diff_ok && pb->diff_for == d->pend_sel) {
+            int py = dy + 2, rows = 0;
+            for (size_t i = 0; i < pb->diff.n && rows < (ch - py - 36) / 16; i++) {
+                stage_diff_entry *e = &pb->diff.entries[i];
+                const char *op = e->op == STAGE_OP_ADD ? "+"
+                               : e->op == STAGE_OP_DELETE ? "-" : "~";
+                unsigned col = e->op == STAGE_OP_ADD ? AIOS_RGB(0x5a, 0xd6, 0x8a)
+                             : e->op == STAGE_OP_DELETE ? AIOS_RGB(0xe8, 0x6a, 0x7a)
+                             : COL_TEXT;
+                char line[256];
+                /* %.40s, not %-40s: a path can be 512 bytes and the window is
+                 * 520 wide, so the long name is cut, not the row. */
+                if (e->op == STAGE_OP_DELETE)
+                    snprintf(line, sizeof line, "- %.40s  removed", e->path);
+                else
+                    snprintf(line, sizeof line, "%s %.40s  %+ld bytes  +%d/-%d",
+                             op, e->path, e->bytes, e->plus, e->minus);
+                aios_win_text(w, 8, py, line, col, 0, 0);
+                py += 16;
+                rows++;
+            }
+            if (pb->diff.n == 0)
+                aios_win_text(w, 8, py, "(no file differences recorded)",
+                              COL_TERM_DIM, 0, 0);
+        } else {
+            aios_win_text(w, 8, dy + 2, "(cannot read this change's diff)",
+                          COL_TERM_DIM, 0, 0);
+        }
+    }
+    char foot[120];
+    snprintf(foot, sizeof foot, "[p] promote   [d] discard   up/down select");
+    aios_win_text(w, 8, ch - 20, foot, COL_TEXT, 0, 1);
     aios_wm_damage_all(d->wm);
+}
+
+static void pend_open(desktop *d) {
+    if (d->pend_win) { aios_wm_focus(d->wm, d->pend_win); return; }
+    pend_buf *pb = calloc(1, sizeof *pb);
+    if (!pb) return;
+    pb->diff_for = -1;
+    int W = aios_fb_w(d->fb), H = aios_fb_h(d->fb);
+    aios_rect r = { W / 2 - 260, 90, 520, H - 90 - BAR_H - 20 };
+    /* A sixth window, and it is allowed to overlap the five launcher apps:
+     * this is a modal decision, and burying the thing waiting on a person
+     * behind the terminal is how a queue gets ignored. The launcher bar stays
+     * visible underneath so the box never looks like it lost its chrome. */
+    d->pend_win = aios_wm_open(d->wm, r, "pending changes", pb);
+    pend_reload(d, pb);
+    pend_diff_load(d, pb);
+    pend_render(d);
+}
+
+static void pend_close(desktop *d) {
+    if (!d->pend_win) return;
+    pend_buf *pb = aios_win_user(d->pend_win);
+    if (pb) {
+        stage_pending_free(&pb->l);
+        stage_diff_free(&pb->diff);
+        free(pb);
+    }
+    aios_wm_close(d->wm, d->pend_win);
+    d->pend_win = NULL;
+    aios_wm_damage_all(d->wm);
+}
+
+/* Resolve + apply. The window decides, but it does not reimplement promote:
+ * it asks the shell to run the same builtin a person would type, so a promote
+ * from the window and a promote from the console go through one code path --
+ * including the audit gate and the refusal that comes with it. */
+static void pend_act(desktop *d, const char *verb) {
+    pend_buf *pb = aios_win_user(d->pend_win);
+    if (!pb || pb->l.n == 0) return;
+    int i = d->pend_sel;
+    if (i < 0 || (size_t)i >= pb->l.n) return;
+    char cmd[300];
+    snprintf(cmd, sizeof cmd, "%s %.60s", verb, pb->l.items[i].id);
+    sh_result r;
+    memset(&r, 0, sizeof r);
+    sh_exec_origin(d->sh, cmd, ORIGIN_HUMAN, &r);
+    if (r.error && *r.error)      toast(d, "%.150s", r.error);
+    else if (r.text && *r.text)   toast(d, "%.150s", r.text);
+    sh_result_free(&r);
+    sembus_pub_kv(d->bus, "sh.ui.pending_action",
+                  (const char *const[]){
+                      "change", pb->l.items[i].id, "verb", verb, NULL});
+    /* The list changed underneath the selection: re-read both. */
+    pend_reload(d, pb);
+    pend_diff_load(d, pb);
+    if (pb->l.n == 0) pend_close(d);
+    else pend_render(d);
+}
+
+static void pend_key(desktop *d, int key) {
+    pend_buf *pb = aios_win_user(d->pend_win);
+    if (!pb) return;
+    if (key == AIOS_KEY_UP && d->pend_sel > 0) d->pend_sel--;
+    else if (key == AIOS_KEY_DOWN && (size_t)(d->pend_sel + 1) < pb->l.n) d->pend_sel++;
+    else if (key == 'p' || key == 'P') { pend_act(d, "promote"); return; }
+    else if (key == 'd' || key == 'D') { pend_act(d, "discard"); return; }
+    else if (key == 27 || key == '\n') {
+        /* enter opens the change's diff on its own -- the console's `diff <id>`
+         * -- which is already the pane below; enter therefore re-reads it. */
+        pend_diff_load(d, pb);
+        pend_render(d);
+        return;
+    } else return;
+    pend_diff_load(d, pb);
+    pend_render(d);
 }
 
 /* ---------------- launcher bar -------------------------------------- */
@@ -708,7 +995,27 @@ static void bar_render(desktop *d) {
     char st[64];
     snprintf(st, sizeof st, "cortex: %s  jobs: %zu", sh_cortex_mode(d->sh),
              alive);
-    aios_fb_text(f, w - 440 - 170, h - BAR_H + 16, st, COL_DIM, 0, 0);
+    aios_fb_text(f, w - 440 - 300, h - BAR_H + 16, st, COL_DIM, 0, 0);
+
+    /* M8: how many changes are waiting on a person, and the click target that
+     * opens the window. Deliberately NOT a sixth launcher slot -- the bar shows
+     * a COUNT, because "3 pending" is a thing you should not have to go looking
+     * for, and the five app slots stay where RULES §2.4 put them. */
+    stage_pending_list pl;
+    char perr[128] = {0};
+    int npend = 0;
+    if (stage_pending_scan(desk_store(), &pl, perr, sizeof perr)) {
+        npend = (int)pl.n;
+        stage_pending_free(&pl);
+    }
+    if (npend > 0) {
+        aios_rect pb = { bar_pend_x(w), h - BAR_H + 8, BAR_PEND_W, 22 };
+        aios_fb_fill(f, &pb, 0xFF3a2a10u);
+        aios_fb_rect(f, &pb, AIOS_RGB(0xe8, 0xb8, 0x6a));
+        char pt[48];
+        snprintf(pt, sizeof pt, "%d pending", npend);
+        aios_fb_text(f, pb.x + 8, pb.y + 3, pt, AIOS_RGB(0xe8, 0xb8, 0x6a), 0, 1);
+    }
 }
 
 static void bar_click(desktop *d, int x, int y) {
@@ -719,6 +1026,11 @@ static void bar_click(desktop *d, int x, int y) {
         return;
     }
     d->nl_focus = 0;
+    int pbx = bar_pend_x(w);
+    if (x >= pbx && x < pbx + BAR_PEND_W && y > h - BAR_H && y < h) {
+        pend_open(d);
+        return;
+    }
     for (int i = 0; i < APP_COUNT; i++) {
         int bx = w - 440 + i * 86;
         if (x >= bx && x < bx + 86 && y > h - BAR_H && y < h) {
@@ -1019,12 +1331,42 @@ int main(int argc, char **argv) {
                                  * utility windows may close */
                                 if (hit == d->hold_win) {
                                     /* M7: closing the question is not answering
-                                     * it. Discard, and say so. */
+                                     * it -- so it counts as no. The window itself
+                                     * says "closing this window = discard", and
+                                     * that promise has to be kept in the engine,
+                                     * not only on the bus.
+                                     *
+                                     * This used to close the window and publish
+                                     * "discard" without telling the shell. Before
+                                     * M8 the action had already been discarded by
+                                     * then, so the event happened to be true. With
+                                     * a held action it is not: the action stayed
+                                     * held, no window could answer it, and the bus
+                                     * claimed a decision nobody could make.
+                                     *
+                                     * sh_resume(DISCARD) is what makes the event
+                                     * true. It applies nothing, which is the whole
+                                     * content of the promise. */
                                     d->hold_win = NULL;
                                     sembus_pub(d->bus, "sh.ui.hold_answered",
                                                "{\"choice\":\"discard\","
                                                "\"why\":\"closed\"}");
+                                    sh_result cr;
+                                    memset(&cr, 0, sizeof cr);
+                                    sh_resume(d->sh, UI_CHOICE_DISCARD, &cr);
+                                    sh_result_free(&cr);
+                                    toast(d, "closed: the proposal was dropped, "
+                                             "nothing ran");
                                     aios_wm_close(d->wm, hit);
+                                    break;
+                                }
+                                if (hit == d->pend_win) {
+                                    /* Closing the LIST is not a decision about
+                                     * any change in it. Nothing is promoted and
+                                     * nothing is discarded; the staging area is
+                                     * untouched and the changes are still there
+                                     * next time the window opens. */
+                                    pend_close(d);
                                     break;
                                 }
                                 for (int i = 0; i < APP_COUNT; i++)
@@ -1048,7 +1390,18 @@ int main(int argc, char **argv) {
                          * else gets the keyboard. A key that both answers the
                          * question and types into a terminal would be a
                          * confirmation dialog you can type through. */
+                        /* M8: the pending list owns the keyboard while it is
+                         * open. It is a decision surface: a `p` that also
+                         * reached the terminal would promote a change the
+                         * person did not select. The hold window still wins
+                         * when both are up -- answering a question is more
+                         * specific than browsing a list. */
                         if (d->hold_win) hold_key(d, ev.key);
+                        else if (d->pend_win) {
+                            if (ev.key == 27) {    /* esc closes, decides nothing */
+                                pend_close(d);
+                            } else pend_key(d, ev.key);
+                        }
                         else if (d->nl_focus) nl_key(d, ev.key);
                         else key_to_app(d, ev.key);
                     }
@@ -1062,6 +1415,7 @@ int main(int argc, char **argv) {
             static int frames;
             frames++;
             if (d->hold_pending) hold_open(d);
+            if (d->pend_open_req) { d->pend_open_req = 0; pend_open(d); }
             if (frames % 25 == 0) {
                 if (d->apps[APP_AUTOPILOT].win) refresh_app(d, APP_AUTOPILOT);
                 if (d->apps[APP_AGENTS].win) refresh_app(d, APP_AGENTS);

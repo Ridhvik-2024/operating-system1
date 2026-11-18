@@ -143,6 +143,13 @@ struct sh_shell {
     void     *ui_ask_ud;
     int       allow_ui_prompt;       /* cleared to force the refusal path */
 
+    /* M8: an action a person has been asked about and has not answered. Held as
+     * a DESCRIPTOR, not as text to re-run: re-running the line could read
+     * different arguments the second time, and the thing the person approved
+     * would not be the thing that executes. */
+    aios_action *deferred;
+    char         deferred_why[192];
+
     /* M3: a machine-originated write lands here instead of the jail. NULL means
      * the tool layer writes directly (a human typed the command, or the caller
      * opted out). Set up per command, torn down after it. */
@@ -515,6 +522,16 @@ ui_choice ui_present(const ui_prompt *p,
         ui_choice c = ask(p, ud);
         if (c == UI_CHOICE_SHOW_DIFF) continue;
         if (c == UI_CHOICE_PROMOTE) return UI_CHOICE_PROMOTE;
+        /* M8: DEFER is passed through, not collapsed into DISCARD.
+         *
+         * The first version of this function returned DISCARD for anything that
+         * was not PROMOTE, which was correct while there were only three answers
+         * and became a lie the moment a front-end could say "asked, not yet
+         * answered". Collapsing it here made the desktop's DEFER unreachable --
+         * the branch that holds the action never ran, and the hold silently
+         * became a refusal. A function that rewrites its caller's answer must be
+         * told about every answer there is. */
+        if (c == UI_CHOICE_DEFER) return UI_CHOICE_DEFER;
         return UI_CHOICE_DISCARD;
     }
     return UI_CHOICE_DISCARD;
@@ -712,6 +729,39 @@ static int action_gate(sh_shell *sh, const aios_action *act, aios_origin origin,
                      act->target ? act->target : "(none)");
             up.have_detail = 1;
             ui_choice c = ui_present(&up, sh->ui_ask, sh->ui_ask_ud);
+            /* M8: DEFER is not DISCARD, and treating it as one is the bug this
+             * whole path exists to fix. A front-end that cannot answer without
+             * blocking -- the desktop, whose event loop IS this thread -- returns
+             * DEFER, and the action is then "waiting for a person" rather than
+             * "refused by one". `sh_resume()` runs it when the person answers.
+             *
+             * Note what has NOT changed: ui_present() still cannot return
+             * PROMOTE without a person choosing it, there is still no timeout,
+             * and an asker that says DEFER and is never resumed leaves the action
+             * unexecuted forever. The unsafe direction is still refused. */
+            if (c == UI_CHOICE_DEFER) {
+                aios_action_free(sh->deferred);
+                sh->deferred = aios_action_from_json(act_json ? act_json : "",
+                                                     NULL, 0);
+                if (sh->deferred) {
+                    aios_action_stamp_origin(sh->deferred, origin);
+                    snprintf(sh->deferred_why, sizeof sh->deferred_why, "%s: %.140s",
+                             aios_policy_reason_str(d.r), d.why);
+                    sembus_pub_kv(sh->bus, "sh.action.deferred",
+                                  (const char *const[]){
+                                      "kind", aios_action_kind_name(act->kind),
+                                      "target", act->target ? act->target : "",
+                                      "reason", aios_policy_reason_str(d.r), NULL});
+                }
+                free(act_json);
+                snprintf(err, ecap,
+                         "this needs a human [%s]: %s%s -- a person has been asked "
+                         "and has not answered yet",
+                         aios_policy_reason_str(d.r), d.why,
+                         origin == ORIGIN_AI
+                             ? " (a machine proposed it)" : "");
+                return 1;
+            }
             if (c == UI_CHOICE_PROMOTE) {
                 accepted = 1;
                 sembus_pub_kv(sh->bus, "sh.action.promoted_by_human",
@@ -1013,6 +1063,43 @@ static void sh_pending_note(sh_shell *sh, const char *except_dir,
              n, n == 1 ? " is" : "s are", id, n == 1 ? "" : ", ...");
 }
 
+/* M8: put the staged change on the record, before anyone is offered it.
+ *
+ * Do.4 of the card -- "refuse to promote anything whose audit record failed
+ * audit verify" -- needs two things this closes:
+ *
+ *   1. a staged change had NO record at all. `audit.log` recorded the tool call
+ *      (the worker wrote into staging and did exactly what it declared), but
+ *      nothing said that a pending change existed or which session held it. So
+ *      "verify the record before promoting" would have checked a log that could
+ *      not have been wrong about this change, because it never mentioned it;
+ *   2. the id a human types must be the thing recorded. Writing it here, once,
+ *      at the moment the change becomes visible, is what makes `promote <id>`
+ *      and "the record of <id>" the same string.
+ *
+ * A failure to record is REPORTED, not fatal: refusing to show a person a diff
+ * because the log is unwritable would hide the change rather than protect it. The
+ * promote gate then refuses it, which is the right place for that refusal.
+ */
+static void sh_audit_stage(sh_shell *sh, const stage_session *s,
+                           const stage_diff *d) {
+    if (!sh || !sh->store[0]) return;
+    const char *base = strrchr(s->dir, '/');
+    base = base ? base + 1 : s->dir;
+
+    char body[1024];
+    snprintf(body, sizeof body,
+             "{\"stage\":\"%.80s\",\"jail\":\"%.200s\","
+             "\"files\":%zu,\"origin\":\"%.16s\"}",
+             base, s->jail, d ? d->n : 0,
+             aios_action_origin_name(sh->last_origin));
+
+    char aerr[192] = {0};
+    if (!audit_append(sh->store, AUDIT_KIND_EVENT, body, NULL, aerr, sizeof aerr))
+        fprintf(stderr, "audit: could not record staged change %.80s: %.160s\n",
+                base, aerr);
+}
+
 /* After a staged tool run: turn the session into a diff for the human. */
 static int sh_stage_report(sh_shell *sh, char **text_out, char *err, size_t ecap) {
     stage_session s;
@@ -1024,6 +1111,7 @@ static int sh_stage_report(sh_shell *sh, char **text_out, char *err, size_t ecap
     stage_diff d;
     int rc = 0;
     if (stage_diff_compute(&s, &d, err, ecap)) {
+        sh_audit_stage(sh, &s, &d);
         char *body = stage_diff_text(&d);
         char *msg = NULL;
 
@@ -1955,6 +2043,9 @@ static const char HELP_TEXT[] =
     "  audit [verify]              walk the hash-chained record and say if it holds\n"
     "  snap [take LABEL]           list snapshots, or take one now (M5)\n"
     "  rollback [latest|ID]        undo to a snapshot; running jobs are revoked\n"
+    "  pending | staged            list pending changes (one line / with diffs)\n"
+    "  diff <id>                   read ONE pending change (M8)\n"
+    "  promote <id> | discard <id> decide one; a bare word refuses if two are pending\n"
     "  machine \"LINE\"               run LINE as if a MODEL had typed it (M7)\n"
     "                              origin tagging: what a machine may and may not do\n"
     "  cortex [scripted|micro|llm] show/switch the routing cortex\n"
@@ -2163,13 +2254,304 @@ static bool sh_pick_session(sh_shell *sh, sargv *a, const char *verb,
     return true;
 }
 
+/* M8: the record has to justify the promote, and it has to justify THIS one.
+ *
+ * Do.4 of the card says "refuse to promote anything whose audit record failed
+ * audit verify". Implemented literally that would check a nearly-always-true
+ * condition: verify says the whole chain is intact, and a chain can be intact
+ * while saying nothing at all about the change in front of you. So there are two
+ * refusals here, and the second is the one that matters:
+ *
+ *   - the chain does not verify  -> the record of this change is in doubt;
+ *   - no record names this id    -> there is no record of this change at all.
+ *
+ * Both mean the same thing for a promote: nobody can say what was approved. That
+ * is the fail-closed direction, and it is why `sh_audit_stage()` writes the
+ * record when the change is OFFERED -- so a change that reached a person is
+ * always one whose id is on the record before they decide.
+ *
+ * What this does NOT do (say it plainly): it does not recompute the hash of the
+ * bytes being promoted, so it still cannot tell that the diff a human read is the
+ * diff being applied. A person with write access to the store can change `upper/`
+ * between `staged` and `promote` and the record will still verify. That binding is
+ * a content hash in the manifest and is not in this change; see D35.
+ */
+static int sh_promote_gate(sh_shell *sh, const stage_session *s,
+                           char *err, size_t ecap) {
+    const char *base = strrchr(s->dir, '/');
+    base = base ? base + 1 : s->dir;
+
+    audit_check c = audit_verify(sh->store, 0);
+    if (c.v != AUDIT_OK) {
+        char why[192];
+        snprintf(why, sizeof why, "%s at seq %lld",
+                 audit_verdict_str(c.v), c.seq);
+        sembus_pub_kv(sh->bus, "sh.stage.promote_refused",
+                      (const char *const[]){"stage", base, "why", why, NULL});
+        snprintf(err, ecap,
+                 "refusing to promote %.80s: the audit chain does not verify "
+                 "(%s at seq %lld). What the record says about this change is "
+                 "exactly what is in doubt.", base,
+                 audit_verdict_str(c.v), c.seq);
+        return 1;
+    }
+
+    long long seq = audit_stage_record(sh->store, base);
+    if (seq < 0) {
+        sembus_pub_kv(sh->bus, "sh.stage.promote_refused",
+                      (const char *const[]){"stage", base, "why", "no_record", NULL});
+        snprintf(err, ecap,
+                 "refusing to promote %.80s: no audit record names it. A change "
+                 "whose proposal was never recorded cannot be shown afterwards to "
+                 "have been approved. Discard it and stage it again.", base);
+        return 1;
+    }
+    return 0;
+}
+
+/* M8: `pending` -- one line per change, for when you are looking rather than
+ * reading. `staged` stays the full view with diffs; this is the index.
+ *
+ * It exists as a separate word because the two jobs are different: deciding
+ * needs the diff, and deciding WHICH change to look at needs a list that fits on
+ * a screen. The card asked for `pending`; `staged` keeps its name because the
+ * boot proof and a person's fingers both already use it.
+ */
+static int builtin_pending(sh_shell *sh, char **text_out, json_val **json_out,
+                           char *err, size_t ecap) {
+    stage_pending_list l;
+    if (!stage_pending_scan(sh->store, &l, err, ecap)) return 1;
+    if (l.n == 0) {
+        *text_out = strdup("nothing is pending\n");
+        (void)json_out;
+        stage_pending_free(&l);
+        return 0;
+    }
+
+    char *acc = NULL;
+    size_t cap = 0;
+    FILE *f = open_memstream(&acc, &cap);
+    if (!f) { stage_pending_free(&l); snprintf(err, ecap, "oom"); return 1; }
+
+    fprintf(f, "%zu pending%s\n", l.n, l.n == 1 ? "" : " changes");
+    for (size_t i = 0; i < l.n; i++) {
+        stage_pending *p = &l.items[i];
+        /* The badge is not decoration: a person deciding on a change should be
+         * able to see at a glance that a model proposed it, and the audit record
+         * is what says so. */
+        const char *who = "-";
+        char who_buf[24] = {0};
+        stage_session s;
+        char oerr[192] = {0};
+        if (stage_open(p->dir, &s, oerr, sizeof oerr)) {
+            /* The origin is in the record, not the directory. Ask the record. */
+            long long seq = audit_stage_record(sh->store, p->id);
+            if (seq >= 0) {
+                snprintf(who_buf, sizeof who_buf, "seq %lld", seq);
+                who = who_buf;
+            }
+            stage_end(&s);
+        }
+        /* id, what it does, origin/seq. The summary is the middle column
+         * because "1 file" tells a person nothing about whether they want it. */
+        if (p->summary[0])
+            fprintf(f, "  [%s]  %-30.30s  %s%s\n",
+                    p->id, p->summary, who,
+                    p->state == STAGE_MANIFEST_PROMOTING ? "  (promote unfinished)" : "");
+        else
+            fprintf(f, "  [%s]  %zu file%s  %s%s\n",
+                    p->id, p->n_files, p->n_files == 1 ? "" : "s", who,
+                    p->state == STAGE_MANIFEST_PROMOTING ? "  (promote unfinished)" : "");
+        if (p->n_unnoted)
+            fprintf(f, "      %zu file%s not named by the manifest\n",
+                    p->n_unnoted, p->n_unnoted == 1 ? "" : "s");
+    }
+    if (l.truncated) fprintf(f, "  (more than this list can show)\n");
+    fprintf(f, "  diff <id>      read one change\n"
+               "  promote <id>   apply it\n"
+               "  discard <id>   throw it away\n");
+    fclose(f);
+    *text_out = acc ? acc : strdup("");
+    (void)json_out;
+    stage_pending_free(&l);
+    return 0;
+}
+
+/* M8: `diff <id>` -- one change, no other change's rows around it.
+ *
+ * `staged` prints every pending change because leaving one out is how a reviewed
+ * change went missing (D34). But a person deciding on ONE change should not have
+ * to read past the others, and the id they type should be echoed back so they can
+ * see they are looking at the thing they named.
+ */
+static int builtin_diff(sh_shell *sh, sargv *a, char **text_out,
+                        json_val **json_out, char *err, size_t ecap) {
+    if (a->n < 2) {
+        snprintf(err, ecap, "usage: diff <id>   (`pending` lists the ids)");
+        return 1;
+    }
+    char dir[600];
+    if (!stage_resolve(sh->store, "diff", a->v[1], dir, sizeof dir, err, ecap))
+        return 1;
+
+    stage_session s;
+    if (!stage_open(dir, &s, err, ecap)) return 1;
+    stage_diff d;
+    if (!stage_diff_compute(&s, &d, err, ecap)) { stage_end(&s); return 1; }
+
+    char *body = stage_diff_text(&d);
+    const char *base = strrchr(s.dir, '/');
+    base = base ? base + 1 : s.dir;
+    char *msg = NULL;
+    if (asprintf(&msg, "change %s\n%s", base, body ? body : "") < 0) msg = NULL;
+    free(body);
+    stage_diff_free(&d);
+
+    if (msg && !sh_stage_has_bytes(dir)) {
+        char *w = NULL;
+        if (asprintf(&w, "%s  nothing is actually staged: the rows above are "
+                          "declared effects, not files.\n", msg) >= 0) {
+            free(msg);
+            msg = w;
+        }
+    }
+    *text_out = msg ? msg : strdup("");
+    stage_end(&s);
+    (void)json_out;
+    return 0;
+}
+
+/* M8: `promote all`.
+ *
+ * Why a word and not a wildcard: D34 is the record of what happens when the one
+ * command that makes a change real is allowed to guess which change you meant.
+ * `all` is not a prefix, not an empty argument, and not a default -- it is a word
+ * a person has to type, and typing it is a decision to apply EVERYTHING pending.
+ *
+ * It is also the one place the gate has to run per change rather than once. A
+ * chain that verifies says nothing about whether each individual change is on the
+ * record, so each session gets its own sh_promote_gate() and the first refusal
+ * stops the run: after a refusal, applying the rest would be applying changes in
+ * an order the person did not choose and cannot see.
+ *
+ * Partial success is reported honestly. If two of three promoted and the third
+ * was refused, the text says so and the status is non-zero, because "promote all"
+ * that applied some is not a success.
+ */
+static int builtin_promote_all(sh_shell *sh, char **text_out, char *err,
+                               size_t ecap) {
+    stage_pending_list l;
+    if (!stage_pending_scan(sh->store, &l, err, ecap)) return 1;
+    if (l.n == 0) {
+        *text_out = strdup("nothing is pending: there is nothing to promote\n");
+        stage_pending_free(&l);
+        return 0;
+    }
+
+    char *acc = NULL;
+    size_t cap = 0;
+    FILE *f = open_memstream(&acc, &cap);
+    if (!f) { stage_pending_free(&l); snprintf(err, ecap, "oom"); return 1; }
+
+    size_t done = 0;
+    int rc = 0;
+    fprintf(f, "promoting %zu change%s\n", l.n, l.n == 1 ? "" : "s");
+    for (size_t i = 0; i < l.n; i++) {
+        stage_pending *p = &l.items[i];
+        stage_session s;
+        char oerr[320] = {0};
+        if (!stage_open(p->dir, &s, oerr, sizeof oerr)) {
+            fprintf(f, "  [%s]  could not open: %.120s\n", p->id, oerr);
+            rc = 1;
+            break;
+        }
+        if (sh_promote_gate(sh, &s, oerr, sizeof oerr) != 0) {
+            fprintf(f, "  [%s]  refused -- %.200s\n", p->id, oerr);
+            /* Carry the reason out as the command's error too: the per-change
+             * lines above say which change, and this says why, so a caller that
+             * only reads ->error still learns the cause. */
+            snprintf(err, ecap, "%.300s", oerr);
+            stage_end(&s);
+            rc = 1;
+            break;
+        }
+        char snapnote[160] = {0};
+        sh_snap_before(sh, "before a promote", snapnote, sizeof snapnote);
+        size_t n = 0;
+        bool ok = stage_promote_locked(&s, sh->last_origin, &n, oerr, sizeof oerr);
+        if (ok && n == 0) {
+            /* The session was promotable but there were no bytes in it. Counting
+             * that as "applied" would make "2 changes applied" print while the
+             * jail gained nothing -- a number that flatters the command. Say it
+             * for what it is. */
+            fprintf(f, "  [%s]  nothing staged to apply (effects declared, no bytes)\n",
+                    p->id);
+            stage_end(&s);
+            continue;
+        }
+        if (ok) {
+            done++;
+            fprintf(f, "  [%s]  promoted %zu file%s\n", p->id, n, n == 1 ? "" : "s");
+            if (sh->bus) {
+                char ev[512];
+                snprintf(ev, sizeof ev, "{\"files\":%zu,\"dir\":\"%.300s\"}", n, s.dir);
+                sembus_pub(sh->bus, "sh.stage.promote", ev);
+            }
+        } else {
+            fprintf(f, "  [%s]  failed -- %.200s\n", p->id, oerr);
+            snprintf(err, ecap, "%.300s", oerr);
+            rc = 1;
+        }
+        stage_end(&s);
+        if (!ok) break;
+    }
+    fclose(f);
+    stage_pending_free(&l);
+
+    /* Say how far it got, always. A run that stopped early and a run that
+     * finished must not read the same. */
+    char tail[200];
+    snprintf(tail, sizeof tail, "%zu change%s applied; %.140s",
+             done, done == 1 ? "" : "s",
+             rc ? "stopped at the first refusal -- the rest were not touched"
+                : "nothing left pending");
+    char *full = NULL;
+    if (asprintf(&full, "%s%s\n", acc ? acc : "", tail) >= 0) {
+        free(acc);
+        acc = full;
+    }
+    *text_out = acc ? acc : strdup("");
+    return rc;
+}
+
 static int builtin_promote(sh_shell *sh, sargv *a, char **text_out,
                            json_val **json_out, char *err, size_t ecap) {
+    /* `all` is matched as a whole word, before any id resolution, so that a
+     * change whose id happens to begin with "all" can never be confused with
+     * it. An id is hex digits and a dash; "all" is not a legal prefix of one. */
+    if (a && a->n >= 2 && strcmp(a->v[1], "all") == 0) {
+        if (a->n > 2) {
+            snprintf(err, ecap,
+                     "promote all takes no further arguments: %.60s is either a "
+                     "change id or the word all, not both", a->v[2]);
+            *text_out = NULL;
+            return 1;
+        }
+        (void)json_out;
+        return builtin_promote_all(sh, text_out, err, ecap);
+    }
+
     char dir[600];
     if (!sh_pick_session(sh, a, "promote", dir, sizeof dir, err, ecap)) return 1;
 
     stage_session s;
     if (!stage_open(dir, &s, err, ecap)) return 1;
+    /* M8: before the snapshot, before anything: is this change on the record? */
+    if (sh_promote_gate(sh, &s, err, ecap) != 0) {
+        stage_end(&s);
+        stage_text_of(NULL, NULL, text_out);
+        return 1;
+    }
     size_t n = 0;
     /* A human typed `promote`: that makes the change human-sponsored, which is
      * exactly what the policy layer wanted before it would let it through. The
@@ -3421,6 +3803,8 @@ static int run_command(sh_shell *sh, scmd *c, aios_origin origin,
     if (strcmp(c0, "cortex") == 0)  return builtin_cortex(sh, a, text_out, err, ecap);
     if (strcmp(c0, "jail") == 0)    return builtin_jail(sh, a, text_out, err, ecap);
     if (strcmp(c0, "staged") == 0)  return builtin_staged(sh, text_out, json_out, err, ecap);
+    if (strcmp(c0, "pending") == 0) return builtin_pending(sh, text_out, json_out, err, ecap);
+    if (strcmp(c0, "diff") == 0)    return builtin_diff(sh, a, text_out, json_out, err, ecap);
     if (strcmp(c0, "promote") == 0) return builtin_promote(sh, a, text_out, json_out, err, ecap);
     if (strcmp(c0, "machine") == 0)
         return builtin_as_machine(sh, a, text_out, json_out, err, ecap);
@@ -3588,6 +3972,132 @@ sh_shell *sh_create(const char *jail_dir, const char *store_dir) {
     return sh;
 }
 
+/* M8: the deferred half of NEEDS_HUMAN.
+ *
+ * `sh_deferred()` is what a front-end draws: is a person being asked something,
+ * and what. `sh_resume()` is what happens when they answer, and it is the only
+ * path from a DEFER to an execution.
+ *
+ * The descriptor that runs is the one that was JUDGED. It is re-validated
+ * (is_valid: expiry, budget, origin stamp) because time passed and an expired
+ * proposal must not be executable -- but it is not re-parsed from text, so the
+ * arguments cannot change underneath the approval. The gate is not asked again
+ * either: policy already said NEEDS_HUMAN, and a person saying "yes" to
+ * NEEDS_HUMAN is precisely the answer that verdict was waiting for. Asking the
+ * same question twice would let a person grant consent that the second ask then
+ * discards.
+ */
+int sh_deferred(sh_shell *sh, char *title, size_t tcap, aios_origin *origin_out) {
+    if (!sh || !sh->deferred) return 0;
+    if (title && tcap)
+        snprintf(title, tcap, "%s%s%s",
+                 aios_action_kind_name(sh->deferred->kind),
+                 sh->deferred->target ? " " : "",
+                 sh->deferred->target ? sh->deferred->target : "");
+    if (origin_out) *origin_out = sh->deferred->origin;
+    return 1;
+}
+
+int sh_resume(sh_shell *sh, ui_choice choice, sh_result *out) {
+    if (!sh || !sh->deferred) return 0;
+    if (!out) return 0;
+    /* Zero the caller's result FIRST, including on the paths that do nothing.
+     * A caller that resumes with SHOW_DIFF gets no action, and if this left the
+     * struct alone the caller's sh_result_free() would free whatever stack
+     * garbage it happened to hold. A function whose contract is "may do nothing"
+     * must not leave its output undefined. */
+    memset(out, 0, sizeof *out);
+    out->text = xstrdup("");
+
+    if (choice != UI_CHOICE_PROMOTE) {
+        /* Every other answer drops the hold. That includes DISCARD, an unknown
+         * choice, and DEFER (asked, still nothing) -- none of them executes, and
+         * only PROMOTE does.
+         *
+         * Return 0 for a discard: the person asked for nothing to happen, and
+         * nothing happened. Returning 1 here (which the first version did) meant
+         * a successful "no" was indistinguishable from a failed "yes" -- the
+         * desktop, which checks rc, would have reported a clean discard as "the
+         * held action could not run". */
+        if (choice == UI_CHOICE_DISCARD) {
+            sembus_pub_kv(sh->bus, "sh.action.discarded",
+                          (const char *const[]){
+                              "kind", aios_action_kind_name(sh->deferred->kind),
+                              "why", "the human answered discard", NULL});
+            out->status = 0;
+            out->text = xstrdup("discarded; nothing was run\n");
+            aios_action_free(sh->deferred);
+            sh->deferred = NULL;
+            sh->deferred_why[0] = 0;
+        }
+        return 0;
+    }
+
+    char why[256];
+    if (!aios_action_is_valid(sh->deferred, why, sizeof why)) {
+        /* An expired or now-invalid descriptor is NOT run. The person said yes
+         * to something that no longer exists as a proposal. */
+        out->status = 1;
+        out->error = NULL;
+        if (asprintf(&out->error, "the held action expired before you answered: %.180s",
+                     why) < 0) out->error = NULL;
+        sembus_pub_kv(sh->bus, "sh.action.refused",
+                      (const char *const[]){
+                          "kind", aios_action_kind_name(sh->deferred->kind),
+                          "verdict", "DENY", "why", why, NULL});
+        aios_action_free(sh->deferred);
+        sh->deferred = NULL;
+        sh->deferred_why[0] = 0;
+        return 1;
+    }
+
+    aios_action *act = sh->deferred;
+    sh->deferred = NULL;
+    sh->deferred_why[0] = 0;
+    sh->last_origin = ORIGIN_HUMAN;      /* a person just accepted it */
+
+    sembus_pub_kv(sh->bus, "sh.action.promoted_by_human",
+                  (const char *const[]){
+                      "kind", aios_action_kind_name(act->kind),
+                      "target", act->target ? act->target : "", NULL});
+    sembus_pub_kv(sh->bus, "sh.action.log",
+                  (const char *const[]){
+                      "verdict", "ALLOW(on human promote)",
+                      "action", act->target ? act->target : "", NULL});
+
+    json_val *jout = NULL;
+    char *text = NULL;
+    char err[SH_ERR_CAP] = {0};
+    int rc;
+    if (act->kind == ACT_TOOL || act->kind == ACT_AGENT) {
+        rc = exec_tool_action(sh, act, ORIGIN_HUMAN, &text, &jout, err, sizeof err);
+    } else {
+        /* Every other kind reaches the gate through a path that spells what it
+         * does -- a background job is `spawn <goal>`, and a delete has no path at
+         * all yet (`fs.delete` is not a tool; see G-gap). Refusing by name is
+         * the honest half: the person's "promote" is recorded, and the reason
+         * they got nothing says which capability is missing rather than pretending
+         * the hold was never theirs.
+         *
+         * Worth being blunt about: this means the desktop can show a person a
+         * destructive proposal, record their answer, and still not carry it out.
+         * That is a missing feature, not a safety property, and naming it here is
+         * better than a resume path that silently did nothing. */
+        rc = 1;
+        snprintf(err, sizeof err,
+                 "you promoted a %s proposal, but aiosh has no execution path for "
+                 "that kind yet -- it was recorded, not run",
+                 aios_action_kind_name(act->kind));
+    }
+    aios_action_free(act);
+
+    out->status = rc;
+    out->text = text ? text : xstrdup("");
+    out->json = jout;
+    if (rc != 0) out->error = xstrdup(err);
+    return 1;
+}
+
 void sh_free(sh_shell *sh) {
     if (!sh) return;
     for (int i = 0; i < sh->nvars; i++) { free(sh->var_name[i]); free(sh->var_val[i]); }
@@ -3595,6 +4105,7 @@ void sh_free(sh_shell *sh) {
     for (int i = 0; i < sh->njobs; i++) { free(sh->jobs[i].goal); free(sh->jobs[i].final); }
     free(sh->last_out);
     free(sh->last_json);
+    aios_action_free(sh->deferred);
     tool_reg_free(sh->tools);
     mem_close(sh->mem);
     sembus_destroy(sh->bus);
@@ -3650,6 +4161,38 @@ int sh_exec_origin(sh_shell *sh, const char *line, aios_origin origin,
     }
     sh->last_origin = origin;
     sh->last_needs_human = 0;
+
+    /* TEST SEAM: `_describe <kind> <target>` runs an ordinary descriptor through
+     * the real gate with an AI origin, so a test can exercise what happens when
+     * the law says NEEDS_HUMAN without inventing a command that happens to reach
+     * it today.
+     *
+     * Honest about being a seam: not in `help`, writes nothing, executes nothing
+     * (it stops at the gate). It exists because the alternative is testing the
+     * deferred path against a mock of the gate -- and a mock of the gate tests the
+     * mock. The seam calls the same action_gate() every real command calls.
+     */
+    if (strncmp(line, "_describe ", 10) == 0) {
+        char kind[24] = {0}, target[200] = {0};
+        if (sscanf(line + 10, "%23s %199s", kind, target) >= 1) {
+            aios_act_kind k = ACT_TOOL;
+            if (strcmp(kind, "delete") == 0) k = ACT_FS_DELETE;
+            if (strcmp(kind, "spawn") == 0)  k = ACT_JOB_SPAWN;
+            if (strcmp(kind, "write") == 0)  k = ACT_FS_WRITE;
+            aios_action *a = aios_action_new(k, ORIGIN_AI, target);
+            if (!a) { out->status = 1; out->error = xstrdup("oom"); return 0; }
+            aios_action_set_intent(a, "describe");
+            aios_action_set_reversible(a, 1);
+            char derr[SH_ERR_CAP] = {0};
+            int grc = action_gate(sh, a, ORIGIN_AI, derr, sizeof derr);
+            aios_action_free(a);
+            out->status = grc;
+            if (grc) out->error = xstrdup(derr);
+            else     out->text = xstrdup("gate said ALLOW");
+            sh->last_status = grc;
+            return 0;
+        }
+    }
 
     /* M7.5: a staged session belongs to ONE command.
      *
@@ -3709,7 +4252,18 @@ int sh_exec_origin(sh_shell *sh, const char *line, aios_origin origin,
         json_free(out->json);
         out->json = pjson;
         if (rc != 0) {
-            out->error = xstrdup(err[0] ? err : aios_status_str(AIOS_ERR));
+            /* err[0] is what a builtin said. When a builtin fails it is
+             * supposed to fill it; when it does not, say that a command failed
+             * and stop.
+             *
+             * This used to be aios_status_str(AIOS_ERR), which is a category
+             * error: rc here is a shell builtin's return code (0 or 1), not an
+             * aios_status (AIOS_ERR is -1). It rendered as "unknown", and only
+             * the front-end's "error: " prefix made it look like a message --
+             * `promote all` stopping at a refusal printed "error: error". A
+             * front-end must not be the only thing standing between a status
+             * code and a sentence. */
+            out->error = xstrdup(err[0] ? err : "the command failed");
             free(ptext);
             break;
         }
