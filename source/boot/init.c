@@ -72,16 +72,22 @@ static char  g_ring[LOG_RING_CAP];
 static size_t g_ring_n;
 static int   g_ring_ok = -1;          /* -1 unknown, 0 unavailable, 1 usable */
 
-static void ring_load(void) {
+static void ring_reset(void) {
     if (g_ring_ok >= 0) return;
-    size_t n = 0;
-    g_ring_ok = (aios_dur_read(LOG_RING_REL, g_ring, sizeof g_ring, &n) == AIOS_OK);
-    g_ring_n = (g_ring_ok && n <= sizeof g_ring) ? n : 0;
-    if (!g_ring_ok) g_ring_n = 0;
+    /* The ring starts EMPTY each boot, it does not append to the last one.
+     *
+     * An earlier version read the previous boot's log back in. That is wrong
+     * twice over: "log" would then show lines from a boot that is not this one,
+     * with nothing in the output saying where the boundary is - and the read had
+     * to happen on the first say(), i.e. before the store is necessarily
+     * mounted, so it could fail and silently leave the ring in an odd state.
+     * Starting empty also removes the call from init's early path. */
+    g_ring_ok = 1;
+    g_ring_n = 0;
 }
 
 static void ring_put(const char *s) {
-    ring_load();
+    ring_reset();
     if (!g_ring_ok) return;           /* the console is still a record of sorts */
     const size_t need = strlen(s) + 1;             /* + newline */
     if (need >= LOG_RING_CAP) return;              /* a single absurd line */

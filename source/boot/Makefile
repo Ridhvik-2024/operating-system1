@@ -253,15 +253,23 @@ $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	     echo "   this file is tracked in git, so raising it is a reviewed commit:"; \
 	     echo "   that is the only form of this guard that can fail in CI"; \
 	 fi; \
-	 echo "   M11/W0-C raise (+2,000): C1 governor supervision in init.c (+1,285"
-	 echo "   bytes of text), C4 the boot ring in init.c plus the log builtin in"
-	 echo "   shell.c (+1,351), C3 flock and the tail reader in durable.c (+668)."
-	 echo "   Three W0-C features, the last open items on the roadmap exit test."
-	 echo "   The raise is 2,000 against 1,980 measured - about 1% headroom, not"
-	 echo "   a new 128KB cushion. Deliberately NOT paid for by dropping a suite:"
-	 echo "   all 17 installed suites exercise something in the image (audit,"
-	 echo "   sandbox, kernel, durable), unlike test_stoich/test_nullspace which"
-	 echo "   are pure arithmetic and are already LINK_ONLY."
+	 echo "   M11/W0-C raise (+10,000 on the M10 cap, 2950000 -> 2960000):"
+	 echo "     C1 governor supervision   init.c    +1,285 bytes of text"
+	 echo "     C4 boot ring + log builtin init.c/shell.c +1,351"
+	 echo "     C3 flock + tail reader    durable.c  +668"
+	 echo "   Three W0-C features - the last open items on the roadmap's exit"
+	 echo "   test - and they are paid for FOUR TIMES because this image is"
+	 echo "   statically linked: aiosh, aios-init, aios-governor and aios-desktop"
+	 echo "   each carry their own copy of durable.o. That amplification, not the"
+	 echo "   source size, is why ~3.5KB of C becomes ~4.1KB of image."
+	 echo "   The number is set from a MEASURED CI build (2,954,688) plus 5,312,"
+	 echo "   not extrapolated: the first attempt sized it at +2,000 from the"
+	 echo "   local delta and CI promptly came in 2,688 over, because CI's static"
+	 echo "   glibc is ~209KB larger and the difference is not constant."
+	 echo "   Deliberately NOT paid for by dropping a suite: all 17 installed"
+	 echo "   suites exercise something in the image (audit, sandbox, kernel,"
+	 echo "   durable), unlike test_stoich/test_nullspace which are pure"
+	 echo "   arithmetic and are already LINK_ONLY."
 	 echo "   (the cap is toolchain-dependent: a static link against a newer" ; \
 	 echo "    glibc is larger. Pin it from the LARGEST supported toolchain," ; \
 	 echo "    not from the smallest.)" ; \
