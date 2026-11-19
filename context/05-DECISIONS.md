@@ -719,3 +719,35 @@ model — a wrong species can make a real attack conserve. Nothing is wired into
 **Reverse if:** a corpus exists with a held-out adversarial split and the critic
 can be shown to refuse the chains the exact half misses. Until then the neural
 component is a documented gap, not a placeholder with a comment calling it one.
+
+## D39 — 2026-11-21 — M11 audits the privacy claim instead of building it
+**Status:** decided
+**Decision.** Item #17 proposed a Stiefel rotation plus null-space projection with
+`I(Z_cloud; PII) = 0` and "zero mathematical possibility of data leakage". Two of
+its three claims are false, and the false ones are false for structural reasons,
+not implementation ones:
+
+- A rotation **is** an isometry, so attention survives — this part is right and is
+  implemented and checked to 1e-14.
+- A rotation is therefore also a **bijection**. `Q` has `n(n−1)/2` parameters and
+  is recovered exactly from `n` known plaintexts; after that every token is
+  readable. Demonstrated by recovering an unknown `Q` and reading a **held-out**
+  embedding to six significant figures. This is not a key-management problem.
+- Projection removes the **linear** component of an attribute and nothing else. An
+  attribute encoded in the norm scores 50.00% linearly and 100.00% quadratically.
+
+So the milestone ships the one thing that can be proven: an **auditor**.
+`ns_certify()` measures linear and quadratic recoverability on the *outputs* of
+any pipeline and refuses unless both are at chance. A projection that looks
+private on a linear probe is caught by the quadratic one.
+
+**Why not build the proposal anyway.** Because the headline is what a doctor reads
+before uploading a chart. M10 refused a learned critic for being unprovable; a
+claim of zero leakage from an invertible map is not less dangerous for being
+stated in mathematics.
+**Cost.** No privacy transform ships — only the ability to refute one. The probes
+are empirical over one corpus, and a determined nonlinear encoding could still beat
+the quadratic probe.
+**Reverse if:** someone exhibits a transform that keeps the attribute under an
+adversary allowed *any* function, not a linear or quadratic one. That would be a
+real result and this decision would be the thing to revisit.
