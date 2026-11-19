@@ -66,8 +66,8 @@ static FILE *con;
  * its log file could not be written; if the ring is unavailable the console
  * still gets the line, and `log` says the ring is unavailable rather than
  * pretending it is empty. */
-#define LOG_RING_REL  "boot.log"
-#define LOG_RING_CAP  (16 * 1024)
+#define LOG_RING_REL  AIOS_BOOT_LOG_REL
+#define LOG_RING_CAP  AIOS_BOOT_LOG_CAP
 static char  g_ring[LOG_RING_CAP];
 static size_t g_ring_n;
 static int   g_ring_ok = -1;          /* -1 unknown, 0 unavailable, 1 usable */
@@ -559,8 +559,6 @@ int main(void) {
     int gov_crashes = 0;
     long gov_backoff_ms = 0;
     int gov_kill_pending = 1;   /* C1 self-test fires at most once per boot */
-    int gov_kill_in = 0;        /* countdown to the deliberate kill; 0 = idle */
-    (void)gov_kill_in;
 
     /* C5: the selftest is OPT-IN for release images.
      *
@@ -697,33 +695,17 @@ int main(void) {
                 snprintf(line, sizeof line,
                          "[init] autopilot governor: pid %d (mode %s)", (int)gov_pid, apmode);
                 say(line);
-                /* C1's own proof, and it ships rather than living in a comment:
-                 * with aios.governor.kill=1 init kills the governor ONCE, so the
-                 * supervision path is exercised on every boot job instead of only
-                 * when something happens to crash. A respawner that has never
-                 * been tested is a respawner nobody knows works - that is how the
-                 * pid went untracked for M1..M10.
-                 *
-                 * The kill is DEFERRED by a countdown, not done here with a
-                 * sleep: PID 1 must not block before the system is up, and a
-                 * usleep() in the spawn path is exactly that. The countdown ticks
-                 * in the reap loop below, so the governor has a chance to run
-                 * before it is killed. */
-                if (gov_kill_pending && cmdline_flag("aios.governor.kill=1")) {
-                    gov_kill_pending = 0;
-                    gov_kill_in = 3;               /* about 3 loop iterations */
-                }
+                /* C1's proof lives in the aios.mode=test path above, not here.
+                 * An earlier version armed a countdown in this loop instead,
+                 * which was dead code: CI boots with aios.mode=test, that path
+                 * powers off before the loop is entered, and an interactive boot
+                 * is never the thing being tested. Removing it also removed the
+                 * WNOHANG special case this loop briefly needed. */
+                (void)gov_kill_pending;
             } else {
                 say("[init] autopilot governor: fork failed");
                 gov_crashes = 5;                   /* do not spin on a broken fork */
             }
-        }
-        /* C1 self-test countdown: let the governor run, then kill it once. */
-        if (gov_kill_in > 0 && --gov_kill_in == 0 && gov_pid > 0) {
-            snprintf(line, sizeof line,
-                     "[init] C1 self-test: killing governor pid %d", (int)gov_pid);
-            say(line);
-            kill(gov_pid, SIGKILL);
         }
         if (use_gui && gui_pid == -1 && gui_crashes < 5) {
             gui_pid = fork();
@@ -746,12 +728,7 @@ int main(void) {
             }
         }
         int st = 0;
-        /* WNOHANG + a short nap, so a pending C1 countdown can tick. Before C1
-         * this could block indefinitely, which was fine when the loop had no
-         * timed work; a blocking waitpid with a countdown above it would mean
-         * the kill only fires when some unrelated child happens to exit. */
-        pid_t p = waitpid(-1, &st, (gov_kill_in > 0) ? WNOHANG : 0);
-        if (p == 0) { usleep(100 * 1000); continue; }
+        pid_t p = waitpid(-1, &st, 0);
         if (p < 0) { if (errno == EINTR) continue; usleep(100000); continue; }
         if (p == gui_pid) {
             gui_pid = -1;

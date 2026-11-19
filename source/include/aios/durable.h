@@ -57,6 +57,13 @@ aios_status aios_dur_write_atomic(const char *rel, const char *data,
 /* Append-only journal write: O_APPEND + fsync + directory fsync. */
 aios_status aios_dur_append(const char *rel, const char *data, size_t len);
 
+/* C4: the boot ring PID 1 writes and `log` reads. Fixed size on purpose: a log
+ * that grows without bound on an 8 MiB data disk eventually becomes the reason a
+ * boot fails. Shared here so init and the shell cannot disagree about it, which
+ * they did while it was a literal in both files. */
+#define AIOS_BOOT_LOG_REL  "boot.log"
+#define AIOS_BOOT_LOG_CAP  (16 * 1024)
+
 /* C4: does the store file exist? Lets a caller say "empty" rather than "error"
  * for a file that has simply never been written. */
 bool aios_dur_exists(const char *rel);

@@ -3430,20 +3430,29 @@ static int builtin_log(sh_shell *sh, sargv *a, char **text_out,
         return 1;
     }
 
-    /* static: the shell's stack is already the thinnest part of the image */
-    static char buf[16 * 1024 + 64];
+    /* One buffer, sized from the shared constant.
+     *
+     * The first version had a static 16 KiB read buffer AND strdup'd the result,
+     * i.e. 32 KiB of RAM - in PID 1's shell, on a machine this project runs in
+     * 512 MB - and repeated the ring size as a literal that could drift from
+     * init's. Reading once into the buffer that becomes the result removes the
+     * copy and the magic number together. */
+    char *buf = malloc(AIOS_BOOT_LOG_CAP + 1);
+    if (!buf) { snprintf(err, ecap, "log: out of memory"); return 1; }
     size_t n = 0;
-    const aios_status st = aios_dur_read("boot.log", buf, sizeof buf, &n);
+    const aios_status st = aios_dur_read(AIOS_BOOT_LOG_REL, buf, AIOS_BOOT_LOG_CAP, &n);
 
     /* A ring file that does not exist yet is EMPTY, not unavailable: that is the
      * state of every store before the first boot message. Reporting it as an
      * error would make `log` fail on a clean system, which is a worse lie than
      * the one this distinction exists to prevent. */
-    if (st != AIOS_OK && !aios_dur_exists("boot.log")) {
+    if (st != AIOS_OK && !aios_dur_exists(AIOS_BOOT_LOG_REL)) {
+        free(buf);
         *text_out = strdup("log: the boot ring is empty (this store has no boot.log yet)");
         return 0;
     }
     if (st != AIOS_OK) {
+        free(buf);
         snprintf(err, ecap,
                  "log: the boot ring is unavailable (%s)\n"
                  "  this is NOT the same as an empty log: PID 1 could not read\n"
@@ -3453,26 +3462,27 @@ static int builtin_log(sh_shell *sh, sargv *a, char **text_out,
         return 1;
     }
     if (n == 0) {
+        free(buf);
         *text_out = strdup("log: the boot ring is empty (no messages recorded)");
         return 0;
     }
-    if (n >= sizeof buf) n = sizeof buf - 1;
-    buf[n] = 0;
+    buf[n] = 0;                      /* the buffer is cap+1 for exactly this */
 
     if (want == 0) {
-        *text_out = strdup(buf);
+        *text_out = buf;             /* ownership moves; no copy */
         return 0;
     }
     /* last `want` lines */
     size_t lines = 0, pos = 0, start = 0;
     for (size_t i = 0; i < n; i++) if (buf[i] == '\n') lines++;
-    if (lines <= want) { *text_out = strdup(buf); return 0; }
+    if (lines <= want) { *text_out = buf; return 0; }
     const size_t skip = lines - want;
     size_t seen = 0;
     for (pos = 0; pos < n; pos++) {
         if (buf[pos] == '\n' && ++seen == skip) { start = pos + 1; break; }
     }
-    *text_out = strdup(buf + start);
+    *text_out = strdup(buf + start);   /* partial: one copy is unavoidable */
+    free(buf);
     (void)sh;
     return 0;
 }
