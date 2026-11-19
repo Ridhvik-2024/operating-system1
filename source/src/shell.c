@@ -3397,6 +3397,86 @@ static int builtin_audit(sh_shell *sh, sargv *a, char **text_out,
     }
 }
 
+/* C4: `log` — the boot ring that PID 1 keeps.
+ *
+ * The ring lives on the durable store under "boot.log" and holds the newest
+ * boot messages, oldest dropped first. It exists because the console stops being
+ * a record the moment the desktop takes the screen: before this, the messages
+ * that explain a failed boot were written to a console nobody was watching and
+ * then overwritten.
+ *
+ * "Unavailable" and "empty" are DIFFERENT answers and are reported as such. A
+ * log command that says "no messages" when it could not read the file teaches a
+ * user the opposite of the truth at the moment they are debugging. */
+static int builtin_log(sh_shell *sh, sargv *a, char **text_out,
+                       char *err, size_t ecap) {
+    if (a->n >= 2 && (strcmp(a->v[1], "-h") == 0 || strcmp(a->v[1], "--help") == 0)) {
+        *text_out = strdup(
+            "log [-n N]   the boot log PID 1 keeps (newest last)\n"
+            "  The ring holds the most recent boot messages; older lines are\n"
+            "  dropped rather than growing without bound on a small data disk.\n"
+            "  This is the boot log, not the audit chain -- `audit` is the record\n"
+            "  of what was DONE, and it is hash-chained. This is what the machine\n"
+            "  SAID while starting up.");
+        return 0;
+    }
+
+    size_t want = 0;                      /* 0 = everything */
+    if (a->n >= 3 && strcmp(a->v[1], "-n") == 0) {
+        want = (size_t)strtoul(a->v[2], NULL, 10);
+        if (want == 0) want = 1;
+    } else if (a->n >= 2) {
+        snprintf(err, ecap, "usage: log [-n N]");
+        return 1;
+    }
+
+    /* static: the shell's stack is already the thinnest part of the image */
+    static char buf[16 * 1024 + 64];
+    size_t n = 0;
+    const aios_status st = aios_dur_read("boot.log", buf, sizeof buf, &n);
+
+    /* A ring file that does not exist yet is EMPTY, not unavailable: that is the
+     * state of every store before the first boot message. Reporting it as an
+     * error would make `log` fail on a clean system, which is a worse lie than
+     * the one this distinction exists to prevent. */
+    if (st != AIOS_OK && !aios_dur_exists("boot.log")) {
+        *text_out = strdup("log: the boot ring is empty (this store has no boot.log yet)");
+        return 0;
+    }
+    if (st != AIOS_OK) {
+        snprintf(err, ecap,
+                 "log: the boot ring is unavailable (%s)\n"
+                 "  this is NOT the same as an empty log: PID 1 could not read\n"
+                 "  boot.log from the store, so what happened at boot was not\n"
+                 "  recorded where this could find it",
+                 st == AIOS_ERR_ARG ? "bad path" : "read failed");
+        return 1;
+    }
+    if (n == 0) {
+        *text_out = strdup("log: the boot ring is empty (no messages recorded)");
+        return 0;
+    }
+    if (n >= sizeof buf) n = sizeof buf - 1;
+    buf[n] = 0;
+
+    if (want == 0) {
+        *text_out = strdup(buf);
+        return 0;
+    }
+    /* last `want` lines */
+    size_t lines = 0, pos = 0, start = 0;
+    for (size_t i = 0; i < n; i++) if (buf[i] == '\n') lines++;
+    if (lines <= want) { *text_out = strdup(buf); return 0; }
+    const size_t skip = lines - want;
+    size_t seen = 0;
+    for (pos = 0; pos < n; pos++) {
+        if (buf[pos] == '\n' && ++seen == skip) { start = pos + 1; break; }
+    }
+    *text_out = strdup(buf + start);
+    (void)sh;
+    return 0;
+}
+
 static int builtin_dur(sh_shell *sh, sargv *a, char **text_out,
                        char *err, size_t ecap) {
     (void)err; (void)ecap;
@@ -3819,6 +3899,7 @@ static int run_command(sh_shell *sh, scmd *c, aios_origin origin,
     if (strcmp(c0, "lm") == 0)      return builtin_lm(sh, a, text_out, err, ecap);
     if (strcmp(c0, "autopilot") == 0) return builtin_autopilot(sh, a, text_out, err, ecap);
     if (strcmp(c0, "tune") == 0)    return builtin_tune(sh, a, text_out, err, ecap);
+    if (strcmp(c0, "log") == 0)     return builtin_log(sh, a, text_out, err, ecap);
     if (strcmp(c0, "dur") == 0)     return builtin_dur(sh, a, text_out, err, ecap);
     if (strcmp(c0, "audit") == 0)   return builtin_audit(sh, a, text_out, err, ecap);
     if (strcmp(c0, "snap") == 0)    return builtin_snap(sh, a, text_out, err, ecap);

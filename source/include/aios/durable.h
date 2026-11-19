@@ -57,6 +57,10 @@ aios_status aios_dur_write_atomic(const char *rel, const char *data,
 /* Append-only journal write: O_APPEND + fsync + directory fsync. */
 aios_status aios_dur_append(const char *rel, const char *data, size_t len);
 
+/* C4: does the store file exist? Lets a caller say "empty" rather than "error"
+ * for a file that has simply never been written. */
+bool aios_dur_exists(const char *rel);
+
 /* Read a store file into out (up to cap bytes); *out_len gets the size. */
 aios_status aios_dur_read(const char *rel, char *out, size_t cap,
                           size_t *out_len);
