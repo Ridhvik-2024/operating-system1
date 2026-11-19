@@ -126,7 +126,14 @@ have1 'AIOS-BOOT-OK selftest=PASS'
 have1 'autopilot governor: pid'
 have1 'C1 self-test: killing governor pid'
 have1 'governor died (killed by signal 9) - respawning'
-have1 'autopilot governor: pid'
+# and the respawn itself: the third occurrence of a governor start line. grep -c
+# rather than a fourth have1, because the first two lines above already match
+# the same pattern and a plain assert would pass without a respawn happening.
+if [ "$(grep -c 'autopilot governor: pid' boot/build/boot-test1.log 2>/dev/null)" -ge 2 ]; then
+    echo "  OK   governor respawned after the kill (2+ start lines)"
+else
+    echo "  MISS governor was never respawned"; fail=1
+fi
 
 echo
 echo "[boot-test] phase 2: same disk — reboot and replay the journal"

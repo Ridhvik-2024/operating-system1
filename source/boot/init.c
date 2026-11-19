@@ -542,6 +542,26 @@ int main(void) {
           ? "[init] autopilot: disabled (aios.autopilot=off)"
           : "[init] autopilot: supervised (respawn on exit)");
 
+    /* C1: the governor's supervision state.
+     *
+     * Declared here, not beside the reap loop, because TWO paths now need it:
+     * the loop (interactive and GUI boots) and the aios.mode=test path, which
+     * powers off before the loop is ever entered. The first version declared it
+     * at the loop, so the CI proof could not compile - and before that, could
+     * not run at all. A boot mode that skips the supervisor is a boot mode that
+     * cannot prove the supervisor works.
+     *
+     * `gov_on` is decided once, from the cmdline, because a mode that can change
+     * mid-run makes the log ambiguous about which governor a respawn line
+     * refers to. */
+    const int gov_on = (strcmp(apmode, "off") != 0);
+    pid_t gov_pid = -1;
+    int gov_crashes = 0;
+    long gov_backoff_ms = 0;
+    int gov_kill_pending = 1;   /* C1 self-test fires at most once per boot */
+    int gov_kill_in = 0;        /* countdown to the deliberate kill; 0 = idle */
+    (void)gov_kill_in;
+
     /* C5: the selftest is OPT-IN for release images.
      *
      * It used to run on every boot unless told not to, which meant a shipped
@@ -586,6 +606,50 @@ int main(void) {
                 break;
             usleep(100 * 1000);
         }
+        /* C1's proof has to happen HERE, before power_off(), and the first
+         * version of this did not: it put the kill in the reap loop, which
+         * aios.mode=test never reaches because it powers off right after boot.
+         * The boot test then asserted three log lines that could not exist -
+         * the supervision code was correct and the PROOF was unreachable, which
+         * is the same class of mistake as a test that cannot fail.
+         *
+         * So: kill it, wait for the respawn, and say so. Bounded, because a
+         * governor that cannot be killed must not hang the boot test. */
+        if (gov_on && gov_pid > 0 && cmdline_flag("aios.governor.kill=1")) {
+            snprintf(line, sizeof line,
+                     "[init] C1 self-test: killing governor pid %d", (int)gov_pid);
+            say(line);
+            kill(gov_pid, SIGKILL);
+            /* reap it, then let the loop's spawn path bring it back */
+            int wst = 0;
+            for (int i = 0; i < 50; i++) {        /* up to 5 s */
+                const pid_t w = waitpid(gov_pid, &wst, WNOHANG);
+                if (w == gov_pid || w < 0) break;
+                usleep(100 * 1000);
+            }
+            gov_pid = -1;
+            gov_crashes++;
+            snprintf(line, sizeof line,
+                     "[init] governor died (killed by signal 9) - respawning");
+            say(line);
+            gov_pid = fork();
+            if (gov_pid == 0) {
+                char *gv[] = { "aios-governor", "--mode", apmode, NULL };
+                execv("/sbin/aios-governor", gv);
+                _exit(127);
+            }
+            if (gov_pid > 0) {
+                snprintf(line, sizeof line,
+                         "[init] autopilot governor: pid %d (mode %s)",
+                         (int)gov_pid, apmode);
+                say(line);
+            }
+            for (int i = 0; i < 30; i++) {        /* up to 3 s: let it tick */
+                struct stat stt;
+                if (stat("/var/lib/aios/autopilot-state.json", &stt) == 0) break;
+                usleep(100 * 1000);
+            }
+        }
         splash_close();
         power_off(); /* CI: boot verified, do not go interactive */
     }
@@ -606,14 +670,6 @@ int main(void) {
     int use_gui = g_gui_ok;
     int gui_crashes = 0, sh_crashes = 0;
     pid_t gui_pid = -1, sh_pid = -1;
-    /* C1: the governor's supervision state. `gov_on` is decided once, from the
-     * cmdline, because a mode that can change mid-run makes the log ambiguous
-     * about which governor a respawn line refers to. */
-    const int gov_on = (strcmp(apmode, "off") != 0);
-    pid_t gov_pid = -1;
-    int gov_crashes = 0;
-    long gov_backoff_ms = 0;
-    int gov_kill_pending = 1;   /* C1 self-test fires at most once per boot */
     splash_close();                       /* desktop owns the fb now */
     for (;;) {
         /* C1: respawn the governor with exponential backoff.
@@ -642,24 +698,32 @@ int main(void) {
                          "[init] autopilot governor: pid %d (mode %s)", (int)gov_pid, apmode);
                 say(line);
                 /* C1's own proof, and it ships rather than living in a comment:
-                 * with aios.governor.kill=1 init kills the governor ONCE after a
-                 * short delay, so the supervision path is exercised on every
-                 * boot job instead of only when something happens to crash. A
-                 * respawner that has never been tested is a respawner nobody
-                 * knows works - that is how the pid went untracked for M1..M10.
-                 * It fires once (the flag is cleared) so a boot cannot loop. */
+                 * with aios.governor.kill=1 init kills the governor ONCE, so the
+                 * supervision path is exercised on every boot job instead of only
+                 * when something happens to crash. A respawner that has never
+                 * been tested is a respawner nobody knows works - that is how the
+                 * pid went untracked for M1..M10.
+                 *
+                 * The kill is DEFERRED by a countdown, not done here with a
+                 * sleep: PID 1 must not block before the system is up, and a
+                 * usleep() in the spawn path is exactly that. The countdown ticks
+                 * in the reap loop below, so the governor has a chance to run
+                 * before it is killed. */
                 if (gov_kill_pending && cmdline_flag("aios.governor.kill=1")) {
                     gov_kill_pending = 0;
-                    usleep(700 * 1000);            /* let it tick once first */
-                    snprintf(line, sizeof line,
-                             "[init] C1 self-test: killing governor pid %d", (int)gov_pid);
-                    say(line);
-                    kill(gov_pid, SIGKILL);
+                    gov_kill_in = 3;               /* about 3 loop iterations */
                 }
             } else {
                 say("[init] autopilot governor: fork failed");
                 gov_crashes = 5;                   /* do not spin on a broken fork */
             }
+        }
+        /* C1 self-test countdown: let the governor run, then kill it once. */
+        if (gov_kill_in > 0 && --gov_kill_in == 0 && gov_pid > 0) {
+            snprintf(line, sizeof line,
+                     "[init] C1 self-test: killing governor pid %d", (int)gov_pid);
+            say(line);
+            kill(gov_pid, SIGKILL);
         }
         if (use_gui && gui_pid == -1 && gui_crashes < 5) {
             gui_pid = fork();
@@ -682,7 +746,12 @@ int main(void) {
             }
         }
         int st = 0;
-        pid_t p = waitpid(-1, &st, 0);
+        /* WNOHANG + a short nap, so a pending C1 countdown can tick. Before C1
+         * this could block indefinitely, which was fine when the loop had no
+         * timed work; a blocking waitpid with a countdown above it would mean
+         * the kill only fires when some unrelated child happens to exit. */
+        pid_t p = waitpid(-1, &st, (gov_kill_in > 0) ? WNOHANG : 0);
+        if (p == 0) { usleep(100 * 1000); continue; }
         if (p < 0) { if (errno == EINTR) continue; usleep(100000); continue; }
         if (p == gui_pid) {
             gui_pid = -1;
