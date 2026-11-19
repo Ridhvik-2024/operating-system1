@@ -133,6 +133,32 @@ user-visible; all of it is what lets everything else land safely.
 - **Exit:** kill the governor in a running OS → it comes back and says so; kill
   a tool worker mid-write → the store is intact.
 
+- **Status: DONE (v1.1).** All four cards landed; CI is green on 22.04 + 24.04
+  and in the two-boot QEMU job, where `aios.mode=test` + `aios.governor.kill=1`
+  makes init kill the governor, reap it, respawn it and print all three lines —
+  so the supervision path is *exercised* by CI rather than merely present.
+  - `C1` — the governor's pid is tracked, reaped by `waitpid`, and respawned
+    with backoff 200/1000/5000 ms, capped at 5 strikes. The respawn message
+    reports the status actually observed (`killed by signal N` / `exited rc=N` /
+    `wait timed out`) instead of the SIGKILL we intended to send.
+  - `C3` — advisory `flock` on the store's parent directory around every
+    multi-write, atomic replace and append. Honest scope: on Linux two
+    concurrent `O_APPEND` writes are already serialised, so the append test
+    cannot distinguish lock from no lock; the lock is what makes
+    *replace-and-fsync* and non-Linux portability safe.
+  - `C4` — a bounded `boot.log` ring, newest lines kept, oldest whole lines
+    dropped; the ring starts empty each boot rather than appending to the last
+    boot's, which would have shown lines from a different boot with no boundary
+    marker. `log` refuses to invent history: absent and unreadable are
+    distinguishable ("no boot.log yet" vs "unavailable: <reason>").
+  - `C5` — the self-test is opt-in; `aios.mode=test` implies it, `aios.selftest=0`
+    vetoes it.
+  - Two things this cost that are worth remembering: the image cap had to be
+    raised by 10 KB (three features × four statically-linked binaries), and C1's
+    first version *removed the governor's launch fork* — every boot logged
+    "supervised" while nothing was running. Only an assertion on the log line
+    caught it.
+
 **W0 total: 6–8 weeks. It produces no new feature a user can see, and it is the
 highest-leverage work in this document.**
 

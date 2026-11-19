@@ -751,3 +751,35 @@ the quadratic probe.
 **Reverse if:** someone exhibits a transform that keeps the attribute under an
 adversary allowed *any* function, not a linear or quadratic one. That would be a
 real result and this decision would be the thing to revisit.
+
+## D40 — 2026-11-16 — W0-C: a supervisor is only a supervisor if CI kills something
+**Status:** done (v1.1); supersedes the "governor dies silently" note in D38's
+M1–M10 recap.
+The governor's pid was never tracked, so a dead governor was indistinguishable
+from one that never started — a scheduler that vanishes with no symptom. C1
+tracks the pid, reaps with `waitpid`, respawns with backoff (200/1000/5000 ms,
+5 strikes), and reports the status it *observed*, not the SIGKILL it intended:
+`killed by signal N` / `exited rc=N` / `wait timed out, no status`. The last one
+matters, because a wedged governor is exactly the case that reaches it.
+**Why the proof lives in `aios.mode=test`.** The first version put the kill in
+the interactive reap loop. CI boots `aios.mode=test`, which powers off before
+that loop, so the three asserted lines could not exist in any CI run: correct
+code, unreachable proof. The kill now runs in the test-mode block before
+`power_off()`.
+**Cost — the bug that argues for this whole card.** Converting the launch to
+supervision, we replaced the `fork()` with a `say()`. From that commit on, no
+governor started on any boot, in any mode, while the log printed "autopilot:
+supervised (respawn on exit)". The original defect ran a service unobserved;
+ours announced supervision of nothing. Nothing in `make test`, the size guard or
+the build caught it — only `boot-test.sh` asserting a log line did. The launch
+and the respawn are now asserted separately, because a kill test that "fails"
+for a missing launch names the wrong cause.
+**Also settled:** `flock` on the store's parent directory covers multi-write,
+atomic-replace and append, but on Linux two concurrent `O_APPEND` writes are
+already serialised, so the append test cannot distinguish lock from no lock. Said
+so in the test rather than claiming otherwise. The boot ring starts empty each
+boot (an earlier version appended to the previous boot's log, showing lines from
+a different boot with no boundary marker), and `log` reports absent vs unreadable
+rather than inventing history.
+**Reverse if:** init moves to a real supervisor (`s6`/`systemd`-style) and the
+respawn logic leaves PID 1.
