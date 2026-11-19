@@ -73,7 +73,7 @@ boot_phase() {  # $1 = serial log path; returns 0 when the VM powered off
         -machine accel=tcg -m 512M -smp 2 \
         -kernel "$KERNEL" -initrd "$INITRD" \
         -drive "file=$DATAIMG,format=raw,if=virtio" \
-        -append "console=ttyS0 rdinit=/init aios.mode=test" \
+        -append "console=ttyS0 rdinit=/init aios.mode=test aios.governor.kill=1" \
         -display none -serial "file:$LOG" -monitor none \
         -no-reboot -nic none -daemonize -pidfile boot/build/qemu.pid
     if [ ! -s boot/build/qemu.pid ]; then
@@ -118,6 +118,14 @@ have1 'AIOS-DUR mounted=1'
 have1 'AIOS-SELFTEST: PASS'
 have1 'SELFTEST test_durable: PASS'
 have1 'AIOS-BOOT-OK selftest=PASS'
+# C1: the governor is supervised, and the supervision is EXERCISED. init kills
+# it deliberately (aios.governor.kill=1), so these three lines prove the whole
+# path - start, detect, respawn - rather than proving the governor happened to
+# start. Before C1 the pid was never recorded and a dead governor was
+# indistinguishable from one that had never been started.
+have1 'autopilot governor: pid'
+have1 'C1 self-test: killing governor pid'
+have1 'governor died (killed by signal 9) - respawning'
 have1 'autopilot governor: pid'
 
 echo

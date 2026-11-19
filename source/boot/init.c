@@ -48,8 +48,66 @@
 
 static FILE *con;
 
+/* ---- C4: a boot log that outlives the console ---------------------------
+ *
+ * `say()` used to write ONLY to the console. That is fine while the splash is
+ * up and useless the moment it closes: the desktop takes over the screen, and
+ * every boot message is gone - not merely hidden, gone. The one class of message
+ * a user most needs ("the governor died", "the mount failed", "rollback
+ * refused") was the class that had no record anywhere.
+ *
+ * So every line is appended to a RING on the durable store as well. The ring is
+ * a fixed-size file rewritten when it fills, NOT an ever-growing journal: a boot
+ * log that grows without bound on a 8 MiB data disk eventually becomes the
+ * reason a boot fails, which is a joke with a bad ending. 16 KiB holds a few
+ * hundred boot lines and costs nothing.
+ *
+ * The write is best effort and NEVER fatal. Init must not refuse to boot because
+ * its log file could not be written; if the ring is unavailable the console
+ * still gets the line, and `log` says the ring is unavailable rather than
+ * pretending it is empty. */
+#define LOG_RING_REL  "boot.log"
+#define LOG_RING_CAP  (16 * 1024)
+static char  g_ring[LOG_RING_CAP];
+static size_t g_ring_n;
+static int   g_ring_ok = -1;          /* -1 unknown, 0 unavailable, 1 usable */
+
+static void ring_load(void) {
+    if (g_ring_ok >= 0) return;
+    size_t n = 0;
+    g_ring_ok = (aios_dur_read(LOG_RING_REL, g_ring, sizeof g_ring, &n) == AIOS_OK);
+    g_ring_n = (g_ring_ok && n <= sizeof g_ring) ? n : 0;
+    if (!g_ring_ok) g_ring_n = 0;
+}
+
+static void ring_put(const char *s) {
+    ring_load();
+    if (!g_ring_ok) return;           /* the console is still a record of sorts */
+    const size_t need = strlen(s) + 1;             /* + newline */
+    if (need >= LOG_RING_CAP) return;              /* a single absurd line */
+    if (g_ring_n + need > LOG_RING_CAP) {
+        /* drop the oldest whole lines until it fits: a ring shows the newest */
+        size_t drop = 0;
+        while (drop < g_ring_n && g_ring_n - drop + need > LOG_RING_CAP) {
+            const char *nl = memchr(g_ring + drop, '\n', g_ring_n - drop);
+            if (!nl) { drop = g_ring_n; break; }
+            drop = (size_t)(nl - g_ring) + 1;
+        }
+        memmove(g_ring, g_ring + drop, g_ring_n - drop);
+        g_ring_n -= drop;
+    }
+    memcpy(g_ring + g_ring_n, s, need - 1);
+    g_ring_n += need - 1;
+    g_ring[g_ring_n++] = '\n';
+    /* Best-effort and deliberately not fsynced per line: a boot log is useful
+       after a crash but is not worth a disk sync on every message. The ring is
+       rewritten whole, so a torn write loses the log, not the boot. */
+    (void)aios_dur_write_atomic(LOG_RING_REL, g_ring, g_ring_n);
+}
+
 static void say(const char *s) {
     if (con) { fputs(s, con); fputc('\n', con); fflush(con); }
+    ring_put(s);
 }
 
 static void mount_fs(const char *src, const char *tgt, const char *type,
@@ -471,31 +529,43 @@ int main(void) {
     /* M7 autopilot: start the closed-loop scheduler governor. */
     char apmode[32] = "balanced";
     cmdline_value("aios.autopilot", apmode, sizeof apmode);
-    if (strcmp(apmode, "off") == 0) {
-        say("[init] autopilot: disabled (aios.autopilot=off)");
-    } else {
-        pid_t g = fork();
-        if (g == 0) {
-            char *gv[] = { "aios-governor", "--mode", apmode, NULL };
-            execv("/sbin/aios-governor", gv);
-            _exit(127);
-        }
-        snprintf(line, sizeof line,
-                 "[init] autopilot governor: pid %d (mode %s)", (int)g, apmode);
-        say(line);
-    }
+    /* C1: the governor is SUPERVISED, not merely started.
+     *
+     * Until now this fork() was fire-and-forget: init never recorded the pid, so
+     * the reap loop treated the governor as "some other child" and a dead
+     * governor was indistinguishable from a governor that never existed. The
+     * scheduler silently vanished and the desktop kept running as if it were
+     * still being scheduled - a failure with no symptom, which is the worst
+     * kind. The pid and the mode now live in the reap loop below, next to the
+     * desktop and the console shell, and are respawned on the same terms. */
+    say(strcmp(apmode, "off") == 0
+          ? "[init] autopilot: disabled (aios.autopilot=off)"
+          : "[init] autopilot: supervised (respawn on exit)");
 
+    /* C5: the selftest is OPT-IN for release images.
+     *
+     * It used to run on every boot unless told not to, which meant a shipped
+     * image spent the first seconds of every boot running 20 test suites that a
+     * user cannot act on and cannot see. The suites are the proof the PROJECT
+     * ships; they are not a thing the PRODUCT does.
+     *
+     * It still runs whenever it is asked for, and `aios.mode=test` (what CI and
+     * boot-test.sh pass) implies asking for it, so the coverage that matters is
+     * unchanged. A release boot now says one line instead of several hundred. */
     int selftest_fail = 0;
-    if (!cmdline_flag("aios.selftest=0")) {
-        splash_phase("selftest: M1-M10 suites running");
-        say("[init] phase 1/2: AI-OS selftest (M1-M10 unit + integration suite)");
+    const int selftest_on = cmdline_flag("aios.selftest=1") ||
+                            (cmdline_flag("aios.mode=test") && !cmdline_flag("aios.selftest=0"));
+    if (selftest_on) {
+        splash_phase("selftest: M1-M11 suites running");
+        say("[init] phase 1/2: AI-OS selftest (M1-M11 unit + integration suite)");
         char *st_argv[] = { "aios-selftest", NULL };
         int rc = run("/usr/bin/aios-selftest", st_argv);
         selftest_fail = (rc != 0);
         fprintf(con, "[init] selftest %s (rc=%d)\n",
                 selftest_fail ? "FAILED" : "PASSED", rc);
     } else {
-        say("[init] selftest skipped (aios.selftest=0)");
+        say("[init] selftest not requested (release boot; pass aios.selftest=1 "
+            "or aios.mode=test to run it)");
     }
 
     splash_phase("system bring-up via aiosh (AI shell)");
@@ -536,8 +606,61 @@ int main(void) {
     int use_gui = g_gui_ok;
     int gui_crashes = 0, sh_crashes = 0;
     pid_t gui_pid = -1, sh_pid = -1;
+    /* C1: the governor's supervision state. `gov_on` is decided once, from the
+     * cmdline, because a mode that can change mid-run makes the log ambiguous
+     * about which governor a respawn line refers to. */
+    const int gov_on = (strcmp(apmode, "off") != 0);
+    pid_t gov_pid = -1;
+    int gov_crashes = 0;
+    long gov_backoff_ms = 0;
+    int gov_kill_pending = 1;   /* C1 self-test fires at most once per boot */
     splash_close();                       /* desktop owns the fb now */
     for (;;) {
+        /* C1: respawn the governor with exponential backoff.
+         *
+         * The cap is 5, like the desktop and the shell, but the reason is
+         * different: a governor that dies instantly and is respawned instantly
+         * is a fork bomb with a scheduler attached. Backoff caps at 5 s, and the
+         * 5th failure stops trying - at that point the log line is more useful
+         * than another attempt. */
+        if (gov_on && gov_pid == -1 && gov_crashes < 5) {
+            if (gov_backoff_ms > 0) {
+                snprintf(line, sizeof line,
+                         "[init] governor restarts in %ld ms (attempt %d of 5)",
+                         gov_backoff_ms, gov_crashes + 1);
+                say(line);
+                usleep((useconds_t)gov_backoff_ms * 1000);
+            }
+            gov_pid = fork();
+            if (gov_pid == 0) {
+                char *gv[] = { "aios-governor", "--mode", apmode, NULL };
+                execv("/sbin/aios-governor", gv);
+                _exit(127);
+            }
+            if (gov_pid > 0) {
+                snprintf(line, sizeof line,
+                         "[init] autopilot governor: pid %d (mode %s)", (int)gov_pid, apmode);
+                say(line);
+                /* C1's own proof, and it ships rather than living in a comment:
+                 * with aios.governor.kill=1 init kills the governor ONCE after a
+                 * short delay, so the supervision path is exercised on every
+                 * boot job instead of only when something happens to crash. A
+                 * respawner that has never been tested is a respawner nobody
+                 * knows works - that is how the pid went untracked for M1..M10.
+                 * It fires once (the flag is cleared) so a boot cannot loop. */
+                if (gov_kill_pending && cmdline_flag("aios.governor.kill=1")) {
+                    gov_kill_pending = 0;
+                    usleep(700 * 1000);            /* let it tick once first */
+                    snprintf(line, sizeof line,
+                             "[init] C1 self-test: killing governor pid %d", (int)gov_pid);
+                    say(line);
+                    kill(gov_pid, SIGKILL);
+                }
+            } else {
+                say("[init] autopilot governor: fork failed");
+                gov_crashes = 5;                   /* do not spin on a broken fork */
+            }
+        }
         if (use_gui && gui_pid == -1 && gui_crashes < 5) {
             gui_pid = fork();
             if (gui_pid == 0) {
@@ -579,7 +702,36 @@ int main(void) {
                 sh_crashes = 0;
             } else
                 say("[init] respawning console shell (aiosh)");
+        } else if (p == gov_pid) {
+            /* C1: say WHICH failure this was. "died" and "exited 0" are
+             * different bugs, and a supervisor that reports neither is a
+             * supervisor that hides them. */
+            gov_pid = -1;
+            /* No statement-expression here: this file has to compile under
+             * clang as well as gcc, and ({ ... }) is a GNU extension. */
+            char how[48];
+            if (WIFSIGNALED(st))
+                snprintf(how, sizeof how, "killed by signal %d", WTERMSIG(st));
+            else if (WIFEXITED(st))
+                snprintf(how, sizeof how, "exit status %d", WEXITSTATUS(st));
+            else
+                snprintf(how, sizeof how, "unknown wait status");
+
+            if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+                gov_crashes = 0;
+                gov_backoff_ms = 0;
+                say("[init] governor exited cleanly (rc=0) - respawning");
+            } else {
+                gov_crashes++;
+                gov_backoff_ms = (gov_crashes >= 3) ? 5000
+                               : (gov_crashes == 2) ? 1000 : 200;
+                snprintf(line, sizeof line,
+                         "[init] governor died (%s) - respawning", how);
+                say(line);
+                if (gov_crashes >= 5)
+                    say("[init] governor failed 5 times - no longer respawning");
+            }
         }
-        /* reaped other children (governor, tool workers) — fine */
+        /* reaped other children (tool workers, one-shot helpers) — fine */
     }
 }
