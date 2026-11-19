@@ -26,7 +26,7 @@ LIB_SRCS  := src/json.c src/types.c src/aiproc.c src/sembus.c \
 	     src/agent.c \
 	     src/cortex.c src/shell.c src/shroute.c src/ksched.c src/ebpf.c src/hardening.c \
 	     src/microlm.c src/autopilot.c src/durable.c \
-	     src/stoich.c src/firewall.c \
+	     src/stoich.c src/firewall.c src/nullspace.c \
 	     src/fb.c src/win.c src/input.c
 LIB       := boot/build/libaios.a
 # Host-only tests: they need /dev/shm or a compiler, or they would have to write
@@ -71,7 +71,12 @@ HOST_ONLY_TESTS := test_supervisor
 # does not know about the new .c", which is precisely how M10 announced itself.
 # Keeping test_stoich out of HOST_ONLY keeps that check alive. Only the 35,024
 # bytes of its compressed payload stay out of the capped image.
-LINK_ONLY_TESTS := test_stoich
+# test_nullspace joins it for the same reason, one milestone later: it is
+# arithmetic over a synthetic corpus it generates itself, it reads no /dev, opens
+# no socket, and asserts nothing about the booted machine. Running it in the
+# initramfs would re-test the host build with the same compiler and libc. It is
+# still LINKED, which is what catches a source-list omission like M10's.
+LINK_ONLY_TESTS := test_stoich test_nullspace
 # TEST_BINS holds `boot/build/test_x`, not `test_x`, so filtering on the bare
 # name silently matched nothing. Spell the prefix once, here, so the install
 # rule cannot get this wrong again -- the first version did, and the suite was

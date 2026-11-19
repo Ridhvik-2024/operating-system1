@@ -12,7 +12,7 @@ LIB_SRCS  := src/json.c src/types.c src/aiproc.c src/sembus.c \
 	     src/agent.c \
 	     src/cortex.c src/shell.c src/shroute.c src/ksched.c src/ebpf.c src/hardening.c \
 	     src/microlm.c src/autopilot.c src/durable.c \
-	     src/stoich.c src/firewall.c \
+	     src/stoich.c src/firewall.c src/nullspace.c \
 	     src/fb.c src/win.c src/input.c
 LIB_OBJS  := $(LIB_SRCS:.c=.o)
 LIB       := libaios.a
