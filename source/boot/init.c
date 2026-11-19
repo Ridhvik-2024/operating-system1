@@ -544,10 +544,6 @@ int main(void) {
      * still being scheduled - a failure with no symptom, which is the worst
      * kind. The pid and the mode now live in the reap loop below, next to the
      * desktop and the console shell, and are respawned on the same terms. */
-    say(strcmp(apmode, "off") == 0
-          ? "[init] autopilot: disabled (aios.autopilot=off)"
-          : "[init] autopilot: supervised (respawn on exit)");
-
     /* C1: the governor's supervision state.
      *
      * Declared here, not beside the reap loop, because TWO paths now need it:
@@ -565,6 +561,37 @@ int main(void) {
     int gov_crashes = 0;
     long gov_backoff_ms = 0;
     int gov_kill_pending = 1;   /* C1 self-test fires at most once per boot */
+
+    if (strcmp(apmode, "off") == 0) {
+        say("[init] autopilot: disabled (aios.autopilot=off)");
+    } else {
+        /* The initial start. The RESPAWN lives in the reap loop (and in the
+         * test-mode block below), which is why the pid has to be visible to
+         * both - see the state declarations further down.
+         *
+         * This fork was briefly MISSING. When C1 replaced the fire-and-forget
+         * launch with supervision, the launch itself was replaced by a say()
+         * and nothing started a governor at all; CI caught it because
+         * boot-test.sh asserts "autopilot governor: pid" and that line had
+         * simply stopped being printed. A supervisor that supervises nothing is
+         * not a smaller bug than an unsupervised service - it is a worse one,
+         * because the log claims the service is running. */
+        gov_pid = fork();
+        if (gov_pid == 0) {
+            char *gv[] = { "aios-governor", "--mode", apmode, NULL };
+            execv("/sbin/aios-governor", gv);
+            _exit(127);
+        }
+        if (gov_pid > 0) {
+            snprintf(line, sizeof line,
+                     "[init] autopilot governor: pid %d (mode %s)", (int)gov_pid, apmode);
+            say(line);
+        } else {
+            say("[init] autopilot governor: fork failed");
+            gov_crashes = 5;
+        }
+    }
+
 
     /* C5: the selftest is OPT-IN for release images.
      *

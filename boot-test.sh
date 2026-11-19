@@ -123,7 +123,14 @@ have1 'AIOS-BOOT-OK selftest=PASS'
 # path - start, detect, respawn - rather than proving the governor happened to
 # start. Before C1 the pid was never recorded and a dead governor was
 # indistinguishable from one that had never been started.
-have1 'autopilot governor: pid'
+# The launch is asserted SEPARATELY from the respawn. C1 briefly shipped
+# without the initial fork at all - the supervisor code was there and nothing
+# started a governor - and only this line would have caught it directly.
+if [ "$(grep -c 'autopilot governor: pid' boot/build/boot-test1.log 2>/dev/null)" -ge 1 ]; then
+    echo "  OK   governor started"
+else
+    echo "  MISS governor never started"; fail=1
+fi
 have1 'C1 self-test: killing governor pid'
 have1 'governor died (killed by signal 9) - respawning'
 # and the respawn itself: the third occurrence of a governor start line. grep -c
