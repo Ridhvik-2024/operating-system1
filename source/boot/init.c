@@ -652,16 +652,36 @@ int main(void) {
             say(line);
             kill(gov_pid, SIGKILL);
             /* reap it, then let the loop's spawn path bring it back */
-            int wst = 0;
+            int wst = 0, reaped = 0;
             for (int i = 0; i < 50; i++) {        /* up to 5 s */
                 const pid_t w = waitpid(gov_pid, &wst, WNOHANG);
-                if (w == gov_pid || w < 0) break;
+                if (w == gov_pid) { reaped = 1; break; }
+                if (w < 0) break;                 /* ECHILD etc: nothing to report */
                 usleep(100 * 1000);
             }
             gov_pid = -1;
             gov_crashes++;
-            snprintf(line, sizeof line,
-                     "[init] governor died (killed by signal 9) - respawning");
+            /* Report what ACTUALLY happened rather than the number we expected.
+             * This line used to hardcode "signal 9" because this block is where
+             * we send SIGKILL - but the message is printed even when the wait
+             * above timed out or failed, and then "killed by signal 9" is a
+             * thing we did not observe. A supervisor whose report is the
+             * intended reason instead of the observed one is not reporting. */
+            if (!reaped)
+                snprintf(line, sizeof line,
+                         "[init] governor died (wait timed out, no status) - respawning");
+            else if (WIFSIGNALED(wst))
+                snprintf(line, sizeof line,
+                         "[init] governor died (killed by signal %d) - respawning",
+                         WTERMSIG(wst));
+            else if (WIFEXITED(wst))
+                snprintf(line, sizeof line,
+                         "[init] governor died (exited rc=%d) - respawning",
+                         WEXITSTATUS(wst));
+            else
+                snprintf(line, sizeof line,
+                         "[init] governor died (status 0x%x, cause unknown) - respawning",
+                         (unsigned)wst);
             say(line);
             gov_pid = fork();
             if (gov_pid == 0) {
