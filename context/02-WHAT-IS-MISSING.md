@@ -177,6 +177,18 @@ not.
   that runs as one uid — a compromised `aiosh` could call `sh_exec()` and claim to
   be a person. Clause (2) is what makes the tag unforgeable, and it is not done.
 
+  **Status at the end of W0 (2026-11-16): still the open S1 gap.** W0-A, W0-B
+  and W0-C are complete and CI proves each of them; W0's stated bar of "0 known
+  S1 gaps" is therefore NOT met, and G6 is the reason. W0-C incidentally made the
+  supervisor worth trusting - init now tracks the governor's pid, reaps it,
+  respawns it and reports the status it actually observed - but a supervisor
+  inside the same trust domain as the thing it supervises still is not a
+  boundary. The fix is unchanged: clause (2), AI work under a separate uid/gid
+  in a user namespace with `no_new_privs`, and PID 1 behind a fixed request
+  protocol instead of forking peers. Proof obligation: a test that runs an action
+  as the AI uid and shows the promote path refusing it *because of the uid*, not
+  because of the tag it was handed. Until that test exists, this stays open.
+
 ### G7 — Input arbitration: MISSING · **S2**
 - **Claim**: human input always preempts AI input, mediated by a host arbiter;
   the AI never injects input; "cursor fights" are a critical failure.
@@ -374,7 +386,7 @@ prerequisite for that and is currently zero (all modules are x86_64 `.ko`).
 | G3 | Sandbox result + diff | S1 | promotion decisions |
 | G4 | Staged writes / tombstones | S1 | "AI never writes reality" |
 | G5 | Snapshots + rollback | S1 | "rollback is physics" |
-| G6 | Authority model / trust split | S1 | human override — ◐ **origin tagging done (M7); uid split + unforgeable tag still open** |
+| G6 | Authority model / trust split | S1 | human override — ◐ **origin tagging done (M7); uid split + unforgeable tag still open — THIS IS THE ONLY REMAINING S1 GAP** |
 | G8 | Tamper-evident audit | S1 | auditability |
 | G9 | Consent / capability gates | S1 | hardware + irreversible actions |
 | G7 | Input arbitration | S2 | safe GUI automation (not yet built) |
