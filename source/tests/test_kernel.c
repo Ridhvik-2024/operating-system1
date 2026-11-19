@@ -6,6 +6,7 @@
  * ordinary dev hosts (partial support).
  */
 #include "t.h"
+#include <limits.h>   /* PATH_MAX: the staging root is resolved here */
 #include "aios/ksched.h"
 #include "aios/ebpf.h"
 #include "aios/hardening.h"
@@ -155,7 +156,7 @@ static void run(void) {
         pid_t p = fork();
         if (p == 0) {
             char why[128];
-            int bits = aios_hardening_apply(NULL, why, sizeof why);
+            int bits = aios_hardening_apply(NULL, NULL, why, sizeof why);
             if (!(bits & AIOS_HARD_SECCOMP)) _exit(42); /* unavailable */
             int s = socket(AF_INET, SOCK_STREAM, 0);
             (void)s;
@@ -173,7 +174,7 @@ static void run(void) {
         p = fork();
         if (p == 0) {
             char why[128];
-            aios_hardening_apply(NULL, why, sizeof why);
+            aios_hardening_apply(NULL, NULL, why, sizeof why);
             FILE *f = fopen("build/seccomp-ok.txt", "w");
             if (!f) _exit(1);
             fputs("hello", f);
@@ -200,17 +201,25 @@ static void run(void) {
         (void)!system("mkdir -p build/ll-jail");
         FILE *f = fopen("build/ll-jail/inside.txt", "w");
         if (f) { fputs("in", f); fclose(f); }
+        /* The outside path must EXIST and be outside the jail, or the kernel
+         * answers ENOENT before any LSM gets a say - which is not a denial.
+         * /etc/passwd exists on every Linux host and in the image; the old
+         * code used /sbin/aiosh, which only exists inside the image, so this
+         * check failed on every host for the wrong reason. */
+        if (access("/etc/passwd", R_OK) != 0) {
+            SKIP("landlock: no outside file to probe (/etc/passwd missing)");
+        } else {
         pid_t p = fork();
         if (p == 0) {
             if (chdir("build") != 0) _exit(3);
             char why[128];
-            int bits = aios_hardening_apply("ll-jail", why, sizeof why);
+            int bits = aios_hardening_apply("ll-jail", NULL, why, sizeof why);
             if (!(bits & AIOS_HARD_LANDLOCK)) _exit(42); /* unavailable */
             int fd = open("ll-jail/inside.txt", O_RDONLY);
             int ok_in = (fd >= 0);
             int in_err = errno;
             if (fd >= 0) close(fd);
-            int fd2 = open("/sbin/aiosh", O_RDONLY); /* outside: must fail */
+            int fd2 = open("/etc/passwd", O_RDONLY); /* outside: must fail */
             int out_err = errno;
             int blocked_out = (fd2 < 0 && (errno == EACCES || errno == EPERM));
             if (fd2 >= 0) close(fd2);
@@ -225,6 +234,90 @@ static void run(void) {
         } else {
             CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0,
                   "landlock: jail readable, /etc/passwd blocked");
+        }
+        }
+    }
+
+
+    /* ---- 5b. Landlock + M3 staging: the second writable root ---- *
+     *
+     * This is a regression test for a bug that no unit test caught and that
+     * silently disabled a feature: the sandbox allowed writes only inside the
+     * jail, and M3's staged writes go to <store>/staging/<id>/upper, which is
+     * outside it. Under AIOS_SANDBOX_HARD every honest AI write therefore died
+     * with SIGSYS before touching the filesystem -- and because the shell
+     * pre-notes declared writes, `staged` still showed a row and `promote`
+     * answered "promoted 0 files". A human was told a change was waiting that
+     * had never existed.
+     *
+     * Three properties, all of which must hold at once, which is why they are
+     * one test: the staging root is writable, the jail is NOT widened to the
+     * whole store, and the containment check still refuses to leave the stage.
+     */
+    if (!have_landlock()) {
+        SKIP("landlock unavailable: staging-root rule untested");
+    } else {
+        (void)!system("rm -rf build/ll-stage && mkdir -p build/ll-stage/jail "
+                      "build/ll-stage/store/staging/s1/upper "
+                      "build/ll-stage/store/other");
+        pid_t p = fork();
+        if (p == 0) {
+            char why[192] = {0};
+            char stageabs[PATH_MAX];
+            if (!realpath("build/ll-stage/store/staging/s1", stageabs)) _exit(11);
+            int bits = aios_hardening_apply("build/ll-stage/jail", stageabs,
+                                            why, sizeof why);
+            if (!(bits & AIOS_HARD_LANDLOCK)) _exit(42);
+
+            /* (a) the staging root accepts a new file: this is the write M3
+             *     needs, and the one that used to fail. */
+            char f1[512];
+            snprintf(f1, sizeof f1, "%s/upper/staged.txt", stageabs);
+            FILE *f = fopen(f1, "w");
+            if (!f) _exit(21);
+            fputs("staged\n", f);
+            fclose(f);
+
+            /* (b) the rest of the store is NOT writable. The fix must grant the
+             *     staging directory, not the store it lives in -- otherwise
+             *     "add a second root" becomes "open the whole thing". */
+            FILE *f2 = fopen("build/ll-stage/store/other/leak.txt", "w");
+            if (f2) { fclose(f2); _exit(22); }
+
+            /* (c) and the jail is still usable, so the sandbox did not simply
+             *     break everything. */
+            FILE *f3 = fopen("build/ll-stage/jail/inside.txt", "w");
+            if (!f3) _exit(23);
+            fputs("in\n", f3);
+            fclose(f3);
+            _exit(0);
+        }
+        int st = 0;
+        waitpid(p, &st, 0);
+        if (WIFEXITED(st) && WEXITSTATUS(st) == 42) {
+            SKIP("landlock restrict failed: staging rule untested");
+        } else if (WIFSIGNALED(st)) {
+            /* A signal here means a syscall the filter forbids, which is the
+             * original failure's shape: report it as such rather than as a
+             * mysterious rc. */
+            char m[120];
+            snprintf(m, sizeof m,
+                     "staging write under landlock died on signal %d (seccomp)",
+                     WTERMSIG(st));
+            CHECK(0, m);
+        } else {
+            CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0,
+                  "landlock: staging root writable, store and jail as intended");
+        }
+        /* Asserted from the parent, where the tree is visible: a child that
+         * exited 0 without writing would pass the line above. */
+        {
+            FILE *a = fopen("build/ll-stage/store/staging/s1/upper/staged.txt", "r");
+            CHECK(a != NULL, "the staged file really landed in upper/");
+            if (a) fclose(a);
+            FILE *b = fopen("build/ll-stage/store/other/leak.txt", "r");
+            CHECK(b == NULL, "and the rest of the store really was refused");
+            if (b) fclose(b);
         }
     }
 

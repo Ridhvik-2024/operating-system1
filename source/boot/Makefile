@@ -21,12 +21,73 @@ CFLAGS  ?= -std=c11 -Os -Wall -Wextra -Wshadow -D_GNU_SOURCE \
 LDFLAGS := -static -pthread -lm -Wl,--gc-sections
 
 LIB_SRCS  := src/json.c src/types.c src/aiproc.c src/sembus.c \
-	     src/mem.c src/tools.c src/sandbox.c src/agent.c src/cortex.c \
-	     src/shell.c src/shroute.c src/ksched.c src/ebpf.c src/hardening.c \
+	     src/action.c src/policy.c src/mem.c src/tools.c src/sandbox.c \
+	     src/stage.c src/snapshot.c src/supervisor.c src/audit.c src/effects.c \
+	     src/agent.c \
+	     src/cortex.c src/shell.c src/shroute.c src/ksched.c src/ebpf.c src/hardening.c \
 	     src/microlm.c src/autopilot.c src/durable.c \
+	     src/stoich.c src/firewall.c src/nullspace.c \
 	     src/fb.c src/win.c src/input.c
 LIB       := boot/build/libaios.a
-TEST_BINS := $(patsubst tests/%.c,boot/build/%,$(wildcard tests/test_*.c))
+# Host-only tests: they need /dev/shm or a compiler, or they would have to write
+# outside the image to test anything. Excluded from the IMAGE (not from
+# `make test`, where they run) so the size guard buys product, not harness.
+#
+# test_supervisor is the interesting one: it starts a supervisor of its own. In
+# the image PID 1 already serves that socket, and the suite's request budget and
+# socket path would fight it -- so the image skips it and the host runs it.
+# An exclusion has to be argued for, which is why it is named here and not a
+# wildcard.
+#
+# M10 adds test_stoich, for a different reason, and the numbers are the argument:
+#
+#   test_stoich is 782,768 bytes on disk and 35,024 bytes IN THIS SANDBOX'S
+#   COMPRESSED IMAGE (2,776,516 -> 2,741,492, measured by building both ways).
+#   CI's image was 2,988,700 against a 2,950,000 cap, i.e. 38,700 over.
+#
+#   Do NOT subtract one from the other: 35,024 is a local delta and 38,700 is a
+#   CI delta, and xz is not additive across toolchains. The first draft of this
+#   comment did exactly that and concluded "91% of the overage, ~3.7 KB still
+#   over" -- and CI then passed comfortably, so the arithmetic was wrong in the
+#   safe direction but wrong. The honest statement is: removing the suite
+#   cleared CI's overage, and locally it is worth 35,024 bytes.
+#
+#   Locally the same image is 173,484 bytes UNDER the cap; the cap is pinned from
+#   the larger toolchain, which is CI.
+#
+# It is the right exclusion beyond the size, though: the suite is pure integer
+# arithmetic over tables it builds itself. It reads no /dev, opens no socket,
+# starts no supervisor and asserts nothing about THIS machine. Running it inside
+# the initramfs re-tests the host's build with the same compiler on the same
+# libc; it cannot observe anything the image does differently. The boot proof
+# tests the image; this tests the mathematics. `make test` still runs it, and the
+# static binary is still built and linked here — so a change that breaks the image
+# link (which is exactly how this file was found) still fails the build.
+HOST_ONLY_TESTS := test_supervisor
+
+# Built and LINKED statically, but not installed into the image.
+#
+# The distinction matters: the link is what catches "boot/Makefile's source list
+# does not know about the new .c", which is precisely how M10 announced itself.
+# Keeping test_stoich out of HOST_ONLY keeps that check alive. Only the 35,024
+# bytes of its compressed payload stay out of the capped image.
+# test_nullspace joins it for the same reason, one milestone later: it is
+# arithmetic over a synthetic corpus it generates itself, it reads no /dev, opens
+# no socket, and asserts nothing about the booted machine. Running it in the
+# initramfs would re-test the host build with the same compiler and libc. It is
+# still LINKED, which is what catches a source-list omission like M10's.
+LINK_ONLY_TESTS := test_stoich test_nullspace
+# TEST_BINS holds `boot/build/test_x`, not `test_x`, so filtering on the bare
+# name silently matched nothing. Spell the prefix once, here, so the install
+# rule cannot get this wrong again -- the first version did, and the suite was
+# installed into the image while the Makefile appeared to exclude it.
+LINK_ONLY_BINS  := $(addprefix boot/build/,$(LINK_ONLY_TESTS))
+TEST_BINS := $(patsubst tests/%.c,boot/build/%,$(filter-out \
+              $(addprefix tests/,$(addsuffix .c,$(HOST_ONLY_TESTS))), \
+              $(wildcard tests/test_*.c)))
+# The M4 adversary ships with the image: test_shell and test_effects run inside
+# the booted system, and the image has no compiler to build it there.
+FIXTURE_BINS := boot/build/liar-worker boot/build/deaf-worker
 
 BOOT_DIR  := boot
 BLD       := boot/build
@@ -51,16 +112,11 @@ LIB_OBJS := $(patsubst src/%.c,$(BLD)/%.o,$(LIB_SRCS))
 $(LIB): $(LIB_OBJS)
 	ar rcs $@ $^
 
-# M10: generated font table + the two sources that consume it
-$(BLD)/font8x16.h: tools/gen_font.py
-	@mkdir -p $(BLD)
-	python3 tools/gen_font.py $@
-
-$(BLD)/fb.o $(BLD)/win.o $(BLD)/input.o: $(BLD)/font8x16.h
-
+# M10: the 8x16 font table is src/font8x16.h, committed (see the host
+# Makefile). No Python, no Pillow, no DejaVu fonts in the image build.
 $(BLD)/%.o: src/%.c $(wildcard include/aios/*.h) $(wildcard src/*.h)
 	@mkdir -p $(BLD)
-	$(CC) $(CFLAGS) -Iinclude -I$(BLD) -MMD -c -o $@ $<
+	$(CC) $(CFLAGS) -Iinclude -MMD -c -o $@ $<
 
 $(BLD)/aios-init: $(BOOT_DIR)/init.c $(LIB)
 	$(CC) $(CFLAGS) -Iinclude -o $@ $< $(LIB) $(LDFLAGS)
@@ -103,9 +159,20 @@ $(BLD)/assets/%.aiosimg: desktop/assets/%.png tools/img2aiosimg.py
 	@mkdir -p $(BLD)/assets
 	python3 tools/img2aiosimg.py $< $@
 
+# A test fixture, built by the same toolchain as everything else and installed
+# next to the tests it belongs to.
+# Fixtures get the SAME link flags as everything else in the image. A fixture
+# linked dynamically cannot run in an initramfs that has no libc: the shell says
+# "not found", which reads like a missing file rather than a missing loader, and
+# the suite that uses it fails with status 127 for a reason that has nothing to do
+# with what it is testing.
+boot/build/%: tests/fixtures/%.c
+	@mkdir -p $(BLD)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+
 $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	   $(BLD)/aios-memctl $(BLD)/tool-exec $(BLD)/aios-governor \
-	   $(BLD)/aios-desktop $(TEST_BINS) \
+	   $(BLD)/aios-desktop $(TEST_BINS) $(FIXTURE_BINS) \
 	   $(BOOT_DIR)/aios-selftest.sh $(BOOT_DIR)/boot.aiosh \
 	   $(BOOT_DIR)/devnodes.txt $(KERNEL) $(BUSYBOX) $(BLD)/aios_intent.ko \
 	   $(MODULES) $(GPUMODS) $(ASSETS)
@@ -142,6 +209,7 @@ $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	@ln -sf busybox $(STAGE)/bin/sort
 	@ln -sf busybox $(STAGE)/bin/uniq
 	@ln -sf busybox $(STAGE)/bin/dirname
+	@ln -sf busybox $(STAGE)/bin/tr
 	@ln -sf busybox $(STAGE)/bin/touch
 	@ln -sf busybox $(STAGE)/bin/sleep
 	@ln -sf busybox $(STAGE)/bin/true
@@ -153,7 +221,9 @@ $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	@install -s -m 0755 $(BLD)/aios-governor $(STAGE)/sbin/aios-governor
 	@install -s -m 0755 $(BLD)/aios-desktop $(STAGE)/sbin/aios-desktop
 	@install -m 0644 $(MODULES) $(STAGE)/lib/modules/
-	@install -s -m 0755 $(TEST_BINS)      $(STAGE)/usr/lib/aios/tests/
+	@install -s -m 0755 $(filter-out $(LINK_ONLY_BINS),$(TEST_BINS)) \
+	   $(STAGE)/usr/lib/aios/tests/
+	@install -s -m 0755 $(FIXTURE_BINS)  $(STAGE)/usr/lib/aios/tests/
 	@install -m 0755 $(BOOT_DIR)/aios-selftest.sh $(STAGE)/usr/bin/aios-selftest
 	@install -m 0644 $(BOOT_DIR)/boot.aiosh $(STAGE)/etc/aios/boot.aiosh
 	@mkdir -p $(STAGE)/usr/lib/aios/gpu $(STAGE)/usr/lib/aios/assets
@@ -172,17 +242,53 @@ $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	@echo "   M10 raise: GPU/input module stack (16 gz modules, ~845KB) ships"
 	@echo "   once; new cap = first m10 image size + 128KB headroom, pinned"
 	@echo "   in boot/.m10-size-cap"
+	@echo "   M6 raise (+51,000): the chained audit (audit.c) and the supervisor add"
+	@echo "   code to three binaries, and CI's static link against a newer glibc is"
+	@echo "   ~4KB larger per binary than a developer's. The guard is enforced on"
+	@echo "   the whole image; the self-test fixtures are reported separately below"
+	@echo "   so that a future raise can say WHICH grew."
 	@if [ ! -f $(BOOT_DIR)/.m10-size-cap ]; then \
 	     s=$$(stat -c %s $@); echo $$((s + 131072)) > $(BOOT_DIR)/.m10-size-cap; \
-	     echo "   cap pinned: $$((s + 131072)) (first M10 build + 128KB)"; \
+	     echo "   cap pinned: $$((s + 131072)) (first build + 128KB headroom)"; \
+	     echo "   this file is tracked in git, so raising it is a reviewed commit:"; \
+	     echo "   that is the only form of this guard that can fail in CI"; \
 	 fi; \
+	 echo "   M11/W0-C raise (+10,000 on the M10 cap, 2950000 -> 2960000):"
+	 echo "     C1 governor supervision   init.c    +1,285 bytes of text"
+	 echo "     C4 boot ring + log builtin init.c/shell.c +1,351"
+	 echo "     C3 flock + tail reader    durable.c  +668"
+	 echo "   Three W0-C features - the last open items on the roadmap's exit"
+	 echo "   test - and they are paid for FOUR TIMES because this image is"
+	 echo "   statically linked: aiosh, aios-init, aios-governor and aios-desktop"
+	 echo "   each carry their own copy of durable.o. That amplification, not the"
+	 echo "   source size, is why ~3.5KB of C becomes ~4.1KB of image."
+	 echo "   The number is set from a MEASURED CI build (2,954,688) plus 5,312,"
+	 echo "   not extrapolated: the first attempt sized it at +2,000 from the"
+	 echo "   local delta and CI promptly came in 2,688 over, because CI's static"
+	 echo "   glibc is ~209KB larger and the difference is not constant."
+	 echo "   Deliberately NOT paid for by dropping a suite: all 17 installed"
+	 echo "   suites exercise something in the image (audit, sandbox, kernel,"
+	 echo "   durable), unlike test_stoich/test_nullspace which are pure"
+	 echo "   arithmetic and are already LINK_ONLY."
+	 echo "   (the cap is toolchain-dependent: a static link against a newer" ; \
+	 echo "    glibc is larger. Pin it from the LARGEST supported toolchain," ; \
+	 echo "    not from the smallest.)" ; \
 	 cap=$$(cat $(BOOT_DIR)/.m10-size-cap); size=$$(stat -c %s $@); \
 	 echo "   v1.1 initramfs: $$size bytes (cap $$cap)"; \
 	 if [ $$size -gt $$cap ]; then \
 	     echo "SIZE-GUARD FAIL: v1.1 image ($$size) exceeds M10 cap ($$cap)"; \
+	     echo "  over by $$((size - cap)) bytes. What grew is found with:"; \
+	     echo "    ls -lS $(STAGE)/sbin $(STAGE)/usr/bin | head"; \
+	     ls -lS $(STAGE)/sbin $(STAGE)/usr/bin 2>/dev/null | head -8; \
 	     exit 1; \
 	 fi; \
-	 echo "   size-guard OK ($$((cap - size)) bytes under cap)"
+	 echo "   size-guard OK ($$((cap - size)) bytes under cap)"; \
+	 tests_kb=$$(du -sk $(STAGE)/usr/lib/aios/tests 2>/dev/null | cut -f1); \
+	 whole_kb=$$(du -sk $(STAGE) | cut -f1); \
+	 echo "   of which the self-test fixtures: $${tests_kb:-0} KB of uncompressed" ; \
+	 echo "   $${whole_kb:-0} KB (they compress to a few hundred KB in the image)." ; \
+	 echo "   Stated so that 'the product grew' and 'the self-test grew' are told" ; \
+	 echo "   apart before either becomes an argument for raising the cap."
 
 boot-run: $(INITRD) boot/run-qemu.sh
 	bash boot/run-qemu.sh

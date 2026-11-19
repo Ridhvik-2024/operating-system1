@@ -1,3 +1,8 @@
+<!-- HISTORICAL: this document describes the pre-C, Rust design phase
+(an `ai_os_core/` crate with lib.rs / action_descriptor.rs). That crate
+is NOT part of this repository. The current architecture is C11 in
+source/, and the living memory is in context/. Kept for design history. -->
+
 # AI-OS Context Document (`ai_con.md`)
 
 

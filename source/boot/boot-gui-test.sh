@@ -21,6 +21,7 @@ OUT=boot/build/boot-gui.log
 MON=/tmp/aios-gui-mon.sock
 SHOT1=/tmp/aios-gui-idle.ppm
 SHOT2=/tmp/aios-gui-typed.ppm
+SHOT3=/tmp/aios-gui-pending.ppm
 PY=tools/gui_check.py
 
 QEMU=${AIOS_QEMU:-qemu-system-x86_64}
@@ -34,7 +35,7 @@ if [[ -d /tmp/qemu-root/usr/lib/x86_64-linux-gnu ]]; then
 fi
 export QEMU_MODULE_DIR=/tmp/qemu-root/usr/lib/x86_64-linux-gnu/qemu
 
-rm -f "$OUT" "$MON" "$SHOT1" "$SHOT2"
+rm -f "$OUT" "$MON" "$SHOT1" "$SHOT2" "$SHOT3"
 
 echo "[boot-gui] booting with bochs-display + keyboard + tablet (TCG)..."
 LD_LIBRARY_PATH="$LDLP" timeout "$TIMEOUT" "$QEMU" "${QL[@]}" \
@@ -103,6 +104,22 @@ if [ "$fail" = "0" ]; then
         python3 "$PY" verify "$SHOT2" 1280 800 has_42 "$SHOT1" || fail=1
     else
         echo "  MISS screendump 2"; fail=1
+    fi
+fi
+
+# ---- shot 3: the pending-changes window (M8) -------------------------
+# Opening it takes a click on the "N pending" badge in the launcher bar, so this
+# only runs when the boot script staged something first. It is additive: the
+# five checks above stand on their own, and a build with nothing pending is not a
+# failure.
+if [ "$fail" = "0" ] && [ -n "${AIOS_GUI_PENDING:-}" ]; then
+    python3 "$PY" click "$MON" "$(( (1280 - 440 - 8 - 96) + 48 ))" "$(( 800 - 64 + 20 ))"
+    sleep 2
+    if python3 "$PY" shot "$MON" "$SHOT3"; then
+        echo "  OK   screendump 3 (pending changes window)"
+        python3 "$PY" verify "$SHOT3" 1280 800 pending_window || fail=1
+    else
+        echo "  MISS screendump 3"; fail=1
     fi
 fi
 

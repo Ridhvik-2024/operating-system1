@@ -16,6 +16,7 @@
 #include "aios/json.h"
 #include "aios/ksched.h"
 #include "aios/hardening.h"
+#include "aios/tools.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -33,7 +34,67 @@
 #include <limits.h>
 
 #define FS_READ_MAX  (256u * 1024)
-#define FS_WRITE_MAX (1024u * 1024)
+#define FS_WRITE_MAX AIOS_FS_WRITE_MAX
+
+/* Set from the request envelope before any tool runs. Default: a human
+ * invocation, which writes through to the jail. */
+static int  g_origin_ai = 0;
+static char g_stage[1024];
+
+/* ---- M4: the worker's own account of what it did ----
+ *
+ * Testimony, not proof. The value is that a worker which lies here has to lie
+ * deliberately and in one place, and that the numbers are the same ones PID 1
+ * will measure independently against the read-only mount (L2). Recording is
+ * unconditional: a tool that says "I did nothing" is more interesting than one
+ * that stays silent, because silence cannot be compared.
+ */
+#define EFF_MAX 16
+#define EFF_PATH_MAX 512
+
+typedef struct {
+    char path[EFF_PATH_MAX];
+    char op[16];
+    long bytes;
+} eff_rec;
+
+static eff_rec g_eff[EFF_MAX];
+static int     g_eff_n = 0;
+static int     g_eff_overflow = 0;
+static long    g_bytes_read = 0;
+static long    g_bytes_written = 0;
+
+static void eff_record(const char *op, const char *path, long bytes) {
+    if (!op || !path) return;
+    if (g_eff_n >= EFF_MAX) { g_eff_overflow = 1; return; }
+    eff_rec *e = &g_eff[g_eff_n++];
+    snprintf(e->op, sizeof e->op, "%s", op);
+    snprintf(e->path, sizeof e->path, "%s", path);
+    e->bytes = bytes;
+}
+
+/* One document. `complete` is true only when nothing was dropped: an overfull
+ * effect list makes the account partial, and a partial account is a finding,
+ * not a rounding error. */
+static json_val *eff_document(long ms) {
+    json_val *arr = json_new_arr();
+    for (int i = 0; i < g_eff_n; i++) {
+        json_val *e = json_new_obj();
+        json_obj_set(e, "path", json_new_str(g_eff[i].path));
+        json_obj_set(e, "op", json_new_str(g_eff[i].op));
+        json_obj_set(e, "bytes", json_new_num((double)g_eff[i].bytes));
+        json_arr_push(arr, e);
+    }
+    json_val *doc = json_new_obj();
+    json_obj_set(doc, "effects", arr);
+    json_obj_set(doc, "complete", json_new_bool(!g_eff_overflow));
+    json_val *usage = json_new_obj();
+    json_obj_set(usage, "ms", json_new_num((double)ms));
+    json_obj_set(usage, "bytes_read", json_new_num((double)g_bytes_read));
+    json_obj_set(usage, "bytes_written", json_new_num((double)g_bytes_written));
+    json_obj_set(doc, "usage", usage);
+    return doc;
+}
 
 /* ---------------- calc: recursive-descent evaluator ----------------
  * Grammar (C-style precedence):
@@ -177,10 +238,24 @@ static json_val *tool_fs_read(json_val *args, char *err, size_t ecap) {
     json_obj_set(res, "path", json_new_str(path));
     json_obj_set(res, "bytes", json_new_num((double)len));
     json_obj_set(res, "content", json_new_str(data));
+    eff_record("read", path, (long)len);
+    g_bytes_read += (long)len;
     free(data);
     return res;
 }
 
+/* M3: where a write actually goes.
+ *
+ * `g_origin_ai` and `g_stage` come from the request envelope, not the
+ * environment (see tools.h for why). The invariant this function exists to
+ * enforce:
+ *
+ *     if the origin is AI, a write either lands in staging or it fails.
+ *     It never falls back to the jail.
+ *
+ * That last clause is the whole point. A staging layer that silently writes
+ * through when its directory is missing is worse than no staging layer,
+ * because everything upstream believes the write is pending review. */
 static json_val *tool_fs_write(json_val *args, char *err, size_t ecap) {
     const char *path = json_str(json_obj_get(args, "path"));
     const char *content = json_str(json_obj_get(args, "content"));
@@ -188,25 +263,78 @@ static json_val *tool_fs_write(json_val *args, char *err, size_t ecap) {
         snprintf(err, ecap, "fs.write needs {\"path\":rel,\"content\":str}");
         return NULL;
     }
+
+    char dest[2048];
+    if (g_origin_ai) {
+        if (!g_stage[0]) {
+            snprintf(err, ecap, "an AI write was refused: no staging directory "
+                                "was supplied (a machine write may never land "
+                                "directly)");
+            return NULL;
+        }
+        /* jail-relative containment inside the staging dir, again: the parent
+         * validated this, and we do not trust the parent.
+         *
+         * M7: this used to realpath() the staging dir HERE, and under the M6
+         * sandbox that was a crash, not a check. The staging dir is outside the
+         * jail, so resolving it performs a readlink under a path Landlock was
+         * only just told about, and the worker died with SIGSYS before reaching
+         * the write -- presenting as "the AI write did nothing", which is the
+         * worst possible way to fail: it looks like policy working.
+         *
+         * The path does not need resolving at this point. The parent passes an
+         * ABSOLUTE staging directory that it created with realpath() before the
+         * worker ever started (see sh_stage_begin), and it is checked before the
+         * request is sent. Resolving it again inside the sandbox bought nothing
+         * and cost the whole feature. What still matters is the containment check
+         * below, which does not touch the filesystem: the joined path must stay
+         * under the staging root. */
+        char stageabs[PATH_MAX];
+        if (strlen(g_stage) >= sizeof stageabs) {
+            snprintf(err, ecap, "an AI write was refused: staging path too long");
+            return NULL;
+        }
+        memcpy(stageabs, g_stage, strlen(g_stage) + 1);
+        if (stageabs[0] != '/') {
+            snprintf(err, ecap, "an AI write was refused: staging dir %.120s is "
+                                "not absolute", g_stage);
+            return NULL;
+        }
+        size_t alen = strlen(stageabs);
+        size_t plen = strlen(path);
+        if (alen + plen + 8 >= sizeof dest) {
+            snprintf(err, ecap, "an AI write was refused: staged path too long");
+            return NULL;
+        }
+        memcpy(dest, stageabs, alen);
+        memcpy(dest + alen, "/upper/", 7);
+        memcpy(dest + alen + 7, path, plen + 1);
+    } else {
+        snprintf(dest, sizeof dest, "%s", path);
+    }
     size_t clen = strlen(content);
     if (clen > FS_WRITE_MAX) {
         snprintf(err, ecap, "content exceeds 1MB write limit");
         return NULL;
     }
     /* create parent directories so agents can write new paths */
-    char dirbuf[1024];
-    snprintf(dirbuf, sizeof dirbuf, "%s", path);
+    char dirbuf[2048];
+    if (strlen(dest) >= sizeof dirbuf) {
+        snprintf(err, ecap, "fs.write: path too long");
+        return NULL;
+    }
+    memcpy(dirbuf, dest, strlen(dest) + 1);
     char *slash = strrchr(dirbuf, '/');
     if (slash && slash != dirbuf) {
         *slash = 0;
         if (aios_mkdirs(dirbuf) != AIOS_OK) {
-            snprintf(err, ecap, "fs.write: cannot create directory %.80s", dirbuf);
+            snprintf(err, ecap, "fs.write: cannot create directory %.200s", dirbuf);
             return NULL;
         }
     }
-    FILE *f = fopen(path, "wb");
+    FILE *f = fopen(dest, "wb");
     if (!f) {
-        snprintf(err, ecap, "fs.write: cannot open %s (%s)", path, strerror(errno));
+        snprintf(err, ecap, "fs.write: cannot open %.200s (%s)", dest, strerror(errno));
         return NULL;
     }
     bool ok = fwrite(content, 1, clen, f) == clen;
@@ -218,6 +346,12 @@ static json_val *tool_fs_write(json_val *args, char *err, size_t ecap) {
     json_val *res = json_new_obj();
     json_obj_set(res, "path", json_new_str(path));
     json_obj_set(res, "bytes", json_new_num((double)clen));
+    json_obj_set(res, "staged", json_new_bool(g_origin_ai));
+    /* The effect names the path the request used (jail-relative), not the
+     * physical staging path: the comparison is about intent, and the parent
+     * knows where it told us to write. */
+    eff_record("write", path, (long)clen);
+    g_bytes_written += (long)clen;
     return res;
 }
 
@@ -253,6 +387,10 @@ static json_val *tool_fs_list(json_val *args, char *err, size_t ecap) {
     json_val *res = json_new_obj();
     json_obj_set(res, "path", json_new_str(path));
     json_obj_set(res, "entries", arr);
+    /* A listing is a read of a directory: it is accounted for, because a tool
+     * that enumerated a directory it never declared is exactly the kind of
+     * quiet reconnaissance the declared-effects rule exists to catch. */
+    eff_record("list", path, (long)json_arr_len(arr));
     return res;
 }
 
@@ -326,21 +464,17 @@ int main(int argc, char **argv) {
     aios_ksched_register(AIOS_KS_BATCH);
     aios_cgroup_move_pid((long)getpid(), AIOS_KS_BATCH);
 
-    /* M6 hardening: seccomp allowlist + Landlock jail (env-gated). */
-    if (getenv("AIOS_SANDBOX_HARD")) {
-        char why[128] = {0};
-        int bits = aios_hardening_apply(jailabs, why, sizeof why);
-        fprintf(stderr, "tool-exec: hardening %s (%s)\n",
-                (bits & 3) == 3 ? "full" : "partial", why);
-    }
-
     /* read full request from stdin */
     char *buf = NULL;
     size_t cap = 0, len = 0;
     char tmp[4096];
     ssize_t r;
     while ((r = read(STDIN_FILENO, tmp, sizeof tmp)) > 0) {
-        if (len + (size_t)r > 64u * 1024) { fprintf(stderr, "request too large\n"); return 3; }
+        if (len + (size_t)r > AIOS_TOOL_REQ_MAX) {
+            fprintf(stderr, "request too large (%u byte limit)\n",
+                    (unsigned)AIOS_TOOL_REQ_MAX);
+            return 3;
+        }
         if (len + (size_t)r > cap) {
             cap = (len + (size_t)r + 4096) * 2;
             buf = (char *)realloc(buf, cap);
@@ -354,6 +488,7 @@ int main(int argc, char **argv) {
 
     json_val *req = json_parse(buf, len);
     free(buf);
+    double t_worker0 = aios_mono_ms();
     char errbuf[512] = {0};
     json_val *resp = json_new_obj();
     if (!req) {
@@ -361,6 +496,35 @@ int main(int argc, char **argv) {
         json_obj_set(resp, "error", json_new_str("unparsable request"));
     } else {
         const char *tool = json_str(json_obj_get(req, "tool"));
+        /* M3 envelope: the parent states the origin and the staging dir. */
+        const char *origin = json_str(json_obj_get(req, "origin"));
+        const char *stage_dir = json_str(json_obj_get(req, "stage"));
+        g_origin_ai = origin && strcmp(origin, "ai") == 0;
+        g_stage[0] = 0;
+        if (stage_dir && *stage_dir && strlen(stage_dir) < sizeof g_stage)
+            memcpy(g_stage, stage_dir, strlen(stage_dir) + 1);
+
+        /* M6 hardening: seccomp allowlist + Landlock jail (env-gated).
+         *
+         * M7 moved this from before the read to HERE, and the reason is the
+         * whole point of the exercise: the staging directory arrives in the
+         * request, and Landlock has to be told about it or every honest machine
+         * write is EACCES. Applying the lock before knowing what to lock out is
+         * how the sandbox came to forbid the one directory M3 writes to.
+         *
+         * It is applied AFTER a full read of the request and BEFORE any tool
+         * runs, so nothing the tool does escapes it. Nothing between here and
+         * the dispatch line is tool code. */
+        if (getenv("AIOS_SANDBOX_HARD")) {
+            char why[192] = {0};
+            char stageabs[PATH_MAX];
+            const char *rw = NULL;
+            if (g_stage[0] && realpath(g_stage, stageabs)) rw = stageabs;
+            int bits = aios_hardening_apply(jailabs, rw, why, sizeof why);
+            fprintf(stderr, "tool-exec: hardening %s (%s)%s\n",
+                    (bits & 3) == 3 ? "full" : "partial", why,
+                    (g_stage[0] && rw) ? " + staging" : "");
+        }
         json_val *args = json_obj_take(req, "args");
         if (!args) args = json_new_obj();
         json_val *result = NULL;
@@ -393,6 +557,18 @@ int main(int argc, char **argv) {
             json_obj_set(resp, "error",
                          json_new_str(errbuf[0] ? errbuf : "tool failed"));
         }
+        /* M4: attach the account even on failure. A tool that errored halfway
+         * through may already have written something; saying "failed" and
+         * nothing else would hide it. */
+        json_val *doc = eff_document((long)((aios_mono_ms() - t_worker0)));
+        json_val *eff = json_obj_take(doc, "effects");
+        json_val *complete = json_obj_take(doc, "complete");
+        json_val *usage = json_obj_take(doc, "usage");
+        json_obj_set(resp, "effects", eff ? eff : json_new_arr());
+        json_obj_set(resp, "complete", json_new_bool(complete ? json_bool(complete) : 0));
+        json_obj_set(resp, "usage", usage ? usage : json_new_obj());
+        json_free(complete);
+        json_free(doc);
         json_free(req);
     }
 

@@ -21,7 +21,19 @@
 #include "aios/microlm.h"
 #include "aios/autopilot.h"
 #include "aios/durable.h"
+#include "aios/policy.h"
+#include "aios/audit.h"
+#include "aios/snapshot.h"
+#include "aios/supervisor.h"
+#include "aios/stage.h"
+#include "aios/effects.h"
 #include "shroute.h"
+
+#include <dirent.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 
 #include <ctype.h>
 #include <errno.h>
@@ -103,6 +115,16 @@ typedef struct {
     char  *final;      /* from result file once finished */
 } sh_job;
 
+/* M4b: a remembered state of one jail path, so the parent can tell whether the
+ * world moved during a staged command. Declared above the shell because the
+ * shell keeps an array of them. */
+typedef struct {
+    char     rel[AIOS_EFFECT_PATH_MAX];
+    bool     existed;
+    long     size;
+    uint64_t hash;
+} jail_witness;
+
 struct sh_shell {
     sembus   *bus;
     mem_ctx  *mem;
@@ -110,6 +132,34 @@ struct sh_shell {
     char      jail[512];
     char      store[512];
     char      cortex_mode[16];
+    int       last_needs_sandbox;    /* M2: host requirements from the verdict */
+    int       last_needs_rollback;
+    int       last_needs_human;      /* M7: the law said a person must decide */
+    aios_origin last_origin;         /* M7: what the last line was stamped as */
+    /* M7: who can answer a NEEDS_HUMAN. The library does not assume there is
+     * anyone: a front-end installs an asker, and the absence of one is a real
+     * answer ("nobody is here"), not a reason to pick a default. */
+    ui_choice (*ui_ask)(const ui_prompt *p, void *ud);
+    void     *ui_ask_ud;
+    int       allow_ui_prompt;       /* cleared to force the refusal path */
+
+    /* M8: an action a person has been asked about and has not answered. Held as
+     * a DESCRIPTOR, not as text to re-run: re-running the line could read
+     * different arguments the second time, and the thing the person approved
+     * would not be the thing that executes. */
+    aios_action *deferred;
+    char         deferred_why[192];
+
+    /* M3: a machine-originated write lands here instead of the jail. NULL means
+     * the tool layer writes directly (a human typed the command, or the caller
+     * opted out). Set up per command, torn down after it. */
+    char      stage_dir[512];
+    int       stage_live;
+
+    /* M4b: what the jail looked like before a staged command. */
+    #define SH_MAX_WITNESS 16
+    jail_witness witness[SH_MAX_WITNESS];
+    int          n_witness;
 
     char *var_name[SH_MAX_VARS];
     char *var_val[SH_MAX_VARS];
@@ -398,6 +448,396 @@ static void stage_text_of(const char *tool, json_val *v, char **text_out) {
     *text_out = j ? j : strdup("");
 }
 
+/* ---- M1 gate ----------------------------------------------------------
+ * The single place where a proposal stops being a proposal.
+ *
+ * policy_eval() was put here by M2, the stage-and-diff by M3/M4, and M6's chained
+ * record is written at the point the call actually executes (tools.c), because a
+ * decision that never runs is not an effect. What stays true, and is the whole
+ * point of M1: no tool call can be constructed anywhere in this file without
+ * first having been a validated, origin-stamped, effect-declared aios_action.
+ *
+ * Note what is NOT here: no execution, no permission. The descriptor does not
+ * get to decide anything; the host code below decides, having read it.
+ * --------------------------------------------------------------------- */
+/* Capabilities this shell holds. Compiled in, not configurable, for the same
+ * reason the law table is: an environment variable that grants capabilities
+ * is a privilege escalation with extra steps.
+ *
+ * HUMAN commands need no capability (the human is the authority). Everything
+ * the MACHINE originates does, which is why the AI path can only use tools
+ * listed here. fs.write is deliberately included and act:FS_DELETE is
+ * deliberately NOT: the interesting part of M2 is not the deny, it is the
+ * small, boring, auditable list of what is actually granted. */
+static const char *SH_CAPS[] = {
+    "tool:calc", "tool:fs.read", "tool:fs.list", "tool:fs.write",
+    "tool:memory.search", "tool:proc.info", "tool:selftest.sleep",
+    "agent:run",
+};
+
+#define SH_N_CAPS ((int)(sizeof SH_CAPS / sizeof SH_CAPS[0]))
+
+
+/* ---------------- M7: the human's side of NEEDS_HUMAN ------------------- *
+ *
+ * action_gate() parks an action and says "this needs a human". This is the part
+ * that asks one. It lives here, in the library, for a reason that is not
+ * tidiness: the serial console and the desktop must ask the SAME question with
+ * the SAME three words, and two copies of a question drift. It is also the only
+ * way to test the answer without a terminal.
+ *
+ * The rule that has no exceptions is at the bottom: no answer means DISCARD.
+ * `promote` is only ever returned when a person chose it. A timeout is a person
+ * not being there, and not being there is not consent.
+ */
+
+int ui_prompt_text(const ui_prompt *p, char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = 0;
+    if (!p) return 0;
+    int n = snprintf(out, cap,
+                     "%.150s\n"
+                     "  because: %.150s\n"
+                     "  proposed by: %s\n"
+                     "%s"
+                     "  [p] promote   [d] discard   [s] show diff\n"
+                     "  (no answer = discard: nothing is promoted by waiting)\n",
+                     p->title, p->reason,
+                     p->origin == ORIGIN_AI ? "a model" : "a person",
+                     p->have_detail ? p->detail : "");
+    return n < 0 ? 0 : n;
+}
+
+ui_choice ui_present(const ui_prompt *p,
+                     ui_choice (*ask)(const ui_prompt *p, void *ud), void *ud) {
+    /* No asker means nobody to ask. Not "assume yes", and not a prompt printed
+     * into a log that a person will read later: DISCARD, which is the answer that
+     * changed nothing. */
+    if (!p || !ask) return UI_CHOICE_DISCARD;
+
+    /* SHOW_DIFF is a question, not a loop forever: a person may look as many
+     * times as they like, but an asker that keeps answering SHOW_DIFF without a
+     * human present would spin. Bound it, and then the honest default. */
+    for (int i = 0; i < 16; i++) {
+        ui_choice c = ask(p, ud);
+        if (c == UI_CHOICE_SHOW_DIFF) continue;
+        if (c == UI_CHOICE_PROMOTE) return UI_CHOICE_PROMOTE;
+        /* M8: DEFER is passed through, not collapsed into DISCARD.
+         *
+         * The first version of this function returned DISCARD for anything that
+         * was not PROMOTE, which was correct while there were only three answers
+         * and became a lie the moment a front-end could say "asked, not yet
+         * answered". Collapsing it here made the desktop's DEFER unreachable --
+         * the branch that holds the action never ran, and the hold silently
+         * became a refusal. A function that rewrites its caller's answer must be
+         * told about every answer there is. */
+        if (c == UI_CHOICE_DEFER) return UI_CHOICE_DEFER;
+        return UI_CHOICE_DISCARD;
+    }
+    return UI_CHOICE_DISCARD;
+}
+
+/* The console's asker. Reads one line; anything unrecognised is a discard.
+ *
+ * Deliberately not "the first letter": `p` is promote, and someone typing "please"
+ * at a security prompt has not asked for anything. The whole line has to be the
+ * word (or its first letter alone). */
+void sh_set_ui_asker(sh_shell *sh, ui_choice (*ask)(const ui_prompt *p, void *ud),
+                     void *ud) {
+    if (!sh) return;
+    sh->ui_ask = ask;
+    sh->ui_ask_ud = ud;
+    sh->allow_ui_prompt = ask ? 1 : 0;
+}
+
+ui_choice sh_console_ask(const ui_prompt *p, void *ud) {
+    (void)ud;
+    char text[1024];
+    ui_prompt_text(p, text, sizeof text);
+    fputs(text, stdout);
+    fflush(stdout);
+
+    char line[64];
+    if (!fgets(line, sizeof line, stdin)) return UI_CHOICE_DISCARD; /* EOF */
+    line[strcspn(line, "\r\n")] = 0;
+    for (char *q = line; *q; q++)
+        if (*q >= 'A' && *q <= 'Z') *q = (char)(*q - 'A' + 'a');
+
+    if (strcmp(line, "p") == 0 || strcmp(line, "promote") == 0 ||
+        strcmp(line, "yes") == 0 || strcmp(line, "y") == 0)
+        return UI_CHOICE_PROMOTE;
+    if (strcmp(line, "s") == 0 || strcmp(line, "show") == 0 ||
+        strcmp(line, "show diff") == 0 || strcmp(line, "diff") == 0)
+        return UI_CHOICE_SHOW_DIFF;
+    return UI_CHOICE_DISCARD;   /* including eof, including garbage */
+}
+
+static int builtin_as_machine(sh_shell *sh, sargv *a,
+                              char **text_out, json_val **json_out,
+                              char *err, size_t ecap) {
+    if (!sh) { snprintf(err, ecap, "no shell"); return 1; }
+    char *line = join_args(a->v, a->n, 1);
+    if (!line || !*line) {
+        free(line);
+        snprintf(err, ecap, "machine needs a line to run, in quotes");
+        return 1;
+    }
+    sh_result r;
+    int rc = sh_exec_origin(sh, line, ORIGIN_AI, &r);
+    free(line);
+    *text_out = r.text ? r.text : strdup("");
+    *json_out = r.json ? r.json : NULL;
+    r.text = NULL;
+    r.json = NULL;
+    /* The AI line's failure is reported as this builtin's ERROR, not as a
+     * status: the human typed `machine`, the machine's refusal is the answer. */
+    if (rc != 0 || r.status != 0) {
+        if (r.error) snprintf(err, ecap, "%s", r.error);
+        else snprintf(err, ecap, "the machine-originated line failed");
+        sh_result_free(&r);
+        return 1;
+    }
+    sh_result_free(&r);
+    return 0;
+}
+
+/* M7: "could this be undone right now?"
+ *
+ * Two callers ask it -- the gate, before it decides, and `policy check`, which
+ * exists so a person can see the decision before making it -- and they used to
+ * get the same hardcoded 0. One function so they cannot drift again: the point
+ * of an introspection builtin is to show what the gate would do, not a
+ * separately-maintained opinion about it.
+ *
+ * The question is per-state, not per-build: a COMPLETE snapshot of this store is
+ * a rollback that exists. An interrupted one has no DONE marker, is never
+ * offered for restore, and counting it would let the shell claim an undo it
+ * cannot perform.
+ */
+static int sh_rollback_available(const sh_shell *sh) {
+    if (!sh) return 0;
+    snap_list sl;
+    memset(&sl, 0, sizeof sl);
+    char err[256];
+    int have = 0;
+    if (snap_list_all(sh->store, &sl, err, sizeof err)) {
+        for (size_t i = 0; i < sl.n; i++)
+            if (sl.items[i].complete) { have = 1; break; }
+        snap_list_free(&sl);
+    }
+    return have;
+}
+
+static int action_gate(sh_shell *sh, const aios_action *act, aios_origin origin,
+                       char *err, size_t ecap) {
+    char why[256];
+
+    /* ---- M1: is this even a proposal? ---- */
+    if (!aios_action_is_valid(act, why, sizeof why)) {
+        snprintf(err, ecap, "action refused: %s", why);
+        sembus_pub_kv(sh->bus, "sh.action.refused",
+                      (const char *const[]){
+                          "kind", aios_action_kind_name(act ? act->kind : ACT__COUNT),
+                          "target", (act && act->target) ? act->target : "",
+                          "why", why, NULL});
+        return 1;
+    }
+
+    /* ---- M2: is it permitted? ----
+     * The verdict comes from a pure function that cannot consult the model,
+     * cannot read the clock, and has no override path. Note what this code
+     * cannot do: it cannot reason about the action, soften the verdict, or ask
+     * the AI for justification. It reads a decision and obeys it. */
+    aios_policy_ctx pctx = aios_policy_ctx_default();
+    /* The sandbox is where the tool will actually run (the worker process),
+     * so for a tool action it is performed rather than pending. A shell or
+     * delete is not simulated yet - that is M3/M4, and until then those stay
+     * denied instead of being waved through. */
+    pctx.sandbox_executed = (act->kind == ACT_TOOL || act->kind == ACT_AGENT);
+    /* M7: was a hardcoded 0, which made every destructive AI action report "not
+     * undoable yet" long after M5 shipped snapshots -- a stale truth is a lie
+     * with a good excuse. sh_rollback_available() asks the real question. */
+    pctx.rollback_available = sh_rollback_available(sh);
+
+    aios_decision d = aios_policy_eval(act, sh->jail, SH_CAPS, SH_N_CAPS,
+                                       &pctx, aios_now_ms());
+
+    char *act_json = aios_action_to_json(act);
+    /* THREE verdicts, and the host must treat them as three.
+     *
+     * Before M7 this was `if (d.v != VERDICT_ALLOW)` -- so NEEDS_HUMAN was
+     * collapsed into a refusal. That is the safe direction but it is not what the
+     * law says: NEEDS_HUMAN means "a person must decide", and a host that refuses
+     * instead of asking has quietly replaced the verdict with its own. It also
+     * made the whole middle of the verdict space unreachable, which is why no test
+     * noticed.
+     *
+     * DENY stays a hard refusal. NEEDS_HUMAN is now reported AS needing a human,
+     * and the caller decides what to do about it. */
+    if (d.v == VERDICT_DENY) {
+        snprintf(err, ecap, "action refused by policy [%s]: %s",
+                 aios_policy_reason_str(d.r), d.why);
+        sembus_pub_kv(sh->bus, "sh.action.refused",
+                      (const char *const[]){
+                          "kind", aios_action_kind_name(act->kind),
+                          "target", act->target ? act->target : "",
+                          "verdict", aios_policy_verdict_str(d.v),
+                          "reason", aios_policy_reason_str(d.r),
+                          "why", d.why, NULL});
+        /* The refusal is logged as a record, not just printed: a denied
+         * action is the most interesting thing in an audit trail. */
+        sembus_pub_kv(sh->bus, "sh.action.log",
+                      (const char *const[]){
+                          "verdict", aios_policy_verdict_str(d.v),
+                          "reason", aios_policy_reason_str(d.r),
+                          "action", act_json ? act_json : "", NULL});
+        free(act_json);
+        return 1;
+    }
+    if (d.v == VERDICT_NEEDS_HUMAN) {
+        /* Not a refusal and not an execution: a proposal parked in front of a
+         * person. Three things happen, in this order, and the order is the point:
+         *
+         *   1. the action is OFFERED through ui_present(), which cannot return
+         *      PROMOTE unless someone chose it -- no timeout counts as yes, no
+         *      asker at all means discard;
+         *   2. if a person chose promote, the gate accepts the action it already
+         *      evaluated. Not a re-run of the line: a re-run could race, or read
+         *      different arguments the second time, and the thing the person
+         *      approved would not be the thing that ran;
+         *   3. otherwise the caller is told what was held, in words that name a
+         *      person as the missing ingredient rather than the law as a wall.
+         *
+         * sh->ui_ask is set by the front-end. Unset (a library embedder, or a
+         * test that wants the refusal) means nobody can answer -- and the honest
+         * result of "nobody can answer" is that nothing happens. */
+        sh->last_needs_human = 1;
+        int accepted = 0;
+        if (sh->ui_ask && sh->allow_ui_prompt) {
+            ui_prompt up;
+            memset(&up, 0, sizeof up);
+            snprintf(up.title, sizeof up.title, "%s%s%s",
+                     aios_action_kind_name(act->kind),
+                     act->target ? " " : "", act->target ? act->target : "");
+            snprintf(up.reason, sizeof up.reason, "%s: %.140s",
+                     aios_policy_reason_str(d.r), d.why);
+            up.origin = origin;
+            /* `show diff` needs something to show. A tool action has no staged
+             * diff (M3 stages writes, not arbitrary tools), so say what it would
+             * touch rather than pretending to have a patch. */
+            snprintf(up.detail, sizeof up.detail, "  target: %.200s\n",
+                     act->target ? act->target : "(none)");
+            up.have_detail = 1;
+            ui_choice c = ui_present(&up, sh->ui_ask, sh->ui_ask_ud);
+            /* M8: DEFER is not DISCARD, and treating it as one is the bug this
+             * whole path exists to fix. A front-end that cannot answer without
+             * blocking -- the desktop, whose event loop IS this thread -- returns
+             * DEFER, and the action is then "waiting for a person" rather than
+             * "refused by one". `sh_resume()` runs it when the person answers.
+             *
+             * Note what has NOT changed: ui_present() still cannot return
+             * PROMOTE without a person choosing it, there is still no timeout,
+             * and an asker that says DEFER and is never resumed leaves the action
+             * unexecuted forever. The unsafe direction is still refused. */
+            if (c == UI_CHOICE_DEFER) {
+                aios_action_free(sh->deferred);
+                sh->deferred = aios_action_from_json(act_json ? act_json : "",
+                                                     NULL, 0);
+                if (sh->deferred) {
+                    aios_action_stamp_origin(sh->deferred, origin);
+                    snprintf(sh->deferred_why, sizeof sh->deferred_why, "%s: %.140s",
+                             aios_policy_reason_str(d.r), d.why);
+                    sembus_pub_kv(sh->bus, "sh.action.deferred",
+                                  (const char *const[]){
+                                      "kind", aios_action_kind_name(act->kind),
+                                      "target", act->target ? act->target : "",
+                                      "reason", aios_policy_reason_str(d.r), NULL});
+                }
+                free(act_json);
+                snprintf(err, ecap,
+                         "this needs a human [%s]: %s%s -- a person has been asked "
+                         "and has not answered yet",
+                         aios_policy_reason_str(d.r), d.why,
+                         origin == ORIGIN_AI
+                             ? " (a machine proposed it)" : "");
+                return 1;
+            }
+            if (c == UI_CHOICE_PROMOTE) {
+                accepted = 1;
+                sembus_pub_kv(sh->bus, "sh.action.promoted_by_human",
+                              (const char *const[]){
+                                  "kind", aios_action_kind_name(act->kind),
+                                  "reason", aios_policy_reason_str(d.r), NULL});
+            } else {
+                sembus_pub_kv(sh->bus, "sh.action.discarded",
+                              (const char *const[]){
+                                  "kind", aios_action_kind_name(act->kind),
+                                  "why", "the human did not promote it", NULL});
+            }
+        }
+        if (accepted) {
+            /* A person said yes. Fall into the ALLOW path below rather than
+             * duplicating it: two execution paths drift, and the second one is
+             * always the one nobody tests. */
+            sembus_pub_kv(sh->bus, "sh.action.log",
+                          (const char *const[]){
+                              "verdict", "ALLOW(on human promote)",
+                              "reason", aios_policy_reason_str(d.r),
+                              "action", act_json ? act_json : "", NULL});
+            free(act_json);
+            if (d.needs_sandbox) sh->last_needs_sandbox = 1;
+            if (d.needs_rollback) sh->last_needs_rollback = 1;
+            return 0;
+        }
+        snprintf(err, ecap,
+                 "this needs a human [%s]: %s%s",
+                 aios_policy_reason_str(d.r), d.why,
+                 origin == ORIGIN_AI
+                     ? " -- a machine proposed it, and only a person can accept it"
+                     : " -- run it yourself to accept it");
+        sembus_pub_kv(sh->bus, "sh.action.needs_human",
+                      (const char *const[]){
+                          "kind", aios_action_kind_name(act->kind),
+                          "target", act->target ? act->target : "",
+                          "reason", aios_policy_reason_str(d.r),
+                          "why", d.why,
+                          "origin", origin == ORIGIN_AI ? "ai" : "human", NULL});
+        sembus_pub_kv(sh->bus, "sh.action.log",
+                      (const char *const[]){
+                          "verdict", "NEEDS_HUMAN",
+                          "reason", aios_policy_reason_str(d.r),
+                          "action", act_json ? act_json : "", NULL});
+        free(act_json);
+        return 1;
+    }
+
+    sembus_pub_kv(sh->bus, "sh.action.log",
+                  (const char *const[]){
+                      "verdict", "ALLOW",
+                      "reason", aios_policy_reason_str(d.r),
+                      "action", act_json ? act_json : "", NULL});
+    free(act_json);
+
+    /* Requirements the host must honour before this is real. Both are
+     * reported so the M3/M5 work has a consumer rather than a comment. */
+    if (d.needs_sandbox) sh->last_needs_sandbox = 1;
+    if (d.needs_rollback) sh->last_needs_rollback = 1;
+    return 0;
+}
+
+/* Build (and publish) the record of an action we accepted.
+ *
+ * This is the decision being made observable on the bus; the durable, chained
+ * record of what actually EXECUTED is written by tools.c through audit.c. Both
+ * matter and they are not the same record: this one says "a proposal was accepted",
+ * that one says "a tool ran and here is what it did". */
+static void action_accept(sh_shell *sh, const aios_action *act) {
+    char *j = aios_action_to_json(act);
+    if (!j) return;
+    sembus_pub(sh->bus, "sh.action.accept", j);
+    free(j);
+}
+
 /* args is consumed on every path (tool_exec contract). */
 static int exec_tool(sh_shell *sh, const char *name, json_val *args,
                      char **text_out, json_val **json_out,
@@ -414,10 +854,725 @@ static int exec_tool(sh_shell *sh, const char *name, json_val *args,
     return 0;
 }
 
+static bool hash_file(const char *abs, uint64_t *out, long *size_out) {
+    char *buf = NULL;
+    size_t len = 0;
+    if (aios_read_file(abs, &buf, &len, 1u * 1024 * 1024) != AIOS_OK) return false;
+    *out = aios_fnv1a(buf, len);
+    if (size_out) *size_out = (long)len;
+    free(buf);
+    return true;
+}
+
+/* Record the current state of a jail-relative path. */
+static void witness_take(const char *jail, const char *rel, jail_witness *w) {
+    memset(w, 0, sizeof *w);
+    snprintf(w->rel, sizeof w->rel, "%s", rel);
+    char abs[AIOS_EFFECT_PATH_MAX * 2];
+    int n = snprintf(abs, sizeof abs, "%s/%s", jail, rel);
+    if (n < 0 || (size_t)n >= sizeof abs) { w->existed = true; return; }  /* unnameable: assume it exists and "changed" */
+    struct stat st;
+    if (stat(abs, &st) != 0 || !S_ISREG(st.st_mode)) { w->existed = false; return; }
+    w->existed = true;
+    w->size = (long)st.st_size;
+    if (!hash_file(abs, &w->hash, NULL)) w->hash = 0;
+}
+
+/* Did it change? A missing-then-present file is a change; so is a different
+ * hash. A present-then-missing file is a change too (a delete by a write). */
+static bool witness_changed(const char *jail, const jail_witness *w) {
+    jail_witness now;
+    witness_take(jail, w->rel, &now);
+    if (now.existed != w->existed) return true;
+    if (!now.existed) return false;
+    return now.hash != w->hash || now.size != w->size;
+}
+
+/* ---- M3: staging for machine-originated writes ----
+ *
+ * The rule: if an AI chose the action, its writes do not land. They go to a
+ * staging directory, are shown as a diff, and land only on `promote`. A human's
+ * own `fs.write` still writes directly -- gating a person's explicit command
+ * behind a second confirmation is theatre, and people learn to click through
+ * theatre.
+ *
+ * The staged directory is passed to the worker as an ARGUMENT, not an env var:
+ * an environment variable is inherited by everything the worker spawns, so it
+ * would leak the staging location into any process the tool starts.
+ */
+/* Witness the declared writes, then pre-note them.
+ *
+ * The note is what gives the diff a ROW even when the worker never runs -- a
+ * refused worker still owes the human an explanation, so this is deliberate.
+ * The witness is what makes the M4 guarantee independent of the worker: it is
+ * taken BEFORE the tool runs, so a worker that writes into the jail anyway is
+ * caught by comparing the world with this snapshot, not by trusting its report.
+ *
+ * M7.5: EVERY declared write is noted, not just the first. `fs.write` declares
+ * one path today, so this looked fine -- until a second write joined a live
+ * session and landed in upper/ with no note at all, invisible to the diff and
+ * unpromotable. That is the same class of defect as an under-declared effect,
+ * on the side that reports rather than the side that acts.
+ */
+static void sh_stage_witness_and_note(sh_shell *sh, stage_session *s,
+                                      aios_action *act, char *err, size_t ecap) {
+    for (int i = 0; i < act->n_declared && sh->n_witness < SH_MAX_WITNESS; i++) {
+        const char *eff = act->declared[i];
+        if (!eff || strncmp(eff, "write:", 6) != 0) continue;
+        if (eff[6]) witness_take(sh->jail, eff + 6,
+                                 &sh->witness[sh->n_witness++]);
+    }
+
+    static char paths[SH_MAX_WITNESS][AIOS_STAGE_PATH_MAX];
+    static stage_op ops[SH_MAX_WITNESS];
+    size_t n = 0;
+    for (int i = 0; i < act->n_declared && n < SH_MAX_WITNESS; i++) {
+        const char *eff = act->declared[i];       /* "write:a/b.txt" */
+        if (!eff || strncmp(eff, "write:", 6) != 0) continue;
+        const char *p = eff + 6;
+        if (!*p || strlen(p) >= AIOS_STAGE_PATH_MAX) continue;
+        snprintf(paths[n], AIOS_STAGE_PATH_MAX, "%s", p);
+        ops[n] = STAGE_OP_ADD;
+        n++;
+    }
+    if (n) (void)stage_note_many(s, (const char (*)[AIOS_STAGE_PATH_MAX])paths, ops,
+                                 n, err, ecap);
+}
+
+/* M7.5: join the live session instead of starting a second one.
+ *
+ * Two sessions for one gesture is what made a reviewed change disappear:
+ * `staged` showed the newer, `promote` applied the newer, and the older was
+ * still pending, still promotable, mentioned nowhere. One gesture is one
+ * change. The witness array is NOT reset here -- the jail must be compared
+ * against how it looked before the FIRST write of this change, or a worker that
+ * moved a file during the second write would be checked against a baseline that
+ * already includes it.
+ */
+static bool sh_stage_extend(sh_shell *sh, aios_action *act, char *err, size_t ecap) {
+    if (!sh || !act) return false;
+    stage_session s;
+    if (!stage_open(sh->stage_dir, &s, err, ecap)) {
+        sh->stage_live = 0;
+        sh->stage_dir[0] = 0;
+        return false;
+    }
+    sh_stage_witness_and_note(sh, &s, act, err, ecap);
+    stage_end(&s);
+    return true;
+}
+
+static bool sh_stage_begin(sh_shell *sh, aios_action *act, char *err, size_t ecap) {
+    if (!sh || !act) return false;
+    stage_session s;
+    if (!stage_begin(sh->jail, sh->store, act->intent_hash, 0, &s, err, ecap)) {
+        sh->stage_live = 0;
+        sh->stage_dir[0] = 0;
+        return false;
+    }
+    snprintf(sh->stage_dir, sizeof sh->stage_dir, "%s", s.dir);
+    sh->stage_live = 1;
+
+    /* Witness and note, in that order: the witness must be taken before the
+     * worker runs, or it records a world that already moved. */
+    sh_stage_witness_and_note(sh, &s, act, err, ecap);
+    stage_end(&s);
+    return true;
+}
+
+/* Abandon a staged session: throw the directory away AND forget it. Used when
+ * the result must not be offered to anyone -- an undeclared effect, a jail that
+ * moved. Dropping the pointer alone leaves an empty "open" session in the store,
+ * which looks to `staged` like something waiting for review. */
+static void sh_stage_abandon(sh_shell *sh) {
+    if (!sh) return;
+    if (sh->stage_live && sh->stage_dir[0]) {
+        stage_session sess;
+        char derr[192] = {0};
+        if (stage_open(sh->stage_dir, &sess, derr, sizeof derr)) {
+            (void)stage_discard(&sess, derr, sizeof derr);
+            stage_end(&sess);
+        }
+    }
+    sh->stage_live = 0;
+    sh->stage_dir[0] = 0;
+    sh->n_witness = 0;
+}
+
+static void sh_stage_drop(sh_shell *sh) {
+    if (!sh) return;
+    sh->stage_live = 0;
+    sh->stage_dir[0] = 0;
+}
+
+/* M7: is there anything in the staging area, or is the manifest all there is?
+ *
+ * The shell pre-notes every declared write, so a session can have rows and no
+ * files. Ask the directory, not the notes: this is the difference between "a
+ * change is waiting for you" and "a change was declared". */
+static int sh_stage_has_bytes(const char *stage_dir) {
+    char up[700];
+    snprintf(up, sizeof up, "%s/upper", stage_dir);
+    DIR *d = opendir(up);
+    if (!d) return 0;
+    int have = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        have = 1;
+        break;
+    }
+    closedir(d);
+    return have;
+}
+
+/* M7.5: is there anything ELSE waiting, and would a promote know which to pick?
+ *
+ * The defect this closes: a shell reported a diff for the change it had just
+ * staged, then forgot it. A second change -- or a plain agent run -- took the
+ * slot, and the first one stopped being mentioned anywhere. It was still in the
+ * store, still promotable, and invisible. A person who read the report and
+ * decided "not yet" was never told the decision was still open. */
+static size_t sh_pending_others(sh_shell *sh, const char *except_dir,
+                               char *first_id, size_t idcap) {
+    if (first_id && idcap) first_id[0] = 0;
+    stage_pending_list l;
+    char perr[192] = {0};
+    if (!stage_pending_scan(sh->store, &l, perr, sizeof perr)) return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < l.n; i++) {
+        if (except_dir && except_dir[0] && strcmp(l.items[i].dir, except_dir) == 0)
+            continue;
+        if (n == 0 && first_id && idcap) snprintf(first_id, idcap, "%s", l.items[i].id);
+        n++;
+    }
+    stage_pending_free(&l);
+    return n;
+}
+
+/* The one-line warning appended wherever a change is described. Silently
+ * leaving a second change unmentioned is the bug; naming it is the fix. */
+static void sh_pending_note(sh_shell *sh, const char *except_dir,
+                            char *buf, size_t cap) {
+    char id[80];
+    size_t n = sh_pending_others(sh, except_dir, id, sizeof id);
+    if (n == 0) { if (cap) buf[0] = 0; return; }
+    snprintf(buf, cap,
+             "  %zu other change%s still pending (%.40s%s). `staged` lists them;\n"
+             "  `promote` will not choose between changes you have not named.\n",
+             n, n == 1 ? " is" : "s are", id, n == 1 ? "" : ", ...");
+}
+
+/* M8: put the staged change on the record, before anyone is offered it.
+ *
+ * Do.4 of the card -- "refuse to promote anything whose audit record failed
+ * audit verify" -- needs two things this closes:
+ *
+ *   1. a staged change had NO record at all. `audit.log` recorded the tool call
+ *      (the worker wrote into staging and did exactly what it declared), but
+ *      nothing said that a pending change existed or which session held it. So
+ *      "verify the record before promoting" would have checked a log that could
+ *      not have been wrong about this change, because it never mentioned it;
+ *   2. the id a human types must be the thing recorded. Writing it here, once,
+ *      at the moment the change becomes visible, is what makes `promote <id>`
+ *      and "the record of <id>" the same string.
+ *
+ * A failure to record is REPORTED, not fatal: refusing to show a person a diff
+ * because the log is unwritable would hide the change rather than protect it. The
+ * promote gate then refuses it, which is the right place for that refusal.
+ */
+static void sh_audit_stage(sh_shell *sh, const stage_session *s,
+                           const stage_diff *d) {
+    if (!sh || !sh->store[0]) return;
+    const char *base = strrchr(s->dir, '/');
+    base = base ? base + 1 : s->dir;
+
+    char body[1024];
+    snprintf(body, sizeof body,
+             "{\"stage\":\"%.80s\",\"jail\":\"%.200s\","
+             "\"files\":%zu,\"origin\":\"%.16s\"}",
+             base, s->jail, d ? d->n : 0,
+             aios_action_origin_name(sh->last_origin));
+
+    char aerr[192] = {0};
+    if (!audit_append(sh->store, AUDIT_KIND_EVENT, body, NULL, aerr, sizeof aerr))
+        fprintf(stderr, "audit: could not record staged change %.80s: %.160s\n",
+                base, aerr);
+}
+
+/* After a staged tool run: turn the session into a diff for the human. */
+static int sh_stage_report(sh_shell *sh, char **text_out, char *err, size_t ecap) {
+    stage_session s;
+    if (!stage_open(sh->stage_dir, &s, err, ecap)) {
+        sh_stage_drop(sh);
+        *text_out = strdup("(staged, but the session could not be reopened)\n");
+        return 0;
+    }
+    stage_diff d;
+    int rc = 0;
+    if (stage_diff_compute(&s, &d, err, ecap)) {
+        sh_audit_stage(sh, &s, &d);
+        char *body = stage_diff_text(&d);
+        char *msg = NULL;
+
+        /* M7: a staged session can be EMPTY and still look full.
+         *
+         * The shell pre-notes every declared write so `staged` has rows even if
+         * the worker never ran -- which is a good property (a refused worker
+         * still owes the human an explanation). But it means the diff has a row
+         * for a file that does not exist in upper/, and the report below used to
+         * say "nothing was written to the jail, promote to apply it" over an
+         * empty stage. A human who read that and typed `promote` got "promoted 0
+         * files into the jail" and no file: a promise the shell could not keep,
+         * made in the one place whose whole job is to be trustworthy about what
+         * did and did not happen.
+         *
+         * So ask the staging area, not the manifest. If nothing is in upper/,
+         * say that the write did not happen and why it matters, rather than
+         * offering to promote an emptiness. This fired in the boot image, where
+         * the sandbox worker could not be found -- an environment problem that
+         * presented as a successful agent run. */
+        int have_bytes = sh_stage_has_bytes(s.dir);
+        if (asprintf(&msg,
+                     "%s"
+                     "%s",
+                     body ? body : "",
+                     have_bytes
+                         ? "  nothing was written to the jail.\n"
+                           "  promote            apply it\n"
+                           "  discard            throw it away\n"
+                         : "  NOTHING WAS STAGED. The write did not happen, so "
+                           "there is\n"
+                           "  nothing to promote -- the rows above are the "
+                           "declared\n"
+                           "  effects, not files. A staged set that is empty "
+                           "usually\n"
+                           "  means the sandbox worker could not be run.\n") < 0)
+            msg = NULL;
+        free(body);
+        /* M7.5: and say what else is still waiting. */
+        if (msg) {
+            char note[256];
+            sh_pending_note(sh, s.dir, note, sizeof note);
+            if (note[0]) {
+                char *full = NULL;
+                if (asprintf(&full, "%s%s", msg, note) >= 0) {
+                    free(msg);
+                    msg = full;
+                }
+            }
+        }
+        *text_out = msg ? msg : strdup("(staged)\n");
+        stage_diff_free(&d);
+    } else {
+        *text_out = strdup("(staged, but the diff could not be computed)\n");
+        rc = 0;
+    }
+    stage_end(&s);
+    return rc;
+}
+
+/* Did the jail move where it was told not to? Returns 1 and names the path. */
+static int sh_jail_moved(sh_shell *sh, char *first, size_t fcap) {
+    if (first && fcap) first[0] = 0;
+    for (int i = 0; i < sh->n_witness; i++) {
+        if (witness_changed(sh->jail, &sh->witness[i])) {
+            if (first && fcap) snprintf(first, fcap, "%s", sh->witness[i].rel);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- M4b: the parent watches the jail, not the story ----
+ *
+ * Everything in M4 compares what the worker SAID against what was DECLARED.
+ * That is a real check, and it is not enough, because both halves can be lies
+ * from the same source. The test that proved it: swap `tool-exec` for a worker
+ * that ignores the `stage` argument and writes into the jail, then reports only
+ * the file it was asked about. Its account matches the declaration exactly, so
+ * every rule above passes -- and the file is already in the jail.
+ *
+ * M3's guarantee was therefore being enforced by the worker. The worker is the
+ * component we least control, so the guarantee has to be checked from outside
+ * it: the parent looks at the jail itself, before and after, and refuses if the
+ * world moved. Testimony is what we ASK; the witness is what we CHECK.
+ *
+ * Cost: a bounded read (hash) of each declared write path, twice per staged
+ * command. Files are already capped at 1 MiB, and only for AI writes.
+ */
+
+
+/* ---- M4: did it do what it said? ----
+ *
+ * Everything up to here has trusted the declaration. This is the first place
+ * that asks whether the declaration was true, and it is the only place that can
+ * do anything about the answer, because it is the only place that holds both
+ * halves: what the descriptor claimed and what the worker reported.
+ *
+ * The asymmetry is the whole design:
+ *
+ *   clean account          -> accept, log the numbers
+ *   under-delivered        -> accept, log it (nothing happened; not dangerous)
+ *   undeclared effect      -> FAIL CLOSED. The result is discarded, the staging
+ *                             directory is discarded, the action is denied
+ *                             after the fact and the reason names the path.
+ *
+ * Discarding the staging directory rather than "reviewing it anyway" is the
+ * point: a worker that touched a file it never mentioned has demonstrated it
+ * cannot be trusted about the files it did mention.
+ */
+static int sh_check_effects(sh_shell *sh, const aios_action *act,
+                            char *err, size_t ecap) {
+    if (!sh || !act || !act->target) return 0;
+
+    /* Only tools that run in the worker can account for themselves. A native
+     * tool runs in this process: there is no worker to interrogate, and its
+     * effects are this process's effects, which the shell already knows because
+     * it is the one running them. Treating "no document" as a violation here
+     * would fail-closed on every native tool, which teaches people that the
+     * check is noise -- the worst outcome for a safety mechanism. */
+    const tool_def *def = tool_reg_find(sh->tools, act->target);
+    if (!def || !def->sandboxed) return 0;
+
+    aios_effects actual;
+    char perr[192] = {0};
+    if (!aios_effects_from_array(tool_reg_last_effects(sh->tools),
+                                 tool_reg_last_complete(sh->tools),
+                                 &actual, perr, sizeof perr)) {
+        snprintf(err, ecap, "the worker's effect report was malformed: %s", perr);
+        return 1;      /* malformed is not "no news", it is bad news */
+    }
+
+    char first[256] = {0};
+    aios_effects_verdict v = aios_effects_compare(&actual, (const char *const *)act->declared,
+                                                 act->n_declared, first, sizeof first);
+
+    if (v == EFFECTS_MISSING) {
+        /* A sandboxed tool that returns no account is not the build we think it
+         * is. That is worth failing on: silence cannot be compared with
+         * anything, so it cannot be cleared. */
+        sembus_pub_kv(sh->bus, "sh.action.refused", (const char *const[]){
+            "kind", aios_action_kind_name(act->kind),
+            "target", act->target, "verdict", "DENY",
+            "reason", "EFFECTS_MISSING", "why", "no effects document", NULL});
+        snprintf(err, ecap, "the worker returned no effects document");
+        return 1;
+    }
+
+    if (v == EFFECTS_OK || v == EFFECTS_UNDER_DELIVERED) {
+        /* Under-delivery is recorded but accepted: the world did not change in
+         * a way nobody expected, which is the only thing this rule is for. */
+        sembus_pub_kv(sh->bus, "sh.effects", (const char *const[]){
+            "action", act->target,
+            "verdict", aios_effects_verdict_str(v),
+            "detail", first, NULL});
+        return 0;
+    }
+
+    /* Undeclared, incomplete or malformed: fail closed, and throw the staging
+     * directory away. A worker that touched a file it never mentioned has shown
+     * it cannot be trusted about the files it did mention, so "let the human
+     * review it anyway" would launder the lie into a diff. */
+    const char *reason = (v == EFFECTS_UNDECLARED) ? "UNDECLARED_EFFECT"
+                                                   : "EFFECTS_UNACCOUNTED";
+    sembus_pub_kv(sh->bus, "sh.action.refused", (const char *const[]){
+        "kind", aios_action_kind_name(act->kind),
+        "target", act->target, "verdict", "DENY",
+        "reason", reason,
+        "why", first[0] ? first : aios_effects_verdict_str(v), NULL});
+    sembus_pub_kv(sh->bus, "sh.action.log", (const char *const[]){
+        "verdict", "DENY", "reason", reason,
+        "action", act->target, "detail", first, NULL});
+
+    sh_stage_abandon(sh);
+
+    if (v == EFFECTS_UNDECLARED)
+        snprintf(err, ecap, "undeclared effect: the worker touched %.120s, "
+                            "which the descriptor never declared", first);
+    else
+        snprintf(err, ecap, "the worker could not account for its effects: %s",
+                 aios_effects_verdict_str(v));
+    return 1;
+}
+
+/* ---- the guardian: how the agent loop reaches policy and staging ----
+ *
+ * The agent loop used to call tool_exec() directly. That made it the one place
+ * an action ran with no descriptor, no verdict and no staging -- and the agent
+ * is precisely the component most likely to act unsupervised, so this was the
+ * largest hole in the constitution, not a detail.
+ *
+ * Every step now builds a real descriptor and asks the same two questions the
+ * shell asks: is this permitted, and does it land here or in staging?
+ */
+typedef struct {
+    sh_shell *sh;
+    const char *goal;      /* the agent's goal, for the intent hash */
+    size_t    n_staged;
+    int       n_refused;
+    int       jail_mutated;   /* fatal: the worker ignored staging entirely */
+
+    /* M4: the descriptor the guarded step built, kept so the post-check can
+     * compare the worker's account against the SAME claim that was permitted.
+     * Rebuilding it afterwards would compare reality against a different
+     * question. */
+    aios_action *last_act;
+} sh_guard_ctx;
+
+static int sh_agent_guard(void *ud, const char *tool, json_val *args,
+                          char *err, size_t ecap) {
+    sh_guard_ctx *g = (sh_guard_ctx *)ud;
+    if (!g || !g->sh) return 1;
+    sh_shell *sh = g->sh;
+    aios_action_free(g->last_act);
+    g->last_act = NULL;
+
+    const char *path = json_str(json_obj_get(args, "path"));
+    aios_act_kind kind = ACT_TOOL;
+    if (strcmp(tool, "fs.write") == 0) kind = ACT_FS_WRITE;
+    else if (strcmp(tool, "fs.read") == 0 || strcmp(tool, "fs.list") == 0 ||
+             strcmp(tool, "calc") == 0 || strcmp(tool, "memory.search") == 0 ||
+             strcmp(tool, "proc.info") == 0)
+        kind = ACT_TOOL;
+
+    /* An AI action. There is no path from the agent loop to a human-origin
+     * descriptor: the origin is not a parameter the planner can choose. */
+    /* The target must be the TOOL for a tool action, not the path: the gate
+     * looks up `target` among the shell's capabilities, so `fs.write` has to
+     * appear there for the capability rule to be decided. The path travels in
+     * args, and policy step 2 also inspects it directly. */
+    aios_action *act = aios_action_new(kind, ORIGIN_AI, tool);
+    if (!act) {
+        snprintf(err, ecap, "cannot build a descriptor for %s", tool);
+        return 1;
+    }
+
+    /* An AI action must carry an intent hash, and M1 refuses one that does
+     * not. A fresh descriptor has none, so without this the guardian would
+     * refuse every single step -- fail-closed, but useless. The intent is the
+     * agent's goal plus the tool, which is what a reviewer would want to see
+     * in the audit record. */
+    char intent[256];
+    snprintf(intent, sizeof intent, "%.180s -> %s", g->goal ? g->goal : "", tool);
+    aios_action_set_intent(act, intent);
+    (void)path;
+
+    int rc = 0;
+    if (kind == ACT_FS_WRITE && path) {
+        /* Declare the effects on the action itself, so policy sees exactly the
+         * descriptor a typed command would produce. This also gives step 2d a
+         * `path` to inspect even when the effect could not be declared. */
+        /* The action carries the path so M1 can validate it and policy step 2
+         * can inspect it; the content stays with the planner's args, which are
+         * what actually reach the tool. */
+        json_val *probe = json_new_obj();
+        json_obj_set(probe, "path", json_new_str(path));
+        json_obj_set(probe, "content", json_new_str(""));
+        aios_action_set_args(act, probe);
+        aios_action_declare_tool_effects(act, tool, probe);
+    }
+
+    /* The agent loop's own actions are ORIGIN_AI by construction -- the planner
+     * cannot choose an origin, which is the property that makes this line
+     * trustworthy rather than hopeful. */
+    if (action_gate(sh, act, ORIGIN_AI, err, ecap) != 0) {
+        g->n_refused++;
+        aios_action_free(act);
+        return 1;
+    }
+    action_accept(sh, act);
+
+    /* An AI write is staged, not applied. This is the same rule the typed
+     * path follows; the difference is that here the human never saw the
+     * command, so the diff afterwards is the only place they can catch it. */
+    if (kind == ACT_FS_WRITE) {
+        if (!sh->stage_live) {
+            if (!sh_stage_begin(sh, act, err, ecap)) {
+                aios_action_free(act);
+                return 1;
+            }
+        }
+        tool_reg_set_staging(sh->tools, sh->stage_dir);
+        g->n_staged++;
+    }
+
+    /* Keep the descriptor for the post-check; the tool gets its own copy of the
+     * args, so the loop's json_val is not consumed twice. */
+    aios_action_set_args(act, json_new_obj());
+    g->last_act = act;
+    (void)path;
+    return rc;
+}
+
+static int sh_agent_after(void *ud, const char *tool, char *err, size_t ecap) {
+    sh_guard_ctx *g = (sh_guard_ctx *)ud;
+    if (!g || !g->sh || !g->last_act) return 0;
+    (void)tool;
+
+    /* 1. what the worker says it did, against what it was permitted to do */
+    if (sh_check_effects(g->sh, g->last_act, err, ecap) != 0) return 1;
+
+    /* 2. what the JAIL says, against what the worker said. This is the only
+     *    check here that does not rely on the worker's honesty: a swapped or
+     *    compromised tool-exec can forge its account, but it cannot forge the
+     *    jail it left behind. */
+    char moved[AIOS_EFFECT_PATH_MAX] = {0};
+    if (sh_jail_moved(g->sh, moved, sizeof moved)) {
+        sh_stage_abandon(g->sh);        /* nothing to promote: the run is void */
+        g->jail_mutated = 1;
+        sembus_pub_kv(g->sh->bus, "sh.action.refused", (const char *const[]){
+            "kind", aios_action_kind_name(g->last_act->kind),
+            "target", g->last_act->target ? g->last_act->target : "",
+            "verdict", "DENY", "reason", "JAIL_MUTATED", "why", moved, NULL});
+        snprintf(err, ecap,
+                 "the jail changed during a staged write (%.120s): the worker is "
+                 "not honouring the staging directory, so its account of what it "
+                 "did cannot be trusted", moved);
+        return 1;
+    }
+    g->sh->n_witness = 0;
+    return 0;
+}
+
+/* Execute a tool THROUGH its descriptor.
+ *
+ * `act` is borrowed: the caller keeps ownership and frees it after the call,
+ * so the refusal text and any later milestone can still see it. The args are
+ * transferred out of the descriptor here, because tool_exec's contract is
+ * that args is consumed on every path.
+ *
+ * This is the ONLY way a tool runs. Command execution, argv parsing and the
+ * intent router all end up here (run_command -> run_tool_stage /
+ * SH_ROUTE_TOOL -> exec_tool_action). */
+static int exec_tool_action(sh_shell *sh, aios_action *act, aios_origin origin,
+                            char **text_out, json_val **json_out,
+                            char *err, size_t ecap) {
+    if (action_gate(sh, act, origin, err, ecap) != 0) {
+        stage_text_of(NULL, NULL, text_out);
+        *json_out = NULL;
+        return 1;
+    }
+    action_accept(sh, act);
+
+    /* M3: an AI write is intercepted before it can reach the jail. */
+    /* `sh->stage_live` is already set when the agent guardian staged this step
+     * earlier; a typed AI write gets here with it clear. Checking both means
+     * the witness runs for either route -- the first version of this only
+     * handled the typed one, and the swapped-worker test sailed through. */
+    bool staged = (sh->stage_live != 0);
+    if (staged && act->origin == ORIGIN_AI && strcmp(act->target, "fs.write") == 0) {
+        /* M7.5: a second AI write joins the session that is already live.
+         *
+         * The first version started a NEW session for every write, so the
+         * earlier change lost the shell's pointer to it. Both were real, both
+         * were promotable, and only one could be named. Joining keeps the
+         * person's decision in one place: they are shown one change with two
+         * rows, not two changes of which one is invisible. */
+        if (!sh_stage_extend(sh, act, err, ecap)) {
+            stage_text_of(NULL, NULL, text_out);
+            *json_out = NULL;
+            return 1;
+        }
+    } else if (!staged && act->origin == ORIGIN_AI &&
+               strcmp(act->target, "fs.write") == 0) {
+        if (!sh_stage_begin(sh, act, err, ecap)) {
+            stage_text_of(NULL, NULL, text_out);
+            *json_out = NULL;
+            return 1;
+        }
+        staged = true;
+    }
+
+    /* Tell the tool layer where an AI write must go. Cleared on every path so
+     * one staged command cannot redirect the next one. */
+    tool_reg_set_staging(sh->tools, staged ? sh->stage_dir : NULL);
+    tool_reg_clear_effects(sh->tools);
+    int rc = exec_tool(sh, act->target, aios_action_take_args(act),
+                       text_out, json_out, err, ecap);
+    tool_reg_set_staging(sh->tools, NULL);
+
+    /* M4: the verdict on the worker's own account, before anything is offered
+     * to the human as "here is what it wants to do". */
+    if (rc == 0 && sh_check_effects(sh, act, err, ecap) != 0) {
+        free(*text_out);
+        *text_out = strdup("");
+        json_free(*json_out);
+        *json_out = NULL;
+        return 1;
+    }
+
+    /* A jail mutation is not a step the agent can route around: it means the
+     * worker is not honouring staging at all. Report it as a fatal condition of
+     * the run rather than a failed step, or the agent reports success while
+     * reality has already been changed. */
+    if (staged) {
+        char moved[AIOS_EFFECT_PATH_MAX] = {0};
+        if (sh_jail_moved(sh, moved, sizeof moved)) {
+            sh_stage_abandon(sh);
+            snprintf(err, ecap,
+                     "the jail changed during a staged write (%.120s): the worker "
+                     "is not honouring the staging directory", moved);
+            sembus_pub_kv(sh->bus, "sh.action.refused", (const char *const[]){
+                "kind", aios_action_kind_name(act->kind),
+                "target", act->target ? act->target : "",
+                "verdict", "DENY", "reason", "JAIL_MUTATED", "why", moved, NULL});
+            free(*text_out);
+            *text_out = strdup("");
+            json_free(*json_out);
+            *json_out = NULL;
+            return 1;
+        }
+        sh->n_witness = 0;
+    }
+
+    /* M4b: and the check that does not depend on the worker telling the truth.
+     * If the jail moved while the worker was supposed to be writing into
+     * staging, the worker is enforcing nothing and its account is worthless --
+     * refuse, and say which file moved. */
+    if (staged) {
+        char moved[AIOS_EFFECT_PATH_MAX] = {0};
+        if (sh_jail_moved(sh, moved, sizeof moved)) {
+            sh_stage_drop(sh);
+            char reason[AIOS_EFFECT_PATH_MAX + 96];
+            snprintf(reason, sizeof reason,
+                     "the jail changed during a staged write (%.120s): the worker "
+                     "is not honouring the staging directory", moved);
+            sembus_pub_kv(sh->bus, "sh.action.refused", (const char *const[]){
+                "kind", aios_action_kind_name(act->kind),
+                "target", act->target ? act->target : "",
+                "verdict", "DENY", "reason", "JAIL_MUTATED",
+                "why", moved, NULL});
+            free(*text_out);
+            *text_out = strdup("");
+            json_free(*json_out);
+            *json_out = NULL;
+            snprintf(err, ecap, "%.400s", reason);
+            return 1;
+        }
+        sh->n_witness = 0;
+    }
+
+    if (staged) {
+        /* The worker wrote into the staging dir (it was told where). Replace
+         * the raw tool text with the diff the human needs to decide. */
+        free(*text_out);
+        char *msg = NULL;
+        rc = sh_stage_report(sh, &msg, err, ecap);
+        *text_out = msg;
+    }
+    return rc;
+}
+
 /* Build tool args from argv (key=value / {json} / positional shorthand),
- * then inject piped input where the tool wants it. */
+ * then inject piped input where the tool wants it.
+ *
+ * The origin is the CALLER'S, not this function's to decide (M7). A human typing
+ * a tool name and a model producing the same line are different events, and the
+ * only place that knows which happened is the caller of sh_exec_origin(). */
 static int run_tool_stage(sh_shell *sh, const char *name, sargv *a,
-                          const char *pipe_text,
+                          aios_origin origin,
+                          const char *raw_line, const char *pipe_text,
                           char **text_out, json_val **json_out,
                           char *err, size_t ecap) {
     json_val *args = json_new_obj();
@@ -481,13 +1636,256 @@ static int run_tool_stage(sh_shell *sh, const char *name, sargv *a,
             json_obj_set(args, "query", json_new_str(pipe_text));
         }
     }
-    return exec_tool(sh, name, args, text_out, json_out, err, ecap);
+    /* M1: wrap the explicitly-typed command in a descriptor and validate it
+     * before anything executes. The descriptor carries the effects the tool
+     * implies, so the claim is on the record even when a human asked. */
+    aios_action *act = aios_action_new(ACT_TOOL, origin, name);
+    if (!act) {
+        json_free(args);
+        snprintf(err, ecap, "oom (descriptor)");
+        return 1;
+    }
+    aios_action_set_intent(act, raw_line ? raw_line : name);
+    aios_action_set_args(act, args);
+    /* If the effects CANNOT be declared (e.g. a path too long to record), we
+     * must not run the call: nothing downstream could then verify what it
+     * touched. Refusing is the fail-closed choice, and the reason is stated
+     * rather than a tool silently executing undeclared. */
+    if (aios_action_declare_tool_effects(act, name, act->args) != AIOS_OK) {
+        stage_text_of(NULL, NULL, text_out);
+        *json_out = NULL;
+        snprintf(err, ecap,
+                 "action refused: effects of %s cannot be declared "
+                 "(path too long to record)", name);
+        aios_action_free(act);
+        return 1;
+    }
+    int rc = exec_tool_action(sh, act, origin, text_out, json_out, err, ecap);
+    aios_action_free(act);
+    return rc;
 }
 
 /* ---------------- agent execution ---------------- */
 
-static int run_agent_fg(sh_shell *sh, const char *goal,
+/* `goal` is the descriptor's target; the descriptor itself carries the
+ * intent hash and origin that M6 will log and M2 will evaluate. An agent
+ * cannot be started without one. */
+
+/* M5: take a snapshot before anything a rollback might have to undo.
+ *
+ * This is the whole guarantee of the milestone: "rollback is available" means a
+ * snapshot already exists at the moment something went wrong, not that a
+ * snapshot COULD have been taken. So it happens automatically, here, before the
+ * work -- not as a command a human has to remember at 2am.
+ *
+ * A failure to snapshot is published and reported but does not stop the work:
+ * refusing to run an agent because a backup could not be written would make the
+ * backup a single point of failure for the whole OS. The refusal is visible
+ * (`sh.snap.failed` on the bus, and the text of the command) because a
+ * rollback that silently does not exist is worse than a loud one.
+ *
+ * Returns true when a snapshot exists afterwards. */
+
+/* ---- M5: asking the supervisor instead of doing it ourselves ---- *
+ *
+ * Rollback power belongs to PID 1 (include/aios/supervisor.h says why). The shell
+ * therefore asks over the socket when the supervisor is there, and only falls
+ * back to doing the work in-process when it is not -- which is the case on a
+ * developer's machine, where there is no PID 1 to ask.
+ *
+ * The fallback is honest about itself: it prints "no supervisor". A shell that
+ * silently used its own copy while claiming the OS handled it would be claiming
+ * a guarantee it did not have.
+ */
+static bool sup_round_trip(const char *req, char *out, size_t cap) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sun_family = AF_UNIX;
+    snprintf(sa.sun_path, sizeof sa.sun_path, "%s", AIOS_SUP_SOCK);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        close(fd);
+        return false;
+    }
+    (void)!write(fd, req, strlen(req));
+
+    size_t n = 0;
+    struct pollfd pfd = { fd, POLLIN, 0 };
+    while (n + 1 < cap) {
+        /* Restore can copy a whole tree; a fixed 5 s would fail on a big store
+         * where the answer is late but correct. */
+        if (poll(&pfd, 1, 30000) <= 0) break;
+        ssize_t r = read(fd, out + n, cap - n - 1);
+        if (r <= 0) break;
+        n += (size_t)r;
+        if (memchr(out, '\n', n)) break;
+    }
+    out[n] = 0;
+    close(fd);
+    return n > 0;
+}
+
+/* Ask PID 1 to put the trees back. The shell still decides WHICH snapshot and
+ * still revokes its own jobs first -- those are the shell's own state, and PID 1
+ * has no business knowing about this shell's job table. What it asks for is the
+ * part that belongs to the OS: moving two trees. */
+static bool sup_restore(const char *which, char *replaced, size_t rcap,
+                        char *err, size_t ecap) {
+    char req[512];
+    snprintf(req, sizeof req, "{\"op\":\"restore\",\"id\":\"%.200s\"}\n", which);
+    char out[4096] = {0};
+    if (!sup_round_trip(req, out, sizeof out)) {
+        snprintf(err, ecap, "the supervisor did not answer");
+        return false;
+    }
+    if (strstr(out, "\"ok\":true") == NULL) {
+        const char *e = strstr(out, "\"error\":\"");
+        snprintf(err, ecap, "%.400s", e ? e + 9 : "supervisor refused");
+        return false;
+    }
+    if (replaced && rcap) {
+        const char *r = strstr(out, "\"replaced\":\"");
+        if (r) {
+            r += 12;
+            size_t n = 0;
+            while (r[n] && r[n] != '"' && n + 1 < rcap) { replaced[n] = r[n]; n++; }
+            replaced[n] = 0;
+        }
+    }
+    return true;
+}
+
+/* Is there a supervisor to ask? A stale socket that nobody is listening on must
+ * count as absent, or every `snap` on a developer machine would try the socket
+ * first and print a connection error. */
+static bool sup_present(const sh_shell *sh) {
+    /* If the socket file is not there, do not even try to connect: on a
+     * developer's machine there is no supervisor, and every `snap` would pay a
+     * failed connection for nothing.
+     *
+     * If the socket's DIRECTORY exists but the socket does not, the supervisor is
+     * starting right now -- PID 1 forks it before any shell, but a shell started
+     * by hand in the same second can still win the race. Waiting briefly is the
+     * difference between "PID 1 owns rollback" and "PID 1 owns rollback unless you
+     * were quick", which is not a guarantee at all. */
+    if (access(AIOS_SUP_SOCK, F_OK) != 0) {
+        if (access(AIOS_SUP_DIR, F_OK) != 0) return false;
+        bool up = false;
+        for (int i = 0; i < 50 && !up; i++) {          /* up to ~1 s */
+            usleep(20 * 1000);
+            up = access(AIOS_SUP_SOCK, F_OK) == 0;
+        }
+        if (!up) return false;
+    }
+    char out[2048] = {0};
+    if (!sup_round_trip("{\"op\":\"ping\"}\n", out, sizeof out)) return false;
+    if (strstr(out, "\"ok\":true") == NULL) return false;
+
+    /* It answered -- but is it serving MY trees? In the image PID 1 serves
+     * /workspace and /data/aios/store. The test suite points a shell at a scratch
+     * jail and store, and asking PID 1 to snapshot those would write the snapshot
+     * into /data/aios/store and then fail to find it in the scratch store. The
+     * user-visible symptom was "snap taken" followed by a listing that did not
+     * contain it.
+     *
+     * Comparing the store is the honest test: two shells can share a store and
+     * jail and be the same trees; a different store is not this shell's state. */
+    const char *sp = strstr(out, "\"store\":\"");
+    if (!sp) return false;
+    sp += 9;
+    size_t n = 0;
+    while (sp[n] && sp[n] != '"') n++;
+    if (n != strlen(sh->store) || strncmp(sp, sh->store, n) != 0) return false;
+    return true;
+}
+
+/* Take a snapshot, through PID 1 when it is there. Returns true on success and
+ * fills `id` when the supervisor supplied one. */
+static bool sup_take(const char *label, char *id, size_t icap, char *err, size_t ecap) {
+    char req[512];
+    snprintf(req, sizeof req, "{\"op\":\"snap\",\"label\":\"%.200s\"}\n", label);
+    char out[4096] = {0};
+    if (!sup_round_trip(req, out, sizeof out)) {
+        snprintf(err, ecap, "the supervisor did not answer");
+        return false;
+    }
+    if (strstr(out, "\"ok\":true") == NULL) {
+        const char *e = strstr(out, "\"error\":\"");
+        snprintf(err, ecap, "supervisor refused: %.200s",
+                 e ? e + 9 : "no reason given");
+        return false;
+    }
+    const char *i = strstr(out, "\"id\":\"");
+    if (i && id && icap) {
+        i += 6;
+        size_t n = 0;
+        while (i[n] && i[n] != '"' && n + 1 < icap) { id[n] = i[n]; n++; }
+        id[n] = 0;
+    }
+    return true;
+}
+
+static bool sh_snap_before(sh_shell *sh, const char *why, char *note, size_t ncap) {
+    char id[AIOS_SNAP_ID_MAX] = {0};
+    char err[256] = {0};
+    /* Ask PID 1 when it is there. It takes the snapshot of the SAME jail and
+     * store, so the answer is identical; what differs is who holds the power. */
+    bool ok;
+    if (sup_present(sh))
+        ok = sup_take(why, id, sizeof id, err, sizeof err);
+    else
+        ok = snap_take(sh->jail, sh->store, why, id, sizeof id, err, sizeof err);
+    if (!ok) {
+        sembus_pub_kv(sh->bus, "sh.snap.failed",
+                      (const char *const[]){ "why", why, "error", err, NULL });
+        if (note && ncap)
+            snprintf(note, ncap, " (no snapshot taken: %.120s)", err);
+        return false;
+    }
+    sembus_pub_kv(sh->bus, "sh.snap.taken",
+                  (const char *const[]){ "id", id, "why", why, NULL });
+    /* Retention is enforced every time, not by a cron nobody runs. */
+    char perr[192] = {0};
+    (void)snap_prune(sh->store, AIOS_SNAP_KEEP, perr, sizeof perr);
+    if (note && ncap) snprintf(note, ncap, " (snapshot %.24s)", id);
+    return true;
+}
+
+/* M5: revoke running jobs. A restore that leaves an agent writing into the tree
+ * it is restoring is not a rollback, it is a race. Returns how many were killed. */
+static int sh_revoke_jobs(sh_shell *sh) {
+    int killed = 0;
+    for (int i = 0; i < sh->njobs; i++) {
+        sh_job *j = &sh->jobs[i];
+        if (j->state != JOB_RUNNING) continue;
+        kill(j->pid, SIGKILL);
+        for (int k = 0; k < 200; k++) {
+            int wst = 0;
+            if (waitpid(j->pid, &wst, WNOHANG) == j->pid) break;
+            usleep(10000);
+        }
+        j->state = JOB_KILLED;
+        killed++;
+    }
+    if (killed)
+        sembus_pub_kv(sh->bus, "sh.jobs.revoked",
+                      (const char *const[]){ "n", "revoked", "why", "rollback", NULL });
+    return killed;
+}
+
+static int run_agent_fg(sh_shell *sh, const aios_action *act, aios_origin origin,
                         char **text_out, char *err, size_t ecap) {
+    if (action_gate(sh, act, origin, err, ecap) != 0) {
+        *text_out = strdup("");
+        return 1;
+    }
+    action_accept(sh, act);
+    /* M5: the snapshot happens before the first tool call, so every write the
+     * agent makes has something to be rolled back to. */
+    char snapnote[160] = {0};
+    sh_snap_before(sh, "before an agent run", snapnote, sizeof snapnote);
+    const char *goal = act->target;
     cortex *cx = strcmp(sh->cortex_mode, "llm") == 0
                  ? cortex_llm_create(NULL)
                  : cortex_scripted_create(goal);
@@ -500,9 +1898,11 @@ static int run_agent_fg(sh_shell *sh, const char *goal,
     sembus_pub_kv(sh->bus, "sh.agent.start",
                   (const char *const[]){"agent", "sh", "goal", goal,
                                         "cortex", sh->cortex_mode, NULL});
+    sh_guard_ctx gctx = { .sh = sh, .goal = goal, .n_staged = 0, .n_refused = 0 };
     agent_cfg cfg = {
         .name = "sh", .goal = goal, .cx = cx,
-        .tools = sh->tools, .mem = sh->mem, .max_steps = 10
+        .tools = sh->tools, .mem = sh->mem, .max_steps = 10,
+        .guard = { .check = sh_agent_guard, .after = sh_agent_after, .ud = &gctx }
     };
     char final[2048] = {0};
     aios_status st = agent_run(&cfg, final, sizeof final);
@@ -514,9 +1914,42 @@ static int run_agent_fg(sh_shell *sh, const char *goal,
                                                     : aios_status_str(st),
                                         "ms", msbuf, NULL});
     cortex_free(cx);
-    *text_out = xstrdup(final);
+
+    /* If the agent tried to write, what the human needs is the diff, not the
+     * agent's summary of it. The summary is optimistic by construction. */
+    if (sh->stage_live) {
+        char *diff = NULL;
+        sh_stage_report(sh, &diff, err, ecap);
+        if (diff) {
+            char *msg = NULL;
+            if (asprintf(&msg, "%s\n%s", final, diff) < 0) msg = NULL;
+            free(diff);
+            *text_out = msg ? msg : xstrdup(final);
+        } else {
+            *text_out = xstrdup(final);
+        }
+        sh->stage_live = 0;
+        sh->stage_dir[0] = 0;
+        sh->n_witness = 0;
+    } else {
+        *text_out = xstrdup(final);
+        sh->n_witness = 0;
+    }
+    if (gctx.jail_mutated) {
+        sh_stage_drop(sh);
+        snprintf(err, ecap,
+                 "agent run refused: the tool worker wrote into the jail instead "
+                 "of staging, so its result was not accepted");
+        return 1;
+    }
     if (st != AIOS_OK) {
-        snprintf(err, ecap, "agent: %s", final[0] ? final : aios_status_str(st));
+        /* Clamp the message into the caller's buffer on purpose: a failed
+         * agent run may carry a 2 KB final state, and err/ecap is whatever
+         * the caller asked for. Truncation is fine here - this is a
+         * human-readable error, and snprintf always terminates. */
+        const char *why = final[0] ? final : aios_status_str(st);
+        size_t room = ecap > 8 ? ecap - 8 : 0;   /* room for "agent: " */
+        snprintf(err, ecap, "agent: %.*s", (int)room, why);
         return 1;
     }
     return 0;
@@ -607,6 +2040,14 @@ static const char HELP_TEXT[] =
     "  tune [k=v ...]              show/rewrite the autopilot conf (M7)\n"
     "  lm [classify|gen|selftest]  the OS micro language model (M7)\n"
     "  dur [sync]                  durable-store status (ext2 side disk, M8)\n"
+    "  audit [verify]              walk the hash-chained record and say if it holds\n"
+    "  snap [take LABEL]           list snapshots, or take one now (M5)\n"
+    "  rollback [latest|ID]        undo to a snapshot; running jobs are revoked\n"
+    "  pending | staged            list pending changes (one line / with diffs)\n"
+    "  diff <id>                   read ONE pending change (M8)\n"
+    "  promote <id> | discard <id> decide one; a bare word refuses if two are pending\n"
+    "  machine \"LINE\"               run LINE as if a MODEL had typed it (M7)\n"
+    "                              origin tagging: what a machine may and may not do\n"
     "  cortex [scripted|micro|llm] show/switch the routing cortex\n"
     "  jail [DIR] | store [DIR]    show/rebind workspace jail / OS store\n"
     "  agent GOAL...               run an agent to completion (foreground)\n"
@@ -623,6 +2064,578 @@ static const char HELP_TEXT[] =
     "          echo 12*(7+5) | calc\n"
     "          summarize the workspace\n"
     "          spawn summarize the workspace ; jobs ; wait all\n";
+
+/* `policy` — show the law. Also `policy check <kind> <target>` to ask the
+ * evaluator what it would say, which is how a human (or a debugging engineer)
+ * finds out why something they expected to work was refused.
+ *
+ * There is deliberately no `policy allow` / `policy override`: a writable rule
+ * set is a privilege escalation with a nicer name. Changing the law means
+ * changing the source and shipping an image. */
+static int builtin_policy(sh_shell *sh, sargv *a,
+                          char **text_out, json_val **json_out,
+                          char *err, size_t ecap) {
+    sb b = {0};
+
+    if (a->n >= 2 && strcmp(a->v[1], "check") == 0) {
+        /* policy check <kind> <target> */
+        aios_act_kind kind = ACT_TOOL;
+        const char *target = a->n >= 4 ? a->v[3] : (a->n >= 3 ? a->v[2] : NULL);
+        if (a->n >= 3 && !target) { snprintf(err, ecap, "policy check needs a target"); return 1; }
+        const char *k = a->n >= 4 ? a->v[2] : "tool";
+        if (strcmp(k, "agent") == 0) kind = ACT_AGENT;
+        else if (strcmp(k, "shell") == 0) kind = ACT_SHELL;
+        else if (strcmp(k, "delete") == 0) kind = ACT_FS_DELETE;
+        else if (strcmp(k, "spawn") == 0) kind = ACT_JOB_SPAWN;
+        else if (strcmp(k, "write") == 0) kind = ACT_FS_WRITE;
+
+        aios_action *act = aios_action_new(kind, ORIGIN_AI, target);
+        if (!act) { snprintf(err, ecap, "cannot build a descriptor"); return 1; }
+        aios_action_set_intent(act, "policy check");
+        aios_policy_ctx pctx = aios_policy_ctx_default();
+        pctx.sandbox_executed = (kind == ACT_TOOL || kind == ACT_AGENT);
+        /* M7: the same function the gate calls, so this builtin reports what the
+         * gate would see rather than its own guess about it. */
+        pctx.rollback_available = sh_rollback_available(sh);
+        aios_decision d = aios_policy_eval(act, sh->jail, SH_CAPS, SH_N_CAPS,
+                                           &pctx, aios_now_ms());
+        char line[512];
+        snprintf(line, sizeof line, "verdict: %s [%s]\n  %s\n",
+                 aios_policy_verdict_str(d.v), aios_policy_reason_str(d.r), d.why);
+        sb_puts(&b, line);
+        /* now the same thing as a human, which is the interesting comparison */
+        aios_action *h = aios_action_new(kind, ORIGIN_HUMAN, target);
+        if (h) {
+            aios_decision hd = aios_policy_eval(h, sh->jail, NULL, 0, &pctx,
+                                                aios_now_ms());
+            snprintf(line, sizeof line, "as human: %s [%s]\n",
+                     aios_policy_verdict_str(hd.v),
+                     aios_policy_reason_str(hd.r));
+            sb_puts(&b, line);
+            aios_action_free(h);
+        }
+        snprintf(line, sizeof line, "as judged: sandbox=%s rollback=%s\n",
+                 pctx.sandbox_executed ? "done" : "none",
+                 pctx.rollback_available ? "available" : "not available");
+        sb_puts(&b, line);
+        aios_action_free(act);
+        *text_out = b.s ? b.s : strdup("");
+        return 0;
+    }
+
+    sb_puts(&b, "AI-OS law table (compiled in; no file, no override)\n");
+    sb_puts(&b, "tier 0 = constitutional veto (binds the human too)\n");
+    sb_puts(&b, "tier 1 = critical (machine actions stopped or sent to a human)\n\n");
+    size_t n = aios_policy_rule_count();
+    for (size_t i = 0; i < n; i++) {
+        const char *law = NULL;
+        aios_reason r = R_OK;
+        int tier = 0;
+        if (!aios_policy_rule_at(i, &law, &tier, &r)) continue;
+        char line[512];
+        snprintf(line, sizeof line, "  [%d] %-62.62s (%s)\n",
+                 tier, law ? law : "?", aios_policy_reason_str(r));
+        sb_puts(&b, line);
+    }
+    sb_puts(&b, "\ncapabilities granted to this shell's AI:\n  ");
+    for (int i = 0; i < SH_N_CAPS; i++) {
+        sb_puts(&b, SH_CAPS[i]);
+        sb_puts(&b, i + 1 < SH_N_CAPS ? ", " : "\n");
+    }
+    *text_out = b.s ? b.s : strdup("");
+    (void)json_out;
+    return 0;
+}
+
+/* ---- M3: the human half of staging ---- */
+/* M7.5: `staged` shows EVERY pending change, each with an id a human can type.
+ *
+ * Before this it showed one change -- whichever `sh_latest_stage()` happened to
+ * pick -- and printed no id at all, so a second pending change could be neither
+ * seen nor named. The output shape stays close to what it was (a diff and a
+ * hint) so muscle memory and the boot script keep working; what is new is that
+ * the answer is the whole answer.
+ */
+static int builtin_staged(sh_shell *sh, char **text_out, json_val **json_out,
+                          char *err, size_t ecap) {
+    stage_pending_list l;
+    if (!stage_pending_scan(sh->store, &l, err, ecap)) return 1;
+
+    if (l.n == 0) {
+        *text_out = strdup("nothing is staged\n");
+        (void)json_out;
+        stage_pending_free(&l);
+        return 0;
+    }
+
+    char *acc = NULL;
+    size_t cap = 0;
+    FILE *f = open_memstream(&acc, &cap);
+    if (!f) { stage_pending_free(&l); snprintf(err, ecap, "oom"); return 1; }
+
+    if (l.n > 1)
+        fprintf(f, "%zu changes are pending. Each block below is one change; "
+                   "none is chosen for you.\n\n", l.n);
+
+    for (size_t i = 0; i < l.n; i++) {
+        stage_pending *p = &l.items[i];
+        /* Always print the id, even for a single change. One place to look for
+         * it, and `promote <id>` works the same way whether one change is
+         * pending or five -- the form of the answer does not depend on how many
+         * there happen to be. */
+        fprintf(f, "[%s]\n", p->id);
+
+        stage_session s;
+        char oerr[192] = {0};
+        if (!stage_open(p->dir, &s, oerr, sizeof oerr)) {
+            fprintf(f, "  (could not be reopened: %s)\n\n", oerr);
+            continue;
+        }
+        stage_diff d;
+        if (stage_diff_compute(&s, &d, oerr, sizeof oerr)) {
+            char *body = stage_diff_text(&d);
+            if (body) fprintf(f, "%s", body);
+            free(body);
+            stage_diff_free(&d);
+        } else {
+            fprintf(f, "  (could not compute the diff: %s)\n", oerr);
+        }
+
+        /* Files the manifest does not name cannot be promoted and were not in
+         * the diff above. Saying nothing here is how they went missing. */
+        if (p->n_unnoted)
+            fprintf(f, "  %zu file%s inside this change %s not named by its "
+                       "manifest and cannot be promoted.\n",
+                    p->n_unnoted, p->n_unnoted == 1 ? "" : "s",
+                    p->n_unnoted == 1 ? "is" : "are");
+        if (p->state == STAGE_MANIFEST_PROMOTING)
+            fprintf(f, "  A promote of this change started and did not finish. "
+                       "Promoting again completes it.\n");
+        if (!sh_stage_has_bytes(p->dir) && p->n_notes)
+            fprintf(f, "  nothing is actually staged here: the rows above are "
+                       "declared effects,\n  not files. There is nothing here "
+                       "to promote.\n");
+        stage_end(&s);
+        fprintf(f, "\n");
+    }
+
+    if (l.n == 1)
+        fprintf(f, "  promote %s        apply it\n"
+                   "  discard %s        throw it away\n",
+                l.items[0].id, l.items[0].id);
+    else
+        fprintf(f, "  promote <id> / discard <id>   you must name which change\n");
+    if (l.truncated)
+        fprintf(f, "  (more changes are pending than this list can show)\n");
+
+    fclose(f);
+    *text_out = acc ? acc : strdup("");
+    (void)json_out;
+    stage_pending_free(&l);
+    return 0;
+}
+
+/* M7.5: resolve what the human typed into exactly one session, never a guess.
+ *
+ * `promote` with no argument used to mean "whichever is newest", which is a
+ * choice made by mtime and readdir order on the human's behalf, in the one
+ * place where the difference between two changes is the whole point. Now it
+ * means "the one pending change", and if there is more than one the answer is
+ * an error that names them. */
+static bool sh_pick_session(sh_shell *sh, sargv *a, const char *verb,
+                            char *dir, size_t dcap, char *err, size_t ecap) {
+    const char *what = (a && a->n >= 2) ? a->v[1] : NULL;
+    if (!stage_resolve(sh->store, verb, what, dir, dcap, err, ecap)) {
+        /* The message from stage_resolve already names the verb and says what
+         * was pending, so it is used as-is rather than wrapped: "cannot promote:
+         * cannot promote: ..." is how a wrapper makes a clear refusal unclear. */
+        return false;
+    }
+    return true;
+}
+
+/* M8: the record has to justify the promote, and it has to justify THIS one.
+ *
+ * Do.4 of the card says "refuse to promote anything whose audit record failed
+ * audit verify". Implemented literally that would check a nearly-always-true
+ * condition: verify says the whole chain is intact, and a chain can be intact
+ * while saying nothing at all about the change in front of you. So there are two
+ * refusals here, and the second is the one that matters:
+ *
+ *   - the chain does not verify  -> the record of this change is in doubt;
+ *   - no record names this id    -> there is no record of this change at all.
+ *
+ * Both mean the same thing for a promote: nobody can say what was approved. That
+ * is the fail-closed direction, and it is why `sh_audit_stage()` writes the
+ * record when the change is OFFERED -- so a change that reached a person is
+ * always one whose id is on the record before they decide.
+ *
+ * What this does NOT do (say it plainly): it does not recompute the hash of the
+ * bytes being promoted, so it still cannot tell that the diff a human read is the
+ * diff being applied. A person with write access to the store can change `upper/`
+ * between `staged` and `promote` and the record will still verify. That binding is
+ * a content hash in the manifest and is not in this change; see D35.
+ */
+static int sh_promote_gate(sh_shell *sh, const stage_session *s,
+                           char *err, size_t ecap) {
+    const char *base = strrchr(s->dir, '/');
+    base = base ? base + 1 : s->dir;
+
+    audit_check c = audit_verify(sh->store, 0);
+    if (c.v != AUDIT_OK) {
+        char why[192];
+        snprintf(why, sizeof why, "%s at seq %lld",
+                 audit_verdict_str(c.v), c.seq);
+        sembus_pub_kv(sh->bus, "sh.stage.promote_refused",
+                      (const char *const[]){"stage", base, "why", why, NULL});
+        snprintf(err, ecap,
+                 "refusing to promote %.80s: the audit chain does not verify "
+                 "(%s at seq %lld). What the record says about this change is "
+                 "exactly what is in doubt.", base,
+                 audit_verdict_str(c.v), c.seq);
+        return 1;
+    }
+
+    long long seq = audit_stage_record(sh->store, base);
+    if (seq < 0) {
+        sembus_pub_kv(sh->bus, "sh.stage.promote_refused",
+                      (const char *const[]){"stage", base, "why", "no_record", NULL});
+        snprintf(err, ecap,
+                 "refusing to promote %.80s: no audit record names it. A change "
+                 "whose proposal was never recorded cannot be shown afterwards to "
+                 "have been approved. Discard it and stage it again.", base);
+        return 1;
+    }
+    return 0;
+}
+
+/* M8: `pending` -- one line per change, for when you are looking rather than
+ * reading. `staged` stays the full view with diffs; this is the index.
+ *
+ * It exists as a separate word because the two jobs are different: deciding
+ * needs the diff, and deciding WHICH change to look at needs a list that fits on
+ * a screen. The card asked for `pending`; `staged` keeps its name because the
+ * boot proof and a person's fingers both already use it.
+ */
+static int builtin_pending(sh_shell *sh, char **text_out, json_val **json_out,
+                           char *err, size_t ecap) {
+    stage_pending_list l;
+    if (!stage_pending_scan(sh->store, &l, err, ecap)) return 1;
+    if (l.n == 0) {
+        *text_out = strdup("nothing is pending\n");
+        (void)json_out;
+        stage_pending_free(&l);
+        return 0;
+    }
+
+    char *acc = NULL;
+    size_t cap = 0;
+    FILE *f = open_memstream(&acc, &cap);
+    if (!f) { stage_pending_free(&l); snprintf(err, ecap, "oom"); return 1; }
+
+    fprintf(f, "%zu pending%s\n", l.n, l.n == 1 ? "" : " changes");
+    for (size_t i = 0; i < l.n; i++) {
+        stage_pending *p = &l.items[i];
+        /* The badge is not decoration: a person deciding on a change should be
+         * able to see at a glance that a model proposed it, and the audit record
+         * is what says so. */
+        const char *who = "-";
+        char who_buf[24] = {0};
+        stage_session s;
+        char oerr[192] = {0};
+        if (stage_open(p->dir, &s, oerr, sizeof oerr)) {
+            /* The origin is in the record, not the directory. Ask the record. */
+            long long seq = audit_stage_record(sh->store, p->id);
+            if (seq >= 0) {
+                snprintf(who_buf, sizeof who_buf, "seq %lld", seq);
+                who = who_buf;
+            }
+            stage_end(&s);
+        }
+        /* id, what it does, origin/seq. The summary is the middle column
+         * because "1 file" tells a person nothing about whether they want it. */
+        if (p->summary[0])
+            fprintf(f, "  [%s]  %-30.30s  %s%s\n",
+                    p->id, p->summary, who,
+                    p->state == STAGE_MANIFEST_PROMOTING ? "  (promote unfinished)" : "");
+        else
+            fprintf(f, "  [%s]  %zu file%s  %s%s\n",
+                    p->id, p->n_files, p->n_files == 1 ? "" : "s", who,
+                    p->state == STAGE_MANIFEST_PROMOTING ? "  (promote unfinished)" : "");
+        if (p->n_unnoted)
+            fprintf(f, "      %zu file%s not named by the manifest\n",
+                    p->n_unnoted, p->n_unnoted == 1 ? "" : "s");
+    }
+    if (l.truncated) fprintf(f, "  (more than this list can show)\n");
+    fprintf(f, "  diff <id>      read one change\n"
+               "  promote <id>   apply it\n"
+               "  discard <id>   throw it away\n");
+    fclose(f);
+    *text_out = acc ? acc : strdup("");
+    (void)json_out;
+    stage_pending_free(&l);
+    return 0;
+}
+
+/* M8: `diff <id>` -- one change, no other change's rows around it.
+ *
+ * `staged` prints every pending change because leaving one out is how a reviewed
+ * change went missing (D34). But a person deciding on ONE change should not have
+ * to read past the others, and the id they type should be echoed back so they can
+ * see they are looking at the thing they named.
+ */
+static int builtin_diff(sh_shell *sh, sargv *a, char **text_out,
+                        json_val **json_out, char *err, size_t ecap) {
+    if (a->n < 2) {
+        snprintf(err, ecap, "usage: diff <id>   (`pending` lists the ids)");
+        return 1;
+    }
+    char dir[600];
+    if (!stage_resolve(sh->store, "diff", a->v[1], dir, sizeof dir, err, ecap))
+        return 1;
+
+    stage_session s;
+    if (!stage_open(dir, &s, err, ecap)) return 1;
+    stage_diff d;
+    if (!stage_diff_compute(&s, &d, err, ecap)) { stage_end(&s); return 1; }
+
+    char *body = stage_diff_text(&d);
+    const char *base = strrchr(s.dir, '/');
+    base = base ? base + 1 : s.dir;
+    char *msg = NULL;
+    if (asprintf(&msg, "change %s\n%s", base, body ? body : "") < 0) msg = NULL;
+    free(body);
+    stage_diff_free(&d);
+
+    if (msg && !sh_stage_has_bytes(dir)) {
+        char *w = NULL;
+        if (asprintf(&w, "%s  nothing is actually staged: the rows above are "
+                          "declared effects, not files.\n", msg) >= 0) {
+            free(msg);
+            msg = w;
+        }
+    }
+    *text_out = msg ? msg : strdup("");
+    stage_end(&s);
+    (void)json_out;
+    return 0;
+}
+
+/* M8: `promote all`.
+ *
+ * Why a word and not a wildcard: D34 is the record of what happens when the one
+ * command that makes a change real is allowed to guess which change you meant.
+ * `all` is not a prefix, not an empty argument, and not a default -- it is a word
+ * a person has to type, and typing it is a decision to apply EVERYTHING pending.
+ *
+ * It is also the one place the gate has to run per change rather than once. A
+ * chain that verifies says nothing about whether each individual change is on the
+ * record, so each session gets its own sh_promote_gate() and the first refusal
+ * stops the run: after a refusal, applying the rest would be applying changes in
+ * an order the person did not choose and cannot see.
+ *
+ * Partial success is reported honestly. If two of three promoted and the third
+ * was refused, the text says so and the status is non-zero, because "promote all"
+ * that applied some is not a success.
+ */
+static int builtin_promote_all(sh_shell *sh, char **text_out, char *err,
+                               size_t ecap) {
+    stage_pending_list l;
+    if (!stage_pending_scan(sh->store, &l, err, ecap)) return 1;
+    if (l.n == 0) {
+        *text_out = strdup("nothing is pending: there is nothing to promote\n");
+        stage_pending_free(&l);
+        return 0;
+    }
+
+    char *acc = NULL;
+    size_t cap = 0;
+    FILE *f = open_memstream(&acc, &cap);
+    if (!f) { stage_pending_free(&l); snprintf(err, ecap, "oom"); return 1; }
+
+    size_t done = 0;
+    int rc = 0;
+    fprintf(f, "promoting %zu change%s\n", l.n, l.n == 1 ? "" : "s");
+    for (size_t i = 0; i < l.n; i++) {
+        stage_pending *p = &l.items[i];
+        stage_session s;
+        char oerr[320] = {0};
+        if (!stage_open(p->dir, &s, oerr, sizeof oerr)) {
+            fprintf(f, "  [%s]  could not open: %.120s\n", p->id, oerr);
+            rc = 1;
+            break;
+        }
+        if (sh_promote_gate(sh, &s, oerr, sizeof oerr) != 0) {
+            fprintf(f, "  [%s]  refused -- %.200s\n", p->id, oerr);
+            /* Carry the reason out as the command's error too: the per-change
+             * lines above say which change, and this says why, so a caller that
+             * only reads ->error still learns the cause. */
+            snprintf(err, ecap, "%.300s", oerr);
+            stage_end(&s);
+            rc = 1;
+            break;
+        }
+        char snapnote[160] = {0};
+        sh_snap_before(sh, "before a promote", snapnote, sizeof snapnote);
+        size_t n = 0;
+        bool ok = stage_promote_locked(&s, sh->last_origin, &n, oerr, sizeof oerr);
+        if (ok && n == 0) {
+            /* The session was promotable but there were no bytes in it. Counting
+             * that as "applied" would make "2 changes applied" print while the
+             * jail gained nothing -- a number that flatters the command. Say it
+             * for what it is. */
+            fprintf(f, "  [%s]  nothing staged to apply (effects declared, no bytes)\n",
+                    p->id);
+            stage_end(&s);
+            continue;
+        }
+        if (ok) {
+            done++;
+            fprintf(f, "  [%s]  promoted %zu file%s\n", p->id, n, n == 1 ? "" : "s");
+            if (sh->bus) {
+                char ev[512];
+                snprintf(ev, sizeof ev, "{\"files\":%zu,\"dir\":\"%.300s\"}", n, s.dir);
+                sembus_pub(sh->bus, "sh.stage.promote", ev);
+            }
+        } else {
+            fprintf(f, "  [%s]  failed -- %.200s\n", p->id, oerr);
+            snprintf(err, ecap, "%.300s", oerr);
+            rc = 1;
+        }
+        stage_end(&s);
+        if (!ok) break;
+    }
+    fclose(f);
+    stage_pending_free(&l);
+
+    /* Say how far it got, always. A run that stopped early and a run that
+     * finished must not read the same. */
+    char tail[200];
+    snprintf(tail, sizeof tail, "%zu change%s applied; %.140s",
+             done, done == 1 ? "" : "s",
+             rc ? "stopped at the first refusal -- the rest were not touched"
+                : "nothing left pending");
+    char *full = NULL;
+    if (asprintf(&full, "%s%s\n", acc ? acc : "", tail) >= 0) {
+        free(acc);
+        acc = full;
+    }
+    *text_out = acc ? acc : strdup("");
+    return rc;
+}
+
+static int builtin_promote(sh_shell *sh, sargv *a, char **text_out,
+                           json_val **json_out, char *err, size_t ecap) {
+    /* `all` is matched as a whole word, before any id resolution, so that a
+     * change whose id happens to begin with "all" can never be confused with
+     * it. An id is hex digits and a dash; "all" is not a legal prefix of one. */
+    if (a && a->n >= 2 && strcmp(a->v[1], "all") == 0) {
+        if (a->n > 2) {
+            snprintf(err, ecap,
+                     "promote all takes no further arguments: %.60s is either a "
+                     "change id or the word all, not both", a->v[2]);
+            *text_out = NULL;
+            return 1;
+        }
+        (void)json_out;
+        return builtin_promote_all(sh, text_out, err, ecap);
+    }
+
+    char dir[600];
+    if (!sh_pick_session(sh, a, "promote", dir, sizeof dir, err, ecap)) return 1;
+
+    stage_session s;
+    if (!stage_open(dir, &s, err, ecap)) return 1;
+    /* M8: before the snapshot, before anything: is this change on the record? */
+    if (sh_promote_gate(sh, &s, err, ecap) != 0) {
+        stage_end(&s);
+        stage_text_of(NULL, NULL, text_out);
+        return 1;
+    }
+    size_t n = 0;
+    /* A human typed `promote`: that makes the change human-sponsored, which is
+     * exactly what the policy layer wanted before it would let it through. The
+     * staging record is the accountability link between the AI that proposed
+     * the change and the person who accepted it. */
+    /* M5: a promote is the moment a change becomes real, so it is the moment
+     * worth having a snapshot of the state before it. */
+    char snapnote[160] = {0};
+    sh_snap_before(sh, "before a promote", snapnote, sizeof snapnote);
+    /* M7: the origin travels even though an AI can never get here -- the
+     * dispatcher refuses first. Belt, braces, and a reason to believe the
+     * belt is on: this is the call the acceptance test names. */
+    bool ok = stage_promote_locked(&s, sh->last_origin, &n, err, ecap);
+    if (ok) {
+        char line[256];
+        snprintf(line, sizeof line, "promoted %zu file%s into the jail\n",
+                 n, n == 1 ? "" : "s");
+        *text_out = strdup(line);
+        if (sh->bus) {
+            char ev[512];
+            snprintf(ev, sizeof ev, "{\"files\":%zu,\"dir\":\"%.300s\"}", n, s.dir);
+            sembus_pub(sh->bus, "sh.stage.promote", ev);
+        }
+        /* M7.5: an applied change must not silently leave others behind. */
+        char note[256];
+        sh_pending_note(sh, s.dir, note, sizeof note);
+        if (note[0] && *text_out) {
+            char *full = NULL;
+            if (asprintf(&full, "%s%s", *text_out, note) >= 0) {
+                free(*text_out);
+                *text_out = full;
+            }
+        }
+    }
+    stage_end(&s);
+    (void)json_out;
+    return ok ? 0 : 1;
+}
+
+static int builtin_discard(sh_shell *sh, sargv *a, char **text_out,
+                           json_val **json_out, char *err, size_t ecap) {
+    char dir[600];
+    bool explicit_id = (a && a->n >= 2);
+    if (!sh_pick_session(sh, a, "discard", dir, sizeof dir, err, ecap)) return 1;
+
+    stage_session s;
+    if (!stage_open(dir, &s, err, ecap)) return 1;
+    /* Remember where it was, so "did anything else survive" is asked about the
+     * list without this one in it. discard moves the directory, so the path in
+     * `s.dir` changes underneath us. */
+    char was[600];
+    snprintf(was, sizeof was, "%s", s.dir);
+    bool ok = stage_discard(&s, err, ecap);
+    if (ok) *text_out = strdup("discarded; the jail was never touched\n");
+    if (ok) {
+        char note[256];
+        sh_pending_note(sh, was, note, sizeof note);
+        if (note[0] && *text_out) {
+            char *full = NULL;
+            if (asprintf(&full, "%s%s", *text_out, note) >= 0) {
+                free(*text_out);
+                *text_out = full;
+            }
+        }
+    }
+    stage_end(&s);
+    (void)explicit_id;
+    (void)json_out;
+    return ok ? 0 : 1;
+}
+
+static int builtin_gc(sh_shell *sh, char **text_out, json_val **json_out,
+                      char *err, size_t ecap) {
+    stage_gc_result r;
+    if (!stage_gc(sh->store, (long long)aios_now_ms(), 3600LL * 1000, &r,
+                  err, ecap))
+        return 1;
+    char line[192];
+    snprintf(line, sizeof line, "gc: removed %zu stale session%s, kept %zu\n",
+             r.removed, r.removed == 1 ? "" : "s", r.kept);
+    *text_out = strdup(line);
+    (void)json_out;
+    return 0;
+}
 
 static int builtin_version(sh_shell *sh, char **text_out, json_val **json_out) {
     *text_out = strdup("AI-OS " AIOS_VERSION " — aiosh (v1.0)");
@@ -880,7 +2893,7 @@ static int builtin_lm(sh_shell *sh, sargv *a,
         /* join the rest into one line (quoted words kept apart) */
         char line[768] = {0};
         size_t off = 0;
-        for (int i = 2; i < a->n && off < sizeof line - 2; i++) {
+        for (size_t i = 2; i < a->n && off < sizeof line - 2; i++) {
             if (off) line[off++] = ' ';
             size_t l = strlen(a->v[i]);
             if (l > sizeof line - off - 1) l = sizeof line - off - 1;
@@ -899,7 +2912,7 @@ static int builtin_lm(sh_shell *sh, sargv *a,
     if (a->n >= 2 && strcmp(a->v[1], "gen") == 0) {
         char prompt[512] = {0};
         size_t off = 0;
-        for (int i = 2; i < a->n && off < sizeof prompt - 2; i++) {
+        for (size_t i = 2; i < a->n && off < sizeof prompt - 2; i++) {
             if (off) prompt[off++] = ' ';
             size_t l = strlen(a->v[i]);
             if (l > sizeof prompt - off - 1) l = sizeof prompt - off - 1;
@@ -1001,7 +3014,7 @@ static int builtin_tune(sh_shell *sh, sargv *a,
         *text_out = strdup(b);
         return 0;
     }
-    for (int i = 1; i < a->n; i++) {
+    for (size_t i = 1; i < a->n; i++) {
         char *eq = strchr(a->v[i], '=');
         if (!eq) {
             snprintf(err, ecap, "tune: expected key=value, got '%s'", a->v[i]);
@@ -1228,6 +3241,252 @@ static void jobs_restore(sh_shell *sh) {
 }
 
 /* M8 durable: `dur` — durable-store status on the ext2 side disk. */
+
+/* `snap` -- list, or take, a snapshot. */
+static int builtin_snap(sh_shell *sh, sargv *a, char **text_out,
+                        char *err, size_t ecap) {
+    if (a->n >= 2 && strcmp(a->v[1], "take") == 0) {
+        const char *label = a->n >= 3 ? a->v[2] : "manual";
+        char id[AIOS_SNAP_ID_MAX] = {0};
+        /* The explicit verb goes through PID 1 too. It would be a strange OS
+         * where the automatic snapshots are owned by the supervisor and the one a
+         * person asks for is made by the shell -- and the difference would be
+         * invisible until the day it mattered. */
+        bool ok;
+        if (sup_present(sh))
+            ok = sup_take(label, id, sizeof id, err, ecap);
+        else
+            ok = snap_take(sh->jail, sh->store, label, id, sizeof id, err, ecap);
+        if (!ok) return 1;
+        char perr[128] = {0};
+        (void)snap_prune(sh->store, AIOS_SNAP_KEEP, perr, sizeof perr);
+        char line[256];
+        snprintf(line, sizeof line, "snapshot %.48s taken (%s)", id, label);
+        *text_out = strdup(line);
+        return 0;
+    }
+    snap_list l;
+    if (!snap_list_all(sh->store, &l, err, ecap)) return 1;
+    char *txt = snap_list_text(&l);
+    size_t need = strlen(txt ? txt : "") + 200;
+    char *out = (char *)malloc(need);
+    if (out) {
+        snprintf(out, need,
+                 "snapshots (%zu, keeping %d):\n%s  rollback [latest|<id>] undoes "
+                 "the most recent one",
+                 l.n, AIOS_SNAP_KEEP, txt ? txt : "");
+        free(txt);
+        *text_out = out;
+    } else {
+        free(txt);
+        *text_out = strdup("");
+    }
+    snap_list_free(&l);
+    return 0;
+}
+
+/* `rollback [latest|<id>]` -- restore the jail and store, revoking jobs.
+ *
+ * The order is deliberate and is the milestone's whole argument: jobs are
+ * stopped FIRST, because restoring a tree that an agent is still writing to
+ * produces a state that is neither the old one nor the new one. */
+static int builtin_rollback(sh_shell *sh, sargv *a, char **text_out,
+                            char *err, size_t ecap) {
+    const char *which = a->n >= 2 ? a->v[1] : "latest";
+
+    snap_info si;
+    if (!snap_find(sh->store, which, &si, err, ecap)) return 1;
+
+    int killed = sh_revoke_jobs(sh);
+    sh_poll_jobs(sh);
+
+    char replaced[600] = {0};
+    char rerr[512] = {0};
+    bool restored;
+    if (sup_present(sh))
+        restored = sup_restore(si.id, replaced, sizeof replaced, rerr, sizeof rerr);
+    else
+        restored = snap_restore(sh->jail, sh->store, si.id,
+                                replaced, sizeof replaced, rerr, sizeof rerr);
+    if (!restored) {
+        snprintf(err, ecap, "rollback failed: %.400s", rerr);
+        sembus_pub_kv(sh->bus, "sh.rollback.failed",
+                      (const char *const[]){ "id", si.id, "error", rerr, NULL });
+        return 1;
+    }
+    sembus_pub_kv(sh->bus, "sh.rollback.done",
+                  (const char *const[]){ "id", si.id, "jobs_revoked", "yes", NULL });
+
+    /* The tool registry and memory hold the OLD tree's state in memory. Reopening
+     * them is not optional: a shell that reports a rollback while its memory
+     * still describes the rolled-back session is lying about what it did. */
+    tool_reg_free(sh->tools);
+    mem_close(sh->mem);
+    sh->mem = mem_open(sh->store);
+    sh->tools = sh->mem ? tool_reg_create(sh->jail, sh->store, "sh", sh->mem) : NULL;
+    if (sh->tools) tool_reg_install_default(sh->tools);
+
+    char line[900];
+    snprintf(line, sizeof line,
+             "rolled back to %.48s (%s)\n"
+             "  %d running job%s revoked\n"
+             "  the state that was replaced is in %.200s",
+             si.id, si.label[0] ? si.label : "no label",
+             killed, killed == 1 ? "" : "s",
+             replaced[0] ? replaced : "(not recorded)");
+    *text_out = strdup(line);
+    return 0;
+}
+
+
+/* `audit [verify]` -- read the record the way a stranger would.
+ *
+ * The point of a hash chain is that verification needs nothing but the file. So
+ * this builtin does not ask the recorder whether the recorder was honest: it walks
+ * the bytes.
+ *
+ * The output distinguishes four answers that are easy to conflate:
+ *   - intact: every record links and hashes
+ *   - a torn tail: a crash (the last record was never finished)
+ *   - a broken link or a bad hash: some record does not match its neighbours
+ *   - absent: there is no log at all, which is NOT the same as a clean one
+ */
+static int builtin_audit(sh_shell *sh, sargv *a, char **text_out,
+                         char *err, size_t ecap) {
+    if (a->n >= 2 && strcmp(a->v[1], "verify") != 0 && strcmp(a->v[1], "check") != 0) {
+        snprintf(err, ecap, "usage: audit [verify]");
+        return 1;
+    }
+
+    audit_check c = audit_verify(sh->store, 0);
+    char head[AIOS_AUDIT_HEX + 1] = {0};
+    (void)audit_head(sh->store, head);
+
+    char line[768];
+    switch (c.v) {
+    case AUDIT_OK:
+        snprintf(line, sizeof line,
+                 "audit: %lld records, chained and intact\n"
+                 "  head: %.16s  (the value a next session could commit to)\n"
+                 "  limit: fnv1a64 is not cryptographic, and this chain is checked "
+                 "only against itself -- an attacker who can rewrite the whole "
+                 "file can rewrite the chain. See include/aios/audit.h",
+                 c.records, head[0] ? head : "(none)");
+        *text_out = strdup(line);
+        return 0;
+
+    case AUDIT_TORN_TAIL:
+        snprintf(line, sizeof line,
+                 "audit: unverified -- %.200s\n"
+                 "  %lld complete records before the break, and that is all this "
+                 "can say about them\n"
+                 "  a torn tail is what a crash looks like; it is not reported as "
+                 "tampering", c.why, c.records);
+        *text_out = strdup(line);
+        return 1;
+
+    default:
+        snprintf(line, sizeof line,
+                 "audit: BROKEN at seq %lld -- %s: %.200s\n"
+                 "  records before the break: %lld\n"
+                 "  the file has been changed somewhere this cannot explain; the "
+                 "only honest next step is to compare it with a copy you trust",
+                 c.seq, audit_verdict_str(c.v), c.why, c.records);
+        *text_out = strdup(line);
+        return 1;
+    }
+}
+
+/* C4: `log` — the boot ring that PID 1 keeps.
+ *
+ * The ring lives on the durable store under "boot.log" and holds the newest
+ * boot messages, oldest dropped first. It exists because the console stops being
+ * a record the moment the desktop takes the screen: before this, the messages
+ * that explain a failed boot were written to a console nobody was watching and
+ * then overwritten.
+ *
+ * "Unavailable" and "empty" are DIFFERENT answers and are reported as such. A
+ * log command that says "no messages" when it could not read the file teaches a
+ * user the opposite of the truth at the moment they are debugging. */
+static int builtin_log(sh_shell *sh, sargv *a, char **text_out,
+                       char *err, size_t ecap) {
+    if (a->n >= 2 && (strcmp(a->v[1], "-h") == 0 || strcmp(a->v[1], "--help") == 0)) {
+        *text_out = strdup(
+            "log [-n N]   the boot log PID 1 keeps (newest last)\n"
+            "  The ring holds the most recent boot messages; older lines are\n"
+            "  dropped rather than growing without bound on a small data disk.\n"
+            "  This is the boot log, not the audit chain -- `audit` is the record\n"
+            "  of what was DONE, and it is hash-chained. This is what the machine\n"
+            "  SAID while starting up.");
+        return 0;
+    }
+
+    size_t want = 0;                      /* 0 = everything */
+    if (a->n >= 3 && strcmp(a->v[1], "-n") == 0) {
+        want = (size_t)strtoul(a->v[2], NULL, 10);
+        if (want == 0) want = 1;
+    } else if (a->n >= 2) {
+        snprintf(err, ecap, "usage: log [-n N]");
+        return 1;
+    }
+
+    /* One buffer, sized from the shared constant.
+     *
+     * The first version had a static 16 KiB read buffer AND strdup'd the result,
+     * i.e. 32 KiB of RAM - in PID 1's shell, on a machine this project runs in
+     * 512 MB - and repeated the ring size as a literal that could drift from
+     * init's. Reading once into the buffer that becomes the result removes the
+     * copy and the magic number together. */
+    char *buf = malloc(AIOS_BOOT_LOG_CAP + 1);
+    if (!buf) { snprintf(err, ecap, "log: out of memory"); return 1; }
+    size_t n = 0;
+    const aios_status st = aios_dur_read(AIOS_BOOT_LOG_REL, buf, AIOS_BOOT_LOG_CAP, &n);
+
+    /* A ring file that does not exist yet is EMPTY, not unavailable: that is the
+     * state of every store before the first boot message. Reporting it as an
+     * error would make `log` fail on a clean system, which is a worse lie than
+     * the one this distinction exists to prevent. */
+    if (st != AIOS_OK && !aios_dur_exists(AIOS_BOOT_LOG_REL)) {
+        free(buf);
+        *text_out = strdup("log: the boot ring is empty (this store has no boot.log yet)");
+        return 0;
+    }
+    if (st != AIOS_OK) {
+        free(buf);
+        snprintf(err, ecap,
+                 "log: the boot ring is unavailable (%s)\n"
+                 "  this is NOT the same as an empty log: PID 1 could not read\n"
+                 "  boot.log from the store, so what happened at boot was not\n"
+                 "  recorded where this could find it",
+                 st == AIOS_ERR_ARG ? "bad path" : "read failed");
+        return 1;
+    }
+    if (n == 0) {
+        free(buf);
+        *text_out = strdup("log: the boot ring is empty (no messages recorded)");
+        return 0;
+    }
+    buf[n] = 0;                      /* the buffer is cap+1 for exactly this */
+
+    if (want == 0) {
+        *text_out = buf;             /* ownership moves; no copy */
+        return 0;
+    }
+    /* last `want` lines */
+    size_t lines = 0, pos = 0, start = 0;
+    for (size_t i = 0; i < n; i++) if (buf[i] == '\n') lines++;
+    if (lines <= want) { *text_out = buf; return 0; }
+    const size_t skip = lines - want;
+    size_t seen = 0;
+    for (pos = 0; pos < n; pos++) {
+        if (buf[pos] == '\n' && ++seen == skip) { start = pos + 1; break; }
+    }
+    *text_out = strdup(buf + start);   /* partial: one copy is unavoidable */
+    free(buf);
+    (void)sh;
+    return 0;
+}
+
 static int builtin_dur(sh_shell *sh, sargv *a, char **text_out,
                        char *err, size_t ecap) {
     (void)err; (void)ecap;
@@ -1271,11 +3530,60 @@ static int builtin_dur(sh_shell *sh, sargv *a, char **text_out,
     sb_puts(&b, line);
     snprintf(line, sizeof line, "\n  memory:     %zu entries", mem_n);
     sb_puts(&b, line);
-    snprintf(line, sizeof line, "\n  audit:      %zu tool calls", audit_n);
-    sb_puts(&b, line);
+    {
+        /* A count is not a health report. "N tool calls" says the file has lines
+         * in it; verification says whether those lines are the ones that were
+         * written. The difference is the whole milestone. */
+        audit_check ac = audit_verify(sh->store, 0);
+        if (ac.v == AUDIT_OK) {
+            char head[AIOS_AUDIT_HEX + 1] = {0};
+            (void)audit_head(sh->store, head);
+            /* %.16s was meant for a hash and got handed a sentence, so it printed
+             * "(6 records, chain)" -- a diagnostic that looks truncated is worse
+             * than none, because the reader assumes the rest was unimportant. */
+            snprintf(line, sizeof line,
+                     "\n  audit:      %zu tool calls, chain intact, head %.16s",
+                     audit_n, head[0] ? head : "(none)");
+        } else if (ac.v == AUDIT_TORN_TAIL) {
+            snprintf(line, sizeof line,
+                     "\n  audit:      %zu tool calls, tail torn (a crash, not an edit)",
+                     audit_n);
+        } else {
+            snprintf(line, sizeof line,
+                     "\n  audit:      %zu tool calls, CHAIN BROKEN at seq %lld "
+                     "(%s) -- run `audit verify`", audit_n, ac.seq,
+                     audit_verdict_str(ac.v));
+        }
+        sb_puts(&b, line);
+    }
     snprintf(line, sizeof line, "\n  jobs:       %zu spawned / %zu journal records",
              spawns, jrecs);
     sb_puts(&b, line);
+
+    /* M5: rollback is only real if a person can SEE it is available. A durable
+     * store with no snapshots is one where `rollback` will refuse, and the shell
+     * should say so here rather than at the moment someone needs it. */
+    {
+        snap_list sl;
+        memset(&sl, 0, sizeof sl);
+        if (snap_list_all(sh->store, &sl, NULL, 0)) {
+            if (sl.n == 0) {
+                snprintf(line, sizeof line,
+                         "\n  snapshots:  none yet — `snap take <label>` "
+                         "before a risky change");
+            } else {
+                const snap_info *newest = &sl.items[0];
+                snprintf(line, sizeof line,
+                         "\n  snapshots:  %zu (keeping %d), newest %.48s \"%.48s\" "
+                         "— `rollback` undoes it",
+                         sl.n, AIOS_SNAP_KEEP, newest->id, newest->label);
+            }
+            sb_puts(&b, line);
+            snap_list_free(&sl);
+        } else {
+            sb_puts(&b, "\n  snapshots:  cannot be listed");
+        }
+    }
     if (apn > 0) {
         snprintf(line, sizeof line, "\n  autopilot:  %zu adjustments (last: %.200s)",
                  apn, lastap);
@@ -1287,9 +3595,34 @@ static int builtin_dur(sh_shell *sh, sargv *a, char **text_out,
     return 0;
 }
 
-static int spawn_job(sh_shell *sh, const char *goal,
+static int spawn_job(sh_shell *sh, const char *goal, aios_origin origin,
                      char **text_out, char *err, size_t ecap) {
     if (!*goal) { snprintf(err, ecap, "spawn needs a goal"); return 1; }
+    /* M7: a spawn INHERITS the caller's origin, and a machine may not spawn.
+     *
+     * Both halves matter. Without inheritance, an AI line that spawned work would
+     * produce a job whose origin is whatever the default happened to be -- and the
+     * background work would then be judged by a different standard than the work
+     * that asked for it. Without the refusal, "an AI may not spawn" would be a
+     * policy rule (2c) that the shell's own grammar walked around: the rule
+     * exists because an agent spawning agents is how a bounded action becomes an
+     * unbounded swarm, and the shell is where spawn is spelled.
+     *
+     * The policy still has 2c, and this is not a replacement for it: a spawn that
+     * got here by another route -- an agent loop, a routed intent -- is checked
+     * there, with a descriptor. This is the door in the wall the policy lives
+     * behind. */
+    if (origin == ORIGIN_AI) {
+        snprintf(err, ecap,
+                 "a machine-originated line may not spawn background work: "
+                 "an agent that starts agents is how a bounded request becomes "
+                 "an unbounded swarm, and how the record stops being complete");
+        sembus_pub_kv(sh->bus, "sh.action.refused_origin",
+                      (const char *const[]){
+                          "command", "spawn", "origin", "ai",
+                          "why", "policy 2c: an AI may not spawn", NULL});
+        return 1;
+    }
     if (sh->njobs >= SH_MAX_JOBS) { snprintf(err, ecap, "job table full"); return 1; }
     char jd[600];
     snprintf(jd, sizeof jd, "%s/jobs", sh->store);
@@ -1327,10 +3660,10 @@ static int spawn_job(sh_shell *sh, const char *goal,
     return 0;
 }
 
-static int builtin_spawn(sh_shell *sh, sargv *a,
+static int builtin_spawn(sh_shell *sh, sargv *a, aios_origin origin,
                          char **text_out, char *err, size_t ecap) {
     char *goal = join_args(a->v, a->n, 1);
-    int rc = spawn_job(sh, goal ? goal : "", text_out, err, ecap);
+    int rc = spawn_job(sh, goal ? goal : "", origin, text_out, err, ecap);
     free(goal);
     return rc;
 }
@@ -1431,7 +3764,82 @@ static int builtin_kill(sh_shell *sh, sargv *a,
 
 /* ---------------- dispatch ---------------- */
 
-static int run_command(sh_shell *sh, scmd *c,
+
+/* ---- M7: the human's hand on the machine ---- *
+ *
+ * Some builtins do not compute a value; they make a change real, or they end the
+ * session. `promote` accepts a machine's proposal. `rollback` rewinds the
+ * machine. `discard` throws work away. `exit` ends the accountability.
+ *
+ * A model that can type these has not been mediated, it has been given the
+ * keyboard: everything M3-M6 built assumes a person is the one accepting a
+ * proposal, and an AI that can call `promote` makes the human a formality in its
+ * own audit trail. So an AI-origin line cannot reach them, and the refusal says
+ * so in words rather than returning "unknown command" -- a model that gets
+ * "unknown" will try another spelling, and one that gets "a person has to do
+ * this" has been told something true.
+ *
+ * This is enforced HERE, in the one place a command is dispatched, not in the
+ * router: a guard that a rewrite of the router could drop is not a guard.
+ *
+ * The list is deliberately short and deliberate: it names the commands whose
+ * effect is a change in what is real, and nothing else. Note what is NOT on it:
+ * `policy` and `staged` are introspection. A model that can read the law and see
+ * what it has pending is a model that can understand its own refusal, and
+ * blinding it would make the machine less predictable without making it safer --
+ * the thing being prevented is a change, not a reading.
+ */
+/* M7: run a line AS A MACHINE, inside this shell.
+ *
+ * This exists for the boot proof and for anyone who wants to ask "what would
+ * happen if a model typed this" without spawning a second process. It is a
+ * builtin rather than a spawn for a reason: the point is to exercise the SAME
+ * shell, with its staging area and its holds, from a different origin. A
+ * subprocess would start with an empty stage and prove much less.
+ *
+ * It is deliberately NOT powerful: the line is executed at ORIGIN_AI, so a model
+ * that could reach this builtin would get nothing it does not already have --
+ * and a human using it is asking a question, not delegating.
+ */
+static int builtin_as_machine(sh_shell *sh, sargv *a,
+                              char **text_out, json_val **json_out,
+                              char *err, size_t ecap);
+
+static const char *const SH_HUMAN_ONLY[] = {
+    "promote", "discard", "rollback", "snap", "exit", "quit", "cortex",
+    "autopilot", "gc", "undelete", NULL,
+};
+
+static const char *human_only_reason(const char *name) {
+    if (!name) return NULL;
+    if (strcmp(name, "promote") == 0)
+        return "accepting a staged change is a person's decision, not a model's";
+    if (strcmp(name, "discard") == 0)
+        return "throwing away a proposal is a person's decision";
+    if (strcmp(name, "rollback") == 0)
+        return "rewinding the machine is a person's decision";
+    if (strcmp(name, "snap") == 0)
+        return "deciding when state is captured is a person's decision";
+    if (strcmp(name, "exit") == 0 || strcmp(name, "quit") == 0)
+        return "a model may not end the session it is accountable to";
+    if (strcmp(name, "cortex") == 0)
+        return "a model may not choose which model answers next";
+    if (strcmp(name, "autopilot") == 0)
+        return "a model may not change the machine's own governor";
+    if (strcmp(name, "gc") == 0)
+        return "a model may not collect the record of what happened";
+    if (strcmp(name, "undelete") == 0)
+        return "restoring a deleted file is a person's decision";
+    return NULL;
+}
+
+static bool sh_is_human_only(const char *name) {
+    for (int i = 0; SH_HUMAN_ONLY[i]; i++)
+        if (strcmp(SH_HUMAN_ONLY[i], name) == 0) return true;
+    return false;
+}
+
+static int run_command(sh_shell *sh, scmd *c, aios_origin origin,
                        const char *pipe_text, json_val *pipe_json,
                        char **text_out, json_val **json_out,
                        char *err, size_t ecap) {
@@ -1441,6 +3849,22 @@ static int run_command(sh_shell *sh, scmd *c,
     *json_out = NULL;
     if (a->n == 0) { snprintf(err, ecap, "empty command in pipeline"); return 1; }
     const char *c0 = a->v[0];
+
+    /* M7: before any builtin can run. See SH_HUMAN_ONLY above for why this is here
+     * and not in the router. */
+    if (origin == ORIGIN_AI && sh_is_human_only(c0)) {
+        const char *why = human_only_reason(c0);
+        snprintf(err, ecap,
+                 "`%.32s` is not available to a machine-originated line: %.160s.\n"
+                 "  This is the point of origin tagging: the shell knows the line "
+                 "came from a model, and a model may not do this.",
+                 c0, why ? why : "a person has to do it");
+        sembus_pub_kv(sh->bus, "sh.action.refused_origin",
+                      (const char *const[]){
+                          "command", c0, "origin", "ai",
+                          "why", why ? why : "human-only command", NULL});
+        return 1;
+    }
 
     /* ---- builtins ---- */
     if (strcmp(c0, "help") == 0)    { *text_out = strdup(HELP_TEXT); return 0; }
@@ -1452,6 +3876,8 @@ static int run_command(sh_shell *sh, scmd *c,
         return 0;
     }
     if (strcmp(c0, "version") == 0) return builtin_version(sh, text_out, json_out);
+    if (strcmp(c0, "policy") == 0)
+        return builtin_policy(sh, a, text_out, json_out, err, ecap);
     if (strcmp(c0, "echo") == 0)    { *text_out = join_args(a->v, a->n, 1); return 0; }
     if (strcmp(c0, "count") == 0)   return builtin_count(a, pipe_text, text_out, json_out, err, ecap);
     if (strcmp(c0, "grep") == 0)    return builtin_grep(a, pipe_text, text_out, err, ecap);
@@ -1466,19 +3892,45 @@ static int run_command(sh_shell *sh, scmd *c,
     if (strcmp(c0, "history") == 0) return builtin_history(sh, text_out);
     if (strcmp(c0, "cortex") == 0)  return builtin_cortex(sh, a, text_out, err, ecap);
     if (strcmp(c0, "jail") == 0)    return builtin_jail(sh, a, text_out, err, ecap);
+    if (strcmp(c0, "staged") == 0)  return builtin_staged(sh, text_out, json_out, err, ecap);
+    if (strcmp(c0, "pending") == 0) return builtin_pending(sh, text_out, json_out, err, ecap);
+    if (strcmp(c0, "diff") == 0)    return builtin_diff(sh, a, text_out, json_out, err, ecap);
+    if (strcmp(c0, "promote") == 0) return builtin_promote(sh, a, text_out, json_out, err, ecap);
+    if (strcmp(c0, "machine") == 0)
+        return builtin_as_machine(sh, a, text_out, json_out, err, ecap);
+    if (strcmp(c0, "discard") == 0) return builtin_discard(sh, a, text_out, json_out, err, ecap);
+    if (strcmp(c0, "gc") == 0)      return builtin_gc(sh, text_out, json_out, err, ecap);
     if (strcmp(c0, "store") == 0)   return builtin_store(sh, a, text_out, err, ecap);
     if (strcmp(c0, "jobs") == 0)    return builtin_jobs(sh, text_out);
     if (strcmp(c0, "wait") == 0)    return builtin_wait(sh, a, text_out, err, ecap);
     if (strcmp(c0, "kill") == 0)    return builtin_kill(sh, a, text_out, err, ecap);
-    if (strcmp(c0, "spawn") == 0)   return builtin_spawn(sh, a, text_out, err, ecap);
+    if (strcmp(c0, "spawn") == 0)
+        return builtin_spawn(sh, a, origin, text_out, err, ecap);
     if (strcmp(c0, "lm") == 0)      return builtin_lm(sh, a, text_out, err, ecap);
     if (strcmp(c0, "autopilot") == 0) return builtin_autopilot(sh, a, text_out, err, ecap);
     if (strcmp(c0, "tune") == 0)    return builtin_tune(sh, a, text_out, err, ecap);
+    if (strcmp(c0, "log") == 0)     return builtin_log(sh, a, text_out, err, ecap);
     if (strcmp(c0, "dur") == 0)     return builtin_dur(sh, a, text_out, err, ecap);
+    if (strcmp(c0, "audit") == 0)   return builtin_audit(sh, a, text_out, err, ecap);
+    if (strcmp(c0, "snap") == 0)    return builtin_snap(sh, a, text_out, err, ecap);
+    if (strcmp(c0, "rollback") == 0) return builtin_rollback(sh, a, text_out, err, ecap);
     if (strcmp(c0, "agent") == 0) {
         char *goal = join_args(a->v, a->n, 1);
         if (!*goal) { free(goal); snprintf(err, ecap, "agent needs a goal"); return 1; }
-        int rc = run_agent_fg(sh, goal, text_out, err, ecap);
+        /* Whoever typed `agent <goal>` chose the goal, so the origin is the
+         * CALLER'S and not this line's to invent. M7 caught this: an AI-origin
+         * line saying `agent x` was stamped ORIGIN_HUMAN here, which is the
+         * milestone's whole failure mode in one hardcoded constant. */
+        aios_action *act = aios_action_new(ACT_AGENT, origin, goal);
+        int rc;
+        if (!act) {
+            snprintf(err, ecap, "oom (descriptor)");
+            rc = 1;
+        } else {
+            aios_action_set_intent(act, c->raw ? c->raw : goal);
+            rc = run_agent_fg(sh, act, origin, text_out, err, ecap);
+            aios_action_free(act);
+        }
         free(goal);
         return rc;
     }
@@ -1490,35 +3942,70 @@ static int run_command(sh_shell *sh, scmd *c,
 
     /* ---- registered tools (M4 registry) ---- */
     if (tool_reg_find(sh->tools, c0))
-        return run_tool_stage(sh, c0, a, pipe_text, text_out, json_out, err, ecap);
+        return run_tool_stage(sh, c0, a, origin, c->raw, pipe_text, text_out,
+                              json_out, err, ecap);
 
-    /* ---- natural language: the intent router ---- */
+    /* ---- natural language: the intent router ----
+     *
+     * THIS IS THE AI PATH. The human wrote prose; the machine chose the tool
+     * and its arguments. So the descriptor's origin is ORIGIN_AI, and the
+     * descriptor already carries the hash of the human line that prompted it
+     * (built in sh_route). If a human could get ORIGIN_HUMAN by typing
+     * prose, origin tagging would be a formality. */
     sh_decision dec;
     aios_status rst = sh_route(sh->cortex_mode, c->raw ? c->raw : c0,
                                sh->tools, &dec, err, ecap);
     if (rst != AIOS_OK) return 1;
     int rc = 0;
+
+    aios_action *act = sh_decision_to_action(&dec);
+    if (!act && dec.kind != SH_ROUTE_REPLY) {
+        /* A routed tool/agent with no descriptor is a bug, not a fallback:
+         * refuse rather than run something nothing validated. */
+        snprintf(err, ecap, "router produced no action descriptor");
+        sh_decision_free(&dec);
+        return 1;
+    }
+    if (act) {
+        aios_action_stamp_origin(act, ORIGIN_AI);
+        /* The router already attempted declaration; if it failed, drop the
+         * proposal rather than execute something unexaminable. */
+        if (act->n_declared == 0 && act->effects_complete == 0
+            && dec.kind == SH_ROUTE_TOOL) {
+            snprintf(err, ecap,
+                     "action refused: effects of %s cannot be declared",
+                     act->target ? act->target : "?");
+            aios_action_free(act);
+            sh_decision_free(&dec);
+            return 1;
+        }
+    }
+
     switch (dec.kind) {
     case SH_ROUTE_TOOL:
-        rc = exec_tool(sh, dec.tool, dec.args ? dec.args : json_new_obj(),
-                       text_out, json_out, err, ecap);
-        dec.args = NULL; /* consumed by exec_tool */
+        if (act) rc = exec_tool_action(sh, act, origin, text_out, json_out, err, ecap);
         break;
     case SH_ROUTE_AGENT:
         /* M7: background wording -> the agents cgroup, not the console */
-        rc = dec.bg
-             ? spawn_job(sh, dec.goal ? dec.goal : "", text_out, err, ecap)
-             : run_agent_fg(sh, dec.goal ? dec.goal : "", text_out, err, ecap);
+        if (dec.bg) {
+            /* A background job is its own proposal kind: it outlives the
+             * command that asked for it, so it is gated as ACT_JOB_SPAWN. */
+            rc = spawn_job(sh, dec.goal ? dec.goal : "", origin, text_out,
+                           err, ecap);
+        } else if (act) {
+            rc = run_agent_fg(sh, act, origin, text_out, err, ecap);
+        }
         break;
     case SH_ROUTE_REPLY:
         *text_out = xstrdup(dec.text);
         break;
     }
+    if (act) aios_action_free(act);
     sh_decision_free(&dec);
     return rc;
 }
 
-static int run_pipeline(sh_shell *sh, spipe *pl,
+static int run_pipeline(sh_shell *sh, spipe *pl, aios_origin origin,
                         char **text_out, json_val **json_out,
                         char *err, size_t ecap) {
     *text_out = NULL;
@@ -1528,7 +4015,7 @@ static int run_pipeline(sh_shell *sh, spipe *pl,
     for (size_t i = 0; i < pl->n; i++) {
         char *ctext = NULL;
         json_val *cjson = NULL;
-        int rc = run_command(sh, &pl->cmd[i], pipe_text, pipe_json,
+        int rc = run_command(sh, &pl->cmd[i], origin, pipe_text, pipe_json,
                              &ctext, &cjson, err, ecap);
         free(pipe_text);
         json_free(pipe_json);
@@ -1568,8 +4055,138 @@ sh_shell *sh_create(const char *jail_dir, const char *store_dir) {
     sh->last_out = strdup("");
     sh->last_json = strdup("");
     sh->next_job_id = 1;
+    /* M7: a shell has not been spoken to yet. calloc would leave this 0, and 0
+     * is ORIGIN_HUMAN -- "no origin" and "a person" must not share a value, or
+     * every fresh shell silently reports that its last line came from a human. */
+    sh->last_origin = ORIGIN_UNSPECIFIED;
     jobs_restore(sh);   /* M8 durable: replay the previous session's jobs */
     return sh;
+}
+
+/* M8: the deferred half of NEEDS_HUMAN.
+ *
+ * `sh_deferred()` is what a front-end draws: is a person being asked something,
+ * and what. `sh_resume()` is what happens when they answer, and it is the only
+ * path from a DEFER to an execution.
+ *
+ * The descriptor that runs is the one that was JUDGED. It is re-validated
+ * (is_valid: expiry, budget, origin stamp) because time passed and an expired
+ * proposal must not be executable -- but it is not re-parsed from text, so the
+ * arguments cannot change underneath the approval. The gate is not asked again
+ * either: policy already said NEEDS_HUMAN, and a person saying "yes" to
+ * NEEDS_HUMAN is precisely the answer that verdict was waiting for. Asking the
+ * same question twice would let a person grant consent that the second ask then
+ * discards.
+ */
+int sh_deferred(sh_shell *sh, char *title, size_t tcap, aios_origin *origin_out) {
+    if (!sh || !sh->deferred) return 0;
+    if (title && tcap)
+        snprintf(title, tcap, "%s%s%s",
+                 aios_action_kind_name(sh->deferred->kind),
+                 sh->deferred->target ? " " : "",
+                 sh->deferred->target ? sh->deferred->target : "");
+    if (origin_out) *origin_out = sh->deferred->origin;
+    return 1;
+}
+
+int sh_resume(sh_shell *sh, ui_choice choice, sh_result *out) {
+    if (!sh || !sh->deferred) return 0;
+    if (!out) return 0;
+    /* Zero the caller's result FIRST, including on the paths that do nothing.
+     * A caller that resumes with SHOW_DIFF gets no action, and if this left the
+     * struct alone the caller's sh_result_free() would free whatever stack
+     * garbage it happened to hold. A function whose contract is "may do nothing"
+     * must not leave its output undefined. */
+    memset(out, 0, sizeof *out);
+    out->text = xstrdup("");
+
+    if (choice != UI_CHOICE_PROMOTE) {
+        /* Every other answer drops the hold. That includes DISCARD, an unknown
+         * choice, and DEFER (asked, still nothing) -- none of them executes, and
+         * only PROMOTE does.
+         *
+         * Return 0 for a discard: the person asked for nothing to happen, and
+         * nothing happened. Returning 1 here (which the first version did) meant
+         * a successful "no" was indistinguishable from a failed "yes" -- the
+         * desktop, which checks rc, would have reported a clean discard as "the
+         * held action could not run". */
+        if (choice == UI_CHOICE_DISCARD) {
+            sembus_pub_kv(sh->bus, "sh.action.discarded",
+                          (const char *const[]){
+                              "kind", aios_action_kind_name(sh->deferred->kind),
+                              "why", "the human answered discard", NULL});
+            out->status = 0;
+            out->text = xstrdup("discarded; nothing was run\n");
+            aios_action_free(sh->deferred);
+            sh->deferred = NULL;
+            sh->deferred_why[0] = 0;
+        }
+        return 0;
+    }
+
+    char why[256];
+    if (!aios_action_is_valid(sh->deferred, why, sizeof why)) {
+        /* An expired or now-invalid descriptor is NOT run. The person said yes
+         * to something that no longer exists as a proposal. */
+        out->status = 1;
+        out->error = NULL;
+        if (asprintf(&out->error, "the held action expired before you answered: %.180s",
+                     why) < 0) out->error = NULL;
+        sembus_pub_kv(sh->bus, "sh.action.refused",
+                      (const char *const[]){
+                          "kind", aios_action_kind_name(sh->deferred->kind),
+                          "verdict", "DENY", "why", why, NULL});
+        aios_action_free(sh->deferred);
+        sh->deferred = NULL;
+        sh->deferred_why[0] = 0;
+        return 1;
+    }
+
+    aios_action *act = sh->deferred;
+    sh->deferred = NULL;
+    sh->deferred_why[0] = 0;
+    sh->last_origin = ORIGIN_HUMAN;      /* a person just accepted it */
+
+    sembus_pub_kv(sh->bus, "sh.action.promoted_by_human",
+                  (const char *const[]){
+                      "kind", aios_action_kind_name(act->kind),
+                      "target", act->target ? act->target : "", NULL});
+    sembus_pub_kv(sh->bus, "sh.action.log",
+                  (const char *const[]){
+                      "verdict", "ALLOW(on human promote)",
+                      "action", act->target ? act->target : "", NULL});
+
+    json_val *jout = NULL;
+    char *text = NULL;
+    char err[SH_ERR_CAP] = {0};
+    int rc;
+    if (act->kind == ACT_TOOL || act->kind == ACT_AGENT) {
+        rc = exec_tool_action(sh, act, ORIGIN_HUMAN, &text, &jout, err, sizeof err);
+    } else {
+        /* Every other kind reaches the gate through a path that spells what it
+         * does -- a background job is `spawn <goal>`, and a delete has no path at
+         * all yet (`fs.delete` is not a tool; see G-gap). Refusing by name is
+         * the honest half: the person's "promote" is recorded, and the reason
+         * they got nothing says which capability is missing rather than pretending
+         * the hold was never theirs.
+         *
+         * Worth being blunt about: this means the desktop can show a person a
+         * destructive proposal, record their answer, and still not carry it out.
+         * That is a missing feature, not a safety property, and naming it here is
+         * better than a resume path that silently did nothing. */
+        rc = 1;
+        snprintf(err, sizeof err,
+                 "you promoted a %s proposal, but aiosh has no execution path for "
+                 "that kind yet -- it was recorded, not run",
+                 aios_action_kind_name(act->kind));
+    }
+    aios_action_free(act);
+
+    out->status = rc;
+    out->text = text ? text : xstrdup("");
+    out->json = jout;
+    if (rc != 0) out->error = xstrdup(err);
+    return 1;
 }
 
 void sh_free(sh_shell *sh) {
@@ -1579,6 +4196,7 @@ void sh_free(sh_shell *sh) {
     for (int i = 0; i < sh->njobs; i++) { free(sh->jobs[i].goal); free(sh->jobs[i].final); }
     free(sh->last_out);
     free(sh->last_json);
+    aios_action_free(sh->deferred);
     tool_reg_free(sh->tools);
     mem_close(sh->mem);
     sembus_destroy(sh->bus);
@@ -1605,6 +4223,17 @@ void sh_result_free(sh_result *r) {
 }
 
 int sh_exec(sh_shell *sh, const char *line, sh_result *out) {
+    /* A shell with a prompt is a person talking. Kept as a thin name because every
+     * caller that is not a model means exactly this. */
+    return sh_exec_origin(sh, line, ORIGIN_HUMAN, out);
+}
+
+aios_origin sh_last_origin(const sh_shell *sh) {
+    return sh ? sh->last_origin : ORIGIN_UNSPECIFIED;
+}
+
+int sh_exec_origin(sh_shell *sh, const char *line, aios_origin origin,
+                   sh_result *out) {
     if (!out) return 0;
     memset(out, 0, sizeof *out);
     out->text = strdup("");
@@ -1613,6 +4242,68 @@ int sh_exec(sh_shell *sh, const char *line, sh_result *out) {
         out->error = strdup("invalid sh_exec call");
         return 0;
     }
+    /* ORIGIN_UNSPECIFIED is not a third kind of caller; it is a caller that did
+     * not say. Refusing is the only safe reading: a default would be the silent
+     * assumption this milestone exists to remove. */
+    if (origin != ORIGIN_HUMAN && origin != ORIGIN_AI) {
+        out->status = 1;
+        out->error = strdup("sh_exec_origin needs ORIGIN_HUMAN or ORIGIN_AI");
+        return 0;
+    }
+    sh->last_origin = origin;
+    sh->last_needs_human = 0;
+
+    /* TEST SEAM: `_describe <kind> <target>` runs an ordinary descriptor through
+     * the real gate with an AI origin, so a test can exercise what happens when
+     * the law says NEEDS_HUMAN without inventing a command that happens to reach
+     * it today.
+     *
+     * Honest about being a seam: not in `help`, writes nothing, executes nothing
+     * (it stops at the gate). It exists because the alternative is testing the
+     * deferred path against a mock of the gate -- and a mock of the gate tests the
+     * mock. The seam calls the same action_gate() every real command calls.
+     */
+    if (strncmp(line, "_describe ", 10) == 0) {
+        char kind[24] = {0}, target[200] = {0};
+        if (sscanf(line + 10, "%23s %199s", kind, target) >= 1) {
+            aios_act_kind k = ACT_TOOL;
+            if (strcmp(kind, "delete") == 0) k = ACT_FS_DELETE;
+            if (strcmp(kind, "spawn") == 0)  k = ACT_JOB_SPAWN;
+            if (strcmp(kind, "write") == 0)  k = ACT_FS_WRITE;
+            aios_action *a = aios_action_new(k, ORIGIN_AI, target);
+            if (!a) { out->status = 1; out->error = xstrdup("oom"); return 0; }
+            aios_action_set_intent(a, "describe");
+            aios_action_set_reversible(a, 1);
+            char derr[SH_ERR_CAP] = {0};
+            int grc = action_gate(sh, a, ORIGIN_AI, derr, sizeof derr);
+            aios_action_free(a);
+            out->status = grc;
+            if (grc) out->error = xstrdup(derr);
+            else     out->text = xstrdup("gate said ALLOW");
+            sh->last_status = grc;
+            return 0;
+        }
+    }
+
+    /* M7.5: a staged session belongs to ONE command.
+     *
+     * `stage_live` is shell state, and the shell outlives any single line. So a
+     * typed AI write left its session live, and the next line -- an unrelated
+     * agent run -- inherited it: the agent's guardian staged its own step into
+     * the human's pending change, and when the run finished with the jail
+     * unchanged the after-hook discarded "the run's" staging, which by then was
+     * the person's change. A change a human had been shown and had not decided
+     * on was thrown away by an agent that never knew it existed.
+     *
+     * Clearing it here is the smallest honest rule: nothing is live until this
+     * command stages something. The cost is that two writes in one command are
+     * two changes (which the pending list can now represent); the benefit is
+     * that no command can ever act on a session it did not open.
+     */
+    sh->stage_live = 0;
+    sh->stage_dir[0] = 0;
+    sh->n_witness = 0;
+
     const char *p = line;
     while (*p == ' ' || *p == '\t') p++;
     if (!*p || *p == '#') return 0;          /* blank / comment */
@@ -1643,7 +4334,7 @@ int sh_exec(sh_shell *sh, const char *line, sh_result *out) {
     for (size_t i = 0; i < lines.n; i++) {
         char *ptext = NULL;
         json_val *pjson = NULL;
-        int rc = run_pipeline(sh, &lines.pl[i], &ptext, &pjson,
+        int rc = run_pipeline(sh, &lines.pl[i], origin, &ptext, &pjson,
                               err, sizeof err);
         if (combined.n) sb_putc(&combined, '\n');
         sb_puts(&combined, ptext ? ptext : "");
@@ -1652,7 +4343,18 @@ int sh_exec(sh_shell *sh, const char *line, sh_result *out) {
         json_free(out->json);
         out->json = pjson;
         if (rc != 0) {
-            out->error = xstrdup(err[0] ? err : aios_status_str(AIOS_ERR));
+            /* err[0] is what a builtin said. When a builtin fails it is
+             * supposed to fill it; when it does not, say that a command failed
+             * and stop.
+             *
+             * This used to be aios_status_str(AIOS_ERR), which is a category
+             * error: rc here is a shell builtin's return code (0 or 1), not an
+             * aios_status (AIOS_ERR is -1). It rendered as "unknown", and only
+             * the front-end's "error: " prefix made it look like a message --
+             * `promote all` stopping at a refusal printed "error: error". A
+             * front-end must not be the only thing standing between a status
+             * code and a sentence. */
+            out->error = xstrdup(err[0] ? err : "the command failed");
             free(ptext);
             break;
         }

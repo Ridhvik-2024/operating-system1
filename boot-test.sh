@@ -73,7 +73,7 @@ boot_phase() {  # $1 = serial log path; returns 0 when the VM powered off
         -machine accel=tcg -m 512M -smp 2 \
         -kernel "$KERNEL" -initrd "$INITRD" \
         -drive "file=$DATAIMG,format=raw,if=virtio" \
-        -append "console=ttyS0 rdinit=/init aios.mode=test" \
+        -append "console=ttyS0 rdinit=/init aios.mode=test aios.governor.kill=1" \
         -display none -serial "file:$LOG" -monitor none \
         -no-reboot -nic none -daemonize -pidfile boot/build/qemu.pid
     if [ ! -s boot/build/qemu.pid ]; then
@@ -118,7 +118,29 @@ have1 'AIOS-DUR mounted=1'
 have1 'AIOS-SELFTEST: PASS'
 have1 'SELFTEST test_durable: PASS'
 have1 'AIOS-BOOT-OK selftest=PASS'
-have1 'autopilot governor: pid'
+# C1: the governor is supervised, and the supervision is EXERCISED. init kills
+# it deliberately (aios.governor.kill=1), so these three lines prove the whole
+# path - start, detect, respawn - rather than proving the governor happened to
+# start. Before C1 the pid was never recorded and a dead governor was
+# indistinguishable from one that had never been started.
+# The launch is asserted SEPARATELY from the respawn. C1 briefly shipped
+# without the initial fork at all - the supervisor code was there and nothing
+# started a governor - and only this line would have caught it directly.
+if [ "$(grep -c 'autopilot governor: pid' boot/build/boot-test1.log 2>/dev/null)" -ge 1 ]; then
+    echo "  OK   governor started"
+else
+    echo "  MISS governor never started"; fail=1
+fi
+have1 'C1 self-test: killing governor pid'
+have1 'governor died (killed by signal 9) - respawning'
+# and the respawn itself: a SECOND governor start line. grep -c
+# rather than a fourth have1, because the first two lines above already match
+# the same pattern and a plain assert would pass without a respawn happening.
+if [ "$(grep -c 'autopilot governor: pid' boot/build/boot-test1.log 2>/dev/null)" -ge 2 ]; then
+    echo "  OK   governor respawned after the kill (2+ start lines)"
+else
+    echo "  MISS governor was never respawned"; fail=1
+fi
 
 echo
 echo "[boot-test] phase 2: same disk — reboot and replay the journal"

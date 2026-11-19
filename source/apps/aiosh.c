@@ -24,8 +24,22 @@ static void print_result(const sh_result *r) {
     if (r->status != 0 && r->error) printf("error: %s\n", r->error);
 }
 
+/* Where the workspace lives when nobody says otherwise.
+ *
+ * This used to be the relative "./workspace", which is fine at a shell prompt
+ * and wrong when PID 1 starts the shell: init never chdir()s, so the jail
+ * resolved to /workspace while the image installs it at /workspace -- and the
+ * relative path only worked for a human who happened to be in the right
+ * directory. A path that depends on someone else's cwd is not a default, it is a
+ * coincidence. Absolute first, relative as the fallback for a source-tree run. */
+static const char *default_jail(void) {
+    if (access("/workspace", F_OK) == 0) return "/workspace";
+    if (access("./workspace", F_OK) == 0) return "./workspace";
+    return "./workspace";
+}
+
 int main(int argc, char **argv) {
-    const char *jail = "./workspace";
+    const char *jail = default_jail();
     /* M8 durable: init points AIOS_STORE at the ext2 side disk when it
      * mounted one — memory/audit/jobs then persist across reboots. */
     const char *store = getenv("AIOS_STORE");
@@ -33,6 +47,7 @@ int main(int argc, char **argv) {
     const char *mode = NULL; /* default below: $AIOS_SHELL_CORTEX */
     const char *cmd = NULL;
     const char *script = NULL;
+    int as_ai = 0;                    /* M7: --as-ai runs input as machine-origin */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--scripted") == 0) mode = "scripted";
@@ -40,11 +55,20 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--llm") == 0) mode = "llm";
         else if (strcmp(argv[i], "--jail") == 0 && i + 1 < argc) jail = argv[++i];
         else if (strcmp(argv[i], "--store") == 0 && i + 1 < argc) store = argv[++i];
+        /* M7: run the line as MACHINE-ORIGINATED input. This exists because the
+         * origin is otherwise impossible to observe from outside: the console is
+         * a person, and every test that wants the AI path had to reach into the
+         * library. With this, "what happens when a model types this" is a command
+         * you can run, which is also how the boot proof exercises it. */
+        else if (strcmp(argv[i], "--as-ai") == 0) as_ai = 1;
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) cmd = argv[++i];
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("usage: aiosh [--scripted|--micro|--llm] [--jail DIR] "
-                   "[--store DIR]\n"
-                   "             [-c LINE] | [script.aiosh]\n");
+                   "[--store DIR] [--as-ai]\n"
+                   "             [-c LINE] | [script.aiosh]\n"
+                   "  --as-ai   execute the input as MACHINE-originated (M7): the\n"
+                   "            shell refuses human-only commands and stamps every\n"
+                   "            action ORIGIN_AI. For testing and for the boot proof.\n");
             return 0;
         }
         else if (argv[i][0] == '-') {
@@ -78,10 +102,18 @@ int main(int argc, char **argv) {
            getenv("AIOS_DUR") ? "yes" : "no");
 
     int last_status = 0;
+    const aios_origin origin = as_ai ? ORIGIN_AI : ORIGIN_HUMAN;
+
+    /* M7: a human at a console can answer a NEEDS_HUMAN, so the asker is
+     * installed. A machine-origin run does NOT get one, and that is the whole
+     * point: if --as-ai could reach the prompt, it would be a prompt a model can
+     * answer, and "only a person can accept it" would be a sentence with nothing
+     * behind it. Uninstalled asker => the hold is reported and never promoted. */
+    if (origin == ORIGIN_HUMAN) sh_set_ui_asker(sh, sh_console_ask, NULL);
 
     if (cmd) {
         sh_result r;
-        sh_exec(sh, cmd, &r);
+        sh_exec_origin(sh, cmd, origin, &r);
         print_result(&r);
         last_status = r.status;
         sh_result_free(&r);
@@ -96,7 +128,7 @@ int main(int argc, char **argv) {
         while (fgets(line, sizeof line, f)) {
             line[strcspn(line, "\r\n")] = 0;
             sh_result r;
-            if (sh_exec(sh, line, &r) != 0) { sh_result_free(&r); break; }
+            if (sh_exec_origin(sh, line, origin, &r) != 0) { sh_result_free(&r); break; }
             print_result(&r);
             last_status = r.status;
             sh_result_free(&r);
@@ -111,7 +143,7 @@ int main(int argc, char **argv) {
             if (!fgets(line, sizeof line, stdin)) break;
             line[strcspn(line, "\r\n")] = 0;
             sh_result r;
-            if (sh_exec(sh, line, &r) != 0) {
+            if (sh_exec_origin(sh, line, origin, &r) != 0) {
                 print_result(&r);
                 sh_result_free(&r);
                 break;

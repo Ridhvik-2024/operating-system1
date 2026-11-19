@@ -23,4 +23,82 @@ echo boot: kernel bridge status
 kernel
 echo boot: autopilot governor status
 autopilot
+echo boot: rollback proof (M5)
+# The proof runs in the shell so it exercises exactly what a human would type:
+# write, snapshot, wreck, roll back, and read the file back. boot-test.sh then
+# asserts the FIRST content after a REBOOT, which is the part that proves the
+# snapshot was on disk rather than in a variable.
+snap take boot-proof
+fs.write path=bootproof.txt content=v1
+snap take before-wreck
+fs.write path=bootproof.txt content=v2
+rollback latest
+fs.read path=bootproof.txt
+echo boot: audit chain proof (M6)
+# The record is a chain: every line carries the hash of the one before it. This
+# verifies the log the boot has just written -- in the image, on the ext2 disk,
+# after real tool calls have gone through the sandbox -- and prints the head hash
+# so the next boot can tell whether it is looking at the same history.
+audit verify
+echo boot: origin proof (M7)
+# The claim M7 makes is not "there is a flag". It is that the shell KNOWS who
+# spoke, and that a model cannot do what a person can. Both halves run here, on
+# the real image, through the real shell:
+#
+#   1. as a HUMAN, `promote` is a command that answers -- an empty stage makes it
+#      say so, which is a different outcome from being refused;
+#   2. as a MACHINE, the very same word is refused, and the refusal names the
+#      origin rather than pretending the command does not exist.
+#
+# A proof that only ran (2) would pass on a shell where `promote` was deleted.
+echo as a human, promote is available:
+promote
+echo as a machine, promote is not:
+machine "promote"
+
+echo boot: staging under the sandbox (M7)
+# M3 stages a machine's writes OUTSIDE the jail; M6's Landlock allows writes
+# only INSIDE it. Both are right, so the sandbox has to be told about the second
+# writable root -- and when it was not, every honest AI write died with SIGSYS
+# while `staged` still showed a row and `promote` said "promoted 0 files": a
+# human told a change was waiting that had never existed.
+#
+# This runs LAST because it legitimately leaves a file pending. The next line
+# throws it away so the boot ends with an empty stage, which is also how the
+# image should hand over.
+machine "fs.write path=bootproof-m7.txt content=written-by-a-machine"
+staged
+echo as a human, discard is available:
+discard
+
+echo boot: pending is a list (M7.5)
+# The defect this proves gone: a change a human had been SHOWN stopped being
+# mentioned as soon as anything else staged, and an unrelated agent run could
+# discard it outright -- because a live staging session was shell state, not
+# command state.
+#
+# The sequence matters and was got wrong first: `promote latest` is only
+# unambiguous with ONE change pending, and `ls` is not a builtin -- it routes to
+# the agent, which stages another file and makes this proof test itself. So the
+# earlier change is promoted by its own id, and nothing here is spelled as a
+# command that would start a run.
+machine "fs.write path=bootproof-m75.txt content=written-by-a-machine"
+echo after an agent run, the earlier change is still listed:
+machine "summarize the workspace"
+staged
+echo promoting the change that was reviewed, by name:
+promote 15406709633990357084-1
+echo the change that was named landed:
+fs.read path=bootproof-m75.txt | grep written-by-a-machine
+echo the agent did not get its own change applied:
+staged
+# Hand over with an EMPTY stage, as the M7 block does. A pending change left on
+# the data disk is not just untidy: on the next boot the M7 origin proof's bare
+# `promote` would resolve `latest` to the previous session's leftover and apply
+# it, so boot 2 would prove something about boot 1's change instead of the one
+# it staged. Cross-boot state has to be deliberate or it is a lie.
+discard 15723575368199243237-1
+echo the stage is empty for the next boot:
+staged
+
 echo boot: aiosh bring-up complete

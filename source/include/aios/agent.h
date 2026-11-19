@@ -42,6 +42,28 @@ cortex *cortex_scripted_create(const char *goal);
 cortex *cortex_llm_create(const char *system_extra);
 void    cortex_free(cortex *cx);
 
+/* The guardian: called before EVERY tool the loop is about to run.
+ *
+ * This exists because the agent loop used to call tool_exec() directly, which
+ * made it the one place in the system where an action ran with no descriptor,
+ * no policy verdict and no staging. Everything the shell did to become
+ * mediated was bypassed by the thing most likely to act unsupervised.
+ *
+ * Implementations return 0 to permit, 1 to refuse (with `err` set), and may
+ * redirect the write target by calling tool_reg_set_staging(). A NULL
+ * `guard` means "no mediation" and is only legitimate in tests. */
+typedef struct {
+    int (*check)(void *ud, const char *tool, json_val *args,
+                 char *err, size_t ecap);
+    /* Called AFTER the tool ran, with the same tool name. This is where the
+     * guardian compares what the worker says it did against what was declared
+     * (M4). It may refuse the step, in which case the result is discarded and
+     * the loop treats it as a failed step. Running unattended is exactly when
+     * the check matters most, since no human is watching the diff. */
+    int (*after)(void *ud, const char *tool, char *err, size_t ecap);
+    void *ud;
+} agent_guard;
+
 typedef struct {
     const char *name;      /* agent identity (audit + memory)     */
     const char *goal;      /* intent to achieve                   */
@@ -49,6 +71,7 @@ typedef struct {
     tool_reg   *tools;     /* tool registry (borrowed)            */
     mem_ctx    *mem;       /* OS memory (borrowed, optional)      */
     int         max_steps; /* hard budget (e.g. 8)                */
+    agent_guard guard;     /* mediation for every step (required) */
 } agent_cfg;
 
 /* Run to completion. final_out gets the final answer (or last error).

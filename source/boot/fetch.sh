@@ -8,6 +8,7 @@ cd "$(dirname "$0")"   # aios/boot
 BASE=https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64
 KERNEL_APK=linux-virt-6.6.142-r0.apk
 DEV_APK=linux-virt-dev-6.6.142-r0.apk
+DEV_APK_SHORT=linux-virt-dev.apk      # name the apk is committed under
 BUSYBOX_APK=busybox-static-1.36.1-r31.apk
 
 mkdir -p dl
@@ -50,7 +51,19 @@ if [ ! -f busybox-root/bin/busybox.static ]; then
     echo "[fetch] busybox ready: busybox-root/bin/busybox.static"
 fi
 
-if [ ! -f modules-gpu/virtio-gpu.ko.gz ]; then
+# Sentinel must be a file that actually ships. It used to test for
+# virtio-gpu.ko.gz, which is NOT in the set (the stack is bochs + evdev +
+# virtio_input), so this block re-downloaded 38 MB on every run - including
+# in CI, where it failed on a network hiccup despite everything being
+# committed. Check the whole expected set instead.
+GPU_MODS="bochs drm drm_kms_helper drm_panel_orientation_quirks drm_shmem_helper
+drm_ttm_helper drm_vram_helper evdev fb fb_io_fops fb_sys_fops fbdev i2c-core
+syscopyarea sysfillrect sysimgblt ttm virtio_input"
+gpu_missing=0
+for m in $GPU_MODS; do
+    [ -f "modules-gpu/$m.ko.gz" ] || gpu_missing=1
+done
+if [ "$gpu_missing" = 1 ]; then
     # M10 desktop: the DRM/bochs + evdev module stack (still gzipped —
     # 743 KB shipped; aios-init gunzips + insmods them at boot when the GUI
     # is enabled). Order proven by boot/dl/modules-gpu load order in init.c.
@@ -93,11 +106,22 @@ if [ ! -f modules-gpu/virtio-gpu.ko.gz ]; then
 fi
 
 if [ ! -f kern-dev/usr/src/linux-headers-6.6.142-0-virt/Makefile ]; then
-    echo "[fetch] downloading kernel headers for the LKM ($DEV_APK, ~18 MB)..."
-    curl -fL -o "$DEV_APK" "$BASE/$DEV_APK"
     mkdir -p kern-dev
-    tar xzf "$DEV_APK" -C kern-dev 2>/dev/null || true
-    rm -f "$DEV_APK"
+    # The dev apk is COMMITTED (18 MB) so extracting it needs no network.
+    # It is stored under the unversioned name; older checkouts used the
+    # upstream versioned name, so accept both before downloading anything.
+    dev_src=""
+    for cand in "$DEV_APK" "$DEV_APK_SHORT"; do
+        if [ -f "$cand" ]; then dev_src="$cand"; break; fi
+    done
+    if [ -n "$dev_src" ]; then
+        echo "[fetch] extracting committed $dev_src (no network needed)..."
+    else
+        echo "[fetch] downloading kernel headers for the LKM ($DEV_APK, ~18 MB)..."
+        curl -fL -o "$DEV_APK" "$BASE/$DEV_APK"
+        dev_src="$DEV_APK"
+    fi
+    tar xzf "$dev_src" -C kern-dev 2>/dev/null || true
     echo "[fetch] headers ready: kern-dev/usr/src/linux-headers-6.6.142-0-virt"
 fi
 

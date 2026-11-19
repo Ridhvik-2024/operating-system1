@@ -1,5 +1,6 @@
 /* aios/tools.c — M4: tool registry, native tools, audit journal. */
 #include "aios/tools.h"
+#include "aios/audit.h"
 #include "sandbox.h"
 
 #include <stdio.h>
@@ -19,6 +20,17 @@ struct tool_reg {
     char store[512];
     char agent[128];
     mem_ctx *mem;      /* borrowed */
+    /* M3: when set, sandboxed writes are redirected here and the worker is
+     * told the action is AI-originated. */
+    char stage[512];
+    int  staged;
+
+    /* M4: the account from the last sandboxed call. Owned here so the caller
+     * can inspect it after tool_exec returns, which is when it knows what it
+     * declared. */
+    json_val *last_effects;
+    json_val *last_usage;
+    int       last_complete;
 };
 
 /* Native tools need registry state (memory ctx, agent name). tools.c
@@ -95,6 +107,8 @@ void tool_reg_free(tool_reg *tr) {
         free(t);
         t = nx;
     }
+    json_free(tr->last_effects);
+    json_free(tr->last_usage);
     free(tr);
 }
 
@@ -137,42 +151,59 @@ char *tool_reg_help_json(tool_reg *tr) {
 
 /* ---------------- audit ---------------- */
 
+/* M6: the record is a link in a chain, written by src/audit.c.
+ *
+ * What changed here is not the fields -- `dur` counts lines and the shell's test
+ * looks for "tool":"calc", so those had to keep working -- but that a failure to
+ * record is now reported. M4's version opened the file, wrote, and ignored every
+ * error on the way out: a full disk meant actions happened and left no trace, and
+ * nothing said so. That is the exact failure a tamper-evident log must not have,
+ * because "no record" and "the record was lost" look identical afterwards.
+ *
+ * It still does not abort the tool call. Refusing to do work because the log is
+ * unwritable would trade a missing record for a broken machine, and the log's own
+ * 'busy' error tells a caller which happened. */
 static void audit_log(tool_reg *tr, const char *tool, const char *args_json,
                       bool ok, double ms, const char *result_json) {
     if (!tr || !tr->store[0]) return;
-    char path[600];
-    snprintf(path, sizeof path, "%s/audit.log", tr->store);
-    FILE *f = fopen(path, "ab");
-    if (!f) return;
-    uint64_t dig = aios_fnv1a(result_json ? result_json : "",
-                              result_json ? strlen(result_json) : 0);
-    /* embed args as JSON value if it parses, else as a JSON string */
-    json_val *a = json_parse(args_json ? args_json : "null",
-                             args_json ? strlen(args_json) : 4);
-    char *args_embedded;
-    if (a) {
-        args_embedded = strdup(args_json ? args_json : "null");
-        json_free(a);
-    } else {
-        json_val *s = json_new_str(args_json ? args_json : "");
-        args_embedded = json_dump(s);
-        json_free(s);
+    char err[256] = {0};
+    if (!audit_append_tool(tr->store, tool, args_json, tr->agent, ok, ms,
+                           result_json, err, sizeof err)) {
+        /* Visible, not silent. The tool ran; the record of it did not land. */
+        fprintf(stderr, "audit: could not record %.60s: %.160s\n",
+                tool ? tool : "?", err);
     }
-    fprintf(f,
-        "{\"ts\":%.0f,\"agent\":\"%s\",\"tool\":\"%s\",\"args\":%s,"
-        "\"ok\":%s,\"ms\":%.1f,\"digest\":\"%016llx\"}\n",
-        aios_now_ms(), tr->agent, tool,
-        args_embedded ? args_embedded : "null",
-        ok ? "true" : "false", ms,
-        (unsigned long long)dig);
-    if (fflush(f) != 0 || fsync(fileno(f)) != 0) { /* best effort */ }
-    fclose(f);
-    free(args_embedded);
 }
 
 /* ---------------- execution ---------------- */
 
 static double g_sandbox_timeout_s = 10.0;
+
+const json_val *tool_reg_last_effects(const tool_reg *tr) {
+    return tr ? tr->last_effects : NULL;
+}
+
+int tool_reg_last_complete(const tool_reg *tr) {
+    return tr ? tr->last_complete : 0;
+}
+
+void tool_reg_clear_effects(tool_reg *tr) {
+    if (!tr) return;
+    json_free(tr->last_effects);
+    tr->last_effects = NULL;
+    tr->last_complete = 0;
+}
+
+void tool_reg_set_staging(tool_reg *tr, const char *stage_dir) {
+    if (!tr) return;
+    if (stage_dir && *stage_dir) {
+        snprintf(tr->stage, sizeof tr->stage, "%s", stage_dir);
+        tr->staged = 1;
+    } else {
+        tr->stage[0] = 0;
+        tr->staged = 0;
+    }
+}
 
 void tool_set_sandbox_timeout(double seconds) {
     if (seconds < 0.5) seconds = 0.5;
@@ -188,6 +219,11 @@ aios_status tool_exec(tool_reg *tr, const char *name, json_val *args,
         if (err && ecap) snprintf(err, ecap, "invalid tool_exec call");
         return AIOS_ERR_ARG;
     }
+    /* Clear the out-parameter before anything can fail. Without this, a caller
+     * that reuses one `json_val *res` across calls double-frees the previous
+     * result the first time a tool fails -- which is exactly what a test did,
+     * and which every real caller would do eventually. */
+    *result_out = NULL;
     const tool_def *def = tool_reg_find(tr, name);
     if (!def) {
         json_free(args);
@@ -200,24 +236,63 @@ aios_status tool_exec(tool_reg *tr, const char *name, json_val *args,
     aios_status st;
     json_val *res = NULL;
 
+    /* Refuse an over-limit write HERE, before it becomes a 1.1 MB pipe payload.
+     * The worker enforces the same limit, but doing it only there means the
+     * refusal competes with the sandbox deadline: under emulation on a busy
+     * boot the round trip loses, and a clear "too big" arrives as a timeout. */
+    if (def->sandboxed && strcmp(name, "fs.write") == 0) {
+        const json_val *c = json_obj_get(args, "content");
+        if (c && json_str(c) && strlen(json_str(c)) > AIOS_FS_WRITE_MAX) {
+            if (err && ecap) snprintf(err, ecap, "content exceeds 1MB write limit");
+            /* A refused call must not leave the PREVIOUS call's account lying
+             * around as if it described this one. */
+            json_free(tr->last_effects);
+            tr->last_effects = json_new_arr();
+            tr->last_complete = 1;
+            free(args_json);
+            free(args);
+            return AIOS_ERR_TOOL;
+        }
+    }
+
     if (def->sandboxed) {
         json_val *req = json_new_obj();
         json_obj_set(req, "tool", json_new_str(name));
         json_obj_set(req, "args", args ? args : json_new_null());
+        /* M3: origin and staging travel with the request. The worker needs the
+         * origin to enforce "an AI write must not land", and it must receive
+         * that from its parent rather than assume it. */
+        json_obj_set(req, "origin", json_new_str(tr->staged ? "ai" : "human"));
+        if (tr->staged) json_obj_set(req, "stage", json_new_str(tr->stage));
         char *req_json = json_dump(req);
         json_free(req);              /* frees args too: ownership moved */
         args = NULL;
-        st = sandbox_run(tr->jail,
-                         req_json ? req_json : "{}",
-                         req_json ? strlen(req_json) : 2,
-                         g_sandbox_timeout_s, &res, err, ecap);
+        sandbox_result sr = {0};
+        st = sandbox_run_ex(tr->jail,
+                            req_json ? req_json : "{}",
+                            req_json ? strlen(req_json) : 2,
+                            g_sandbox_timeout_s, &sr, err, ecap);
         free(req_json);
-        if (st == AIOS_OK && res) {
-            /* unwrap worker envelope {"ok":true,"result":X} -> X (or null) */
-            json_val *r = json_obj_take(res, "result");
-            json_free(res);
-            res = r ? r : json_new_null();
+        if (sr.resp) {
+            /* The account is kept whatever the outcome. A tool that failed
+             * halfway may already have written something; discarding its
+             * testimony because it also reported an error would hide exactly
+             * that. The verdict on `st` is unaffected. */
+            /* M4: unpack the envelope, keeping the account. The result is
+             * handed on as before; the effects document rides along beside it,
+             * because the caller needs both to answer "did it do what it
+             * said?" -- a question the result alone cannot answer. */
+            json_val *r = json_obj_take(sr.resp, "result");
+            tr->last_effects = json_obj_take(sr.resp, "effects");
+            tr->last_complete = sr.complete ? json_bool(sr.complete) : 0;
+            json_free(tr->last_usage);
+            tr->last_usage = json_obj_take(sr.resp, "usage");
+            json_free(sr.resp);
+            sr.resp = NULL;
+            if (st == AIOS_OK) res = r ? r : json_new_null();
+            else json_free(r);
         }
+        sandbox_result_free(&sr);
     } else {
         g_active_reg = tr;
         st = def->native ? def->native(args, &res, err, ecap)

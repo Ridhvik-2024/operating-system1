@@ -19,6 +19,7 @@
 #ifndef AIOS_SHELL_H
 #define AIOS_SHELL_H
 
+#include "aios/action.h"
 #include "aios/types.h"
 #include "aios/json.h"
 #include "aios/mem.h"
@@ -56,6 +57,121 @@ const char *sh_cortex_mode(sh_shell *sh);
  * Returns 0 = keep running, 1 = exit requested (exit/quit builtin).
  * out must be non-NULL; free with sh_result_free(). */
 int  sh_exec(sh_shell *sh, const char *line, sh_result *out);
+
+/* M7: the same, with the caller stating where the line came from.
+ *
+ * This is the whole of origin tagging, and the reason it is a separate function
+ * rather than a parameter with a default: a default is an assumption, and the
+ * assumption that every line is human is the one that was silently true before.
+ * Typed input is human; text that a model produced is AI; there is no third
+ * answer and no "unspecified" that quietly becomes human downstream.
+ *
+ * What the origin changes:
+ *   - the descriptor carrying the action is stamped with it, so policy can tell
+ *     a machine's proposal from a person's instruction;
+ *   - an AI-origin line may not run a builtin that makes a change real
+ *     (`promote`, `discard`, `rollback`, `snap take`, `exit`, ...). Those builtins
+ *     are the human's hand on the machine; a model being able to type them would
+ *     make every other guarantee decorative. The refusal is explicit and names
+ *     the origin, rather than the builtin silently not being found;
+ *   - an AI-origin line that the router turns into a tool keeps ORIGIN_AI all the
+ *     way to the audit record.
+ *
+ * sh_exec() is the human case and is defined as sh_exec_origin(ORIGIN_HUMAN).
+ * It is kept because a shell with a prompt is a person talking, and making every
+ * caller spell that out would be noise. Anything that runs text IT produced must
+ * use sh_exec_origin() -- and if it does not, it is claiming to be a person.
+ */
+int  sh_exec_origin(sh_shell *sh, const char *line, aios_origin origin,
+                    sh_result *out);
+
+/* M7: what a held action is waiting for, and what the console does about it.
+ *
+ * NEEDS_HUMAN is not a refusal (see action_gate). It is a proposal parked in
+ * front of a person, and a person has to be able to answer it with one of these
+ * three words. ui_present() is the console's side of that conversation; it is in
+ * the library rather than in aiosh so that the desktop and the serial console ask
+ * the SAME question in the same words, and so that the answer can be tested
+ * without a terminal.
+ *
+ * The single most important line in this declaration is `hold_ms`: there is no
+ * auto-promote. When the countdown runs out the answer is DISCARD, because a
+ * timeout is a decision to do nothing, and "the human did not answer" must never
+ * be read as "the human agreed". */
+typedef enum {
+    UI_CHOICE_DISCARD = 0,   /* do nothing -- the default, and the timeout    */
+    UI_CHOICE_PROMOTE = 1,   /* accept: run it                                  */
+    UI_CHOICE_SHOW_DIFF = 2, /* show what it would change, then ask again       */
+    /* M8: "a person has been asked, and has not answered". For a front-end whose
+     * event loop cannot stop to wait -- the desktop -- this is the only honest
+     * answer available while the question is on screen. It is NOT a fourth kind
+     * of consent: the action stays unexecuted until sh_resume() is told a person
+     * chose. Before this existed the desktop answered DISCARD and opened the
+     * window anyway, so the human's later "promote" applied to nothing while the
+     * shell had already decided. */
+    UI_CHOICE_DEFER = 3
+} ui_choice;
+
+typedef struct {
+    char        title[160];   /* what is being proposed, in one line          */
+    char        reason[160];  /* the law's reason, verbatim                   */
+    char        detail[512];  /* the diff or the target, if there is one      */
+    int         have_detail;
+    aios_origin origin;
+} ui_prompt;
+
+/* Ask. Returns the choice, and never promotes on its own.
+ *
+ * `ask` may be NULL, which is how a non-interactive caller (a script, a boot
+ * test, the serial console with no one at it) gets the honest answer: DISCARD.
+ * A function that invented a reader would be inventing consent. */
+ui_choice ui_present(const ui_prompt *p,
+                     ui_choice (*ask)(const ui_prompt *p, void *ud), void *ud);
+
+/* The one-line rendering both front-ends use, so the choices read the same in a
+ * terminal and in a window. Returns the number of bytes written. */
+int ui_prompt_text(const ui_prompt *p, char *out, size_t cap);
+
+/* Install an asker. Passing NULL REMOVES it, which turns a held action back into
+ * a reported refusal -- the state a script or a test wants. There is no "default
+ * asker": a default would be a front-end the library invented, and the first
+ * thing a default asker does when stdin is not a terminal is answer for nobody. */
+void sh_set_ui_asker(sh_shell *sh,
+                     ui_choice (*ask)(const ui_prompt *p, void *ud), void *ud);
+
+/* The console asker: prints the three choices, reads one line, treats EOF and
+ * anything unrecognised as DISCARD. Exposed so aiosh can install it and the
+ * tests can call it with a pipe. */
+ui_choice sh_console_ask(const ui_prompt *p, void *ud);
+
+/* M8: the other half of a DEFER.
+ *
+ * After an asker returns UI_CHOICE_DEFER, the action is held by the shell and
+ * NOTHING has run. `sh_deferred()` says whether one is waiting and what it is, so
+ * a front-end can draw it. `sh_resume()` takes a person's answer:
+ *
+ *   PROMOTE  -> the held action is executed, with the same descriptor that was
+ *               judged -- not by re-running the line, which could read different
+ *               arguments the second time;
+ *   DISCARD  -> the hold is dropped and the action never happens;
+ *   anything else -> no change at all.
+ *
+ * There is still no timeout. A hold that nobody answers stays a hold, which is
+ * the safe direction: the alternative is an action that executes because the
+ * window was closed, and that is exactly what "no auto-promote" forbids.
+ *
+ * Returns 1 only if the resume FAILED -- the held action could not be applied
+ * (e.g. it expired between the question and the answer). A clean discard and a
+ * clean promote both return 0, so a caller can tell "the person said no" from
+ * "the person's yes went wrong"; `out` carries what to say in either case. */
+int  sh_deferred(sh_shell *sh, char *title, size_t tcap,
+                 aios_origin *origin_out);
+int  sh_resume(sh_shell *sh, ui_choice choice, sh_result *out);
+
+/* What the last line executed was stamped as. For the desktop's status line and
+ * for tests that assert the stamping actually happened, rather than trusting the
+ * call site. */
+aios_origin sh_last_origin(const sh_shell *sh);
 
 /* Background agent jobs. sh_poll_jobs reaps finished children; call it
  * before inspecting job state (the shell does this on every sh_exec). */

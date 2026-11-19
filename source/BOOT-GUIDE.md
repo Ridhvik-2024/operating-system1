@@ -77,7 +77,7 @@ AI-OS 1.1.0-m10 (v1.1 desktop)
 [init] durable: this is boot #N for this data disk      <- real persistence
 [init] autopilot governor: pid N (mode balanced)        <- the closed loop
 [init] phase 1/2: AI-OS selftest (M1-M8 unit + integration suite)
-  ... 10 suites ...
+  ... 15 suites ...
 AIOS-SELFTEST: PASS
 [init] phase 2/2: system bring-up via aiosh (AI shell)
 lm: class=bg conf=1.00 (micro-lm)                       <- the OS's own LM
@@ -177,7 +177,7 @@ write is fsync'd before the prompt returns.
 | `boot/init.c` | loads virtio_blk/mbcache/ext2, mounts /data, restores the previous session, prints the replay report, logs this boot |
 | `tests/test_durable.c` | suite 10: atomicity, torn-tail replay, mirror/restore, escape rejection, job-journal replay through a real shell, live side-disk write (in-VM) |
 | `tools/install.sh` + `make install` | the v1.0 install path (M9): binaries, headers and lib to `$PREFIX`, `DESTDIR`-aware, verified by a post-install shell run |
-| `boot-gui-test.sh` | the M10 desktop proof: boots with a `bochs-display` GPU + virtio keyboard, screendumps the desktop through the QEMU monitor, pixel-asserts wallpaper/accent/title bars/cursor, types `6*7` in the GUI terminal and asserts the answer `42`; screenshots in `download/m10-boot-shots/` |
+| `boot-gui-test.sh` | the M10 desktop proof: boots with a `bochs-display` GPU + virtio keyboard, screendumps the desktop through the QEMU monitor, pixel-asserts wallpaper/accent/title bars/cursor, types `6*7` in the GUI terminal and asserts the answer `42` (screendumps are written to `download/m10-boot-shots/` by the script when it runs) |
 | `tools/perf-run.sh` | the v1.0 performance pass: build/suite/latency measurements behind `docs/PERFORMANCE.md` |
 | `docs/` | HARDENING.md (threat model + claim->test matrix), PERFORMANCE.md, ACCEPTANCE-v1.0.md (the release record) |
 

@@ -1,18 +1,34 @@
 /* probe.c — M6 recon: probe the booted kernel for the features the
  * kernel-bridge milestone needs. Static, zero deps. Staged as /sbin/probe.
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* syscall(2) declaration */
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sched.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <linux/landlock.h>
 #include <linux/sched.h>
 #include <linux/bpf.h>
-#include <linux/sched/types.h>
-#include <sched.h>
+
+/* Same glibc >= 2.36 clash as src/ksched.c: <linux/sched/types.h> and
+ * glibc's <sched.h> both define struct sched_param. Declare only the one
+ * kernel struct this dev probe actually needs. */
+struct sched_attr {
+    unsigned int size;
+    unsigned int sched_policy;
+    long long    sched_flags;
+    int          sched_nice;
+    unsigned int sched_priority;
+    unsigned long long sched_runtime;
+    unsigned long long sched_deadline;
+    unsigned long long sched_period;
+};
 
 #ifndef __NR_landlock_create_ruleset
 #define __NR_landlock_create_ruleset 444

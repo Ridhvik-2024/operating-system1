@@ -53,7 +53,7 @@ static int seccomp_install(char *why, size_t cap) {
      * ptrace, bpf, kexec...) is rejected with SIGSYS. */
     static const int allow[] = {
         __NR_read, __NR_write, __NR_close,
-        __NR_openat, __NR_stat, __NR_lstat, __NR_fstat, __NR_newfstatat,
+        __NR_open, __NR_openat, __NR_stat, __NR_lstat, __NR_fstat, __NR_newfstatat,
         __NR_statx, __NR_lseek, __NR_readlinkat, __NR_getdents64,
         __NR_mmap, __NR_munmap, __NR_mprotect, __NR_brk,
         __NR_rt_sigaction, __NR_rt_sigprocmask, __NR_rt_sigreturn,
@@ -130,16 +130,50 @@ static int seccomp_install(char *why, size_t cap) {
 /* ------------------------------------------------------------------ */
 /* Landlock: filesystem view limited to the jail                        */
 
-static int landlock_apply(const char *jail, char *why, size_t cap) {
+/* One rule: "everything beneath `path` may be read and written". Returns 0 on
+ * success, -1 with *why filled. */
+static int landlock_allow(const char *path, int ruleset_fd, __u64 handled,
+                          char *why, size_t cap) {
+    int jfd = open(path, O_PATH | O_CLOEXEC | O_DIRECTORY);
+    if (jfd < 0) {
+        whyf(why, cap, "open %s: %s", path, strerror(errno));
+        return -1;
+    }
+    struct landlock_path_beneath_attr pb = {
+        .allowed_access = handled,
+        .parent_fd = (unsigned)jfd,
+    };
+    int rc = (int)syscall(__NR_landlock_add_rule, ruleset_fd,
+                          LANDLOCK_RULE_PATH_BENEATH, &pb, 0);
+    close(jfd);
+    if (rc != 0) {
+        whyf(why, cap, "landlock_add_rule %s: %s", path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int landlock_apply(const char *jail, const char *extra_rw,
+                          char *why, size_t cap) {
     long abi = syscall(__NR_landlock_create_ruleset, NULL, 0,
                        LANDLOCK_CREATE_RULESET_VERSION);
     if (abi < 0) {
         whyf(why, cap, "landlock unavailable: %s", strerror(errno));
         return -1;
     }
+    /* What the tools actually do: read, write, create (O_CREAT on a new file is
+     * MAKE_REG, not WRITE_FILE), and remove. WRITE_FILE alone is enough to
+     * overwrite an existing file and NOT enough to create one, which is exactly
+     * the difference between a staged write landing and returning EACCES with no
+     * output at all -- the failure mode that made this look like the sandbox
+     * refusing to run rather than refusing one access bit.
+     *
+     * MAKE_DIR is here for the same reason: fs.write creates missing parents. */
     __u64 handled = LANDLOCK_ACCESS_FS_READ_FILE |
                     LANDLOCK_ACCESS_FS_WRITE_FILE |
-                    LANDLOCK_ACCESS_FS_READ_DIR;
+                    LANDLOCK_ACCESS_FS_READ_DIR |
+                    LANDLOCK_ACCESS_FS_MAKE_REG |
+                    LANDLOCK_ACCESS_FS_MAKE_DIR;
     if (abi >= 2) handled |= LANDLOCK_ACCESS_FS_REMOVE_FILE |
                              LANDLOCK_ACCESS_FS_REMOVE_DIR;
     if (abi >= 3) handled |= LANDLOCK_ACCESS_FS_TRUNCATE;
@@ -152,29 +186,25 @@ static int landlock_apply(const char *jail, char *why, size_t cap) {
         return -1;
     }
 
-    /* allow everything within the jail */
-    int jfd = open(jail, O_PATH | O_CLOEXEC | O_DIRECTORY);
-    if (jfd < 0) {
-        whyf(why, cap, "open jail %s: %s", jail, strerror(errno));
+    /* Allow everything within the jail. */
+    if (landlock_allow(jail, ruleset_fd, handled, why, cap) != 0) {
         close(ruleset_fd);
         return -1;
     }
-    struct landlock_path_beneath_attr pb = {
-        .allowed_access = LANDLOCK_ACCESS_FS_READ_FILE |
-                          LANDLOCK_ACCESS_FS_WRITE_FILE |
-                          LANDLOCK_ACCESS_FS_READ_DIR |
-                          (abi >= 2 ? (LANDLOCK_ACCESS_FS_REMOVE_FILE |
-                                       LANDLOCK_ACCESS_FS_REMOVE_DIR) : 0) |
-                          (abi >= 3 ? LANDLOCK_ACCESS_FS_TRUNCATE : 0),
-        .parent_fd = (unsigned)jfd,
-    };
-    int rc = (int)syscall(__NR_landlock_add_rule, ruleset_fd,
-                          LANDLOCK_RULE_PATH_BENEATH, &pb, 0);
-    close(jfd);
-    if (rc != 0) {
-        whyf(why, cap, "landlock_add_rule: %s", strerror(errno));
-        close(ruleset_fd);
-        return -1;
+    /* And the staging directory, when there is one. Not "the store": the
+     * staging subtree the parent named, which is the only outside place a
+     * machine's write is supposed to reach. */
+    if (extra_rw && *extra_rw) {
+        if (landlock_allow(extra_rw, ruleset_fd, handled, why, cap) != 0) {
+            /* Not fatal, and deliberately so. The jail rule is the one that must
+             * hold; the staging rule is an addition, and failing to add it must
+             * not turn "sandbox is up" into "sandbox is off". What it must do is
+             * SAY so, because the symptom otherwise is a machine write that
+             * silently goes nowhere. */
+            fprintf(stderr, "tool-exec: landlock staging rule not added (%s) -- "
+                            "a machine write will be refused\n", why);
+            why[0] = 0;
+        }
     }
 
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
@@ -193,14 +223,15 @@ static int landlock_apply(const char *jail, char *why, size_t cap) {
 
 /* ------------------------------------------------------------------ */
 
-int aios_hardening_apply(const char *jail, char *why, size_t whycap) {
+int aios_hardening_apply(const char *jail, const char *extra_rw,
+                         char *why, size_t whycap) {
     int applied = 0;
     char w1[128] = {0}, w2[128] = {0};
 
     /* Landlock FIRST (it still needs its own syscalls + open), then the
      * seccomp allowlist last — from that point on, nothing outside the
      * list can be attempted at all. */
-    if (jail && landlock_apply(jail, w2, sizeof w2) == 0)
+    if (jail && landlock_apply(jail, extra_rw, w2, sizeof w2) == 0)
         applied |= AIOS_HARD_LANDLOCK;
     if (seccomp_install(w1, sizeof w1) == 0) applied |= AIOS_HARD_SECCOMP;
 

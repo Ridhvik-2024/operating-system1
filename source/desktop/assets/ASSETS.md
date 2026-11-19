@@ -75,6 +75,6 @@ a build.
 
 ## Canonical copy
 
-A copy of this spec is handed to the artist as
-`download/m10-assets-spec.md`. If the two ever differ, THIS file (in
-the repo) is authoritative.
+This file (in the repo) is authoritative. An artist-facing copy was
+previously handed over as `download/m10-assets-spec.md`; if you make one,
+generate it from this file rather than editing it separately.

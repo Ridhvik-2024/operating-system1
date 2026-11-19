@@ -5,6 +5,7 @@
 #   gui_check.py shot <mon.sock> <out.ppm>      take a screendump
 #   gui_check.py type <mon.sock> <text>         sendkey a string
 #   gui_check.py key  <mon.sock> <keyname>      one raw sendkey (ret, etc.)
+#   gui_check.py click <mon.sock> <x> <y>       move+press+release (tablet)
 #   gui_check.py quit <mon.sock>                terminate QEMU
 #   gui_check.py verify <shot.ppm> <checks...>  pixel assertions (see main)
 import os
@@ -102,6 +103,19 @@ def main():
     if cmd == "key":
         hmp(sys.argv[2], "sendkey " + sys.argv[3])
         sys.exit(0)
+    if cmd == "click":
+        # M8: a real click, at absolute screen coordinates, through the tablet.
+        # QEMU's HMP mouse_move takes ABSOLUTE coordinates when a tablet is
+        # attached; mouse_button then delivers press and release. Both are
+        # needed -- a press with no release leaves the desktop's button state
+        # stuck down and the next click is swallowed.
+        mon, x, y = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+        hmp(mon, f"mouse_move {x} {y}")
+        time.sleep(0.2)
+        hmp(mon, "mouse_button 1")
+        time.sleep(0.2)
+        hmp(mon, "mouse_button 0")
+        sys.exit(0)
     if cmd == "quit":
         hmp(sys.argv[2], "quit", expect_prompt=False)
         sys.exit(0)
@@ -183,6 +197,50 @@ def main():
                         diff += 1
             assert diff > 12, f"no visible new output ({diff} px)"
             print(f"PASS has_42 ({diff} changed px in terminal)")
+        elif check == "pending_window":
+            # M8: the pending-changes window. A SIXTH WINDOW, not a sixth
+            # launcher slot, centred and overlapping the five apps:
+            #   { W/2 - 260, 90, 520, H - 90 - BAR_H - 20 } on 1280x800
+            # so it starts at x=380, y=90 and is 520 wide. Opening it is a
+            # person's action (the bar badge), so this runs on a shot taken
+            # after that click.
+            wx, wy, ww = (w // 2 - 260), 90, 520
+            assert 0 <= wx < w, "window origin off-screen"
+            # The window ORIGIN is the title bar; the body (the canvas that
+            # aios_win_text draws into) starts AIOS_TITLE_H=24 below it. Every
+            # probe below is in canvas coordinates, offset by cy.
+            cy = wy + 24
+            # 1. the title bar: bright ink on the title row, in the left part
+            ink = 0
+            for y in range(wy + 6, wy + 18):
+                for x in range(wx + 12, min(wx + 200, w - 1), 4):
+                    r, g, b = px(raw, w, x, y)
+                    if r + g + b > 380:
+                        ink += 1
+            assert ink > 3, f"pending window title ink missing ({ink})"
+            # 2. the accent-coloured heading ("N pending changes") at canvas y=4,
+            # green text on the panel fill
+            head = 0
+            for y in range(cy + 4, cy + 20):
+                for x in range(wx + 8, min(wx + 190, w - 1)):
+                    r, g, b = px(raw, w, x, y)
+                    if g > 150 and r < 130 and b < 200 and g > r:
+                        head += 1
+            assert head > 20, f"no pending heading ink ({head})"
+            # 3. a green '+' row and a red '-' row in the diff pane. Hue, not
+            # brightness: the '+' is (0x5a,0xd6,0x8a), the '-' is (0xe8,0x6a,0x7a)
+            green = red = 0
+            for y in range(cy + 40, min(cy + 240, h - 1)):
+                for x in range(wx + 8, min(wx + ww - 8, w - 1)):
+                    r, g, b = px(raw, w, x, y)
+                    if g > 120 and r < 110 and g > r + 40 and b < 200:
+                        green += 1
+                    if r > 120 and r > g + 40 and r > b + 20 and g < 160:
+                        red += 1
+            assert green > 40, f"no green '+' diff row ({green} px)"
+            assert red > 5, f"no red '-' diff row ({red} px)"
+            print(f"PASS pending_window (title ink={ink}, heading={head}, "
+                  f"green={green}, red={red})")
         else:
             sys.exit(f"unknown check {check}")
         sys.exit(0)

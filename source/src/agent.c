@@ -118,7 +118,10 @@ aios_status agent_run(const agent_cfg *cfg, char *final_out, size_t cap) {
         st = cfg->cx->plan(cfg->cx, obs_json, &act, err, sizeof err);
         free(obs_json);
         if (st != AIOS_OK) {
-            snprintf(last_err, sizeof last_err, "cortex: %s",
+            /* err is caller-sized; last_err is 512. Clamp explicitly so a
+             * long cortex message cannot be reported as a truncation bug. */
+            snprintf(last_err, sizeof last_err, "cortex: %.*s",
+                     (int)sizeof last_err - 9,
                      err[0] ? err : aios_status_str(st));
             last_tool[0] = 0;
             last_ok = false;
@@ -201,8 +204,31 @@ aios_status agent_run(const agent_cfg *cfg, char *final_out, size_t cap) {
             free(args_json);
             continue;
         }
-        st = tool_exec(cfg->tools, act.tool, act.args, &result,
-                       err, sizeof err);
+        /* Mediation. The loop does not get to call tools on its own authority:
+         * the guardian sees the tool and its args first, and can refuse or
+         * redirect. Without one, nothing here would ever have been gated.
+         *
+         * A refusal is reported as a tool failure rather than aborting the
+         * loop: the planner then sees why in its own history and can choose a
+         * different route. Silently retrying is prevented by the duplicate
+         * check above; failing the whole run would make a single refused step
+         * kill an otherwise productive agent. */
+        bool refused = false;
+        if (cfg->guard.check) {
+            char gerr[512] = {0};
+            if (cfg->guard.check(cfg->guard.ud, act.tool, act.args,
+                                 gerr, sizeof gerr) != 0) {
+                snprintf(err, sizeof err, "%.400s", gerr[0] ? gerr : "refused");
+                refused = true;
+            }
+        }
+        if (refused) {
+            st = AIOS_ERR_TOOL;
+            result = NULL;
+        } else {
+            st = tool_exec(cfg->tools, act.tool, act.args, &result,
+                           err, sizeof err);
+        }
         act.args = NULL; /* consumed by tool_exec */
         snprintf(last_tool, sizeof last_tool, "%s", act.tool);
         last_ok = (st == AIOS_OK);
@@ -233,6 +259,20 @@ aios_status agent_run(const agent_cfg *cfg, char *final_out, size_t cap) {
             }
         }
         free(args_json);
+
+        /* M4: the guardian's post-check, on the worker's own account. A batch
+         * agent has no human reading its diff, so this is the only thing
+         * standing between "it said it wrote one file" and the truth. */
+        if (!refused && st == AIOS_OK && cfg->guard.after) {
+            char aerr[512] = {0};
+            if (cfg->guard.after(cfg->guard.ud, act.tool, aerr, sizeof aerr) != 0) {
+                snprintf(err, sizeof err, "%.400s", aerr[0] ? aerr : "effects refused");
+                st = AIOS_ERR_TOOL;
+                json_free(result);
+                result = NULL;
+                last_ok = false;
+            }
+        }
 
         /* reflect: write the tool outcome into episodic memory */
         if (cfg->mem) {

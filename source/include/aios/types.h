@@ -1,5 +1,5 @@
 /* aios/types.h — M1 core types, status codes, small utilities.
- * AI-OS: AI-native operating system. License: project-internal. */
+ * AI-OS: AI-native operating system. License: Apache-2.0 (see LICENSE). */
 #ifndef AIOS_TYPES_H
 #define AIOS_TYPES_H
 

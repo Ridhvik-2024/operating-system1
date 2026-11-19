@@ -30,7 +30,15 @@ void sh_decision_free(sh_decision *d) {
     free(d->text);
     free(d->thought);
     json_free(d->args);
+    if (d->action) aios_action_free(d->action);   /* M1: never leak a proposal */
     memset(d, 0, sizeof *d);
+}
+
+aios_action *sh_decision_to_action(sh_decision *d) {
+    if (!d) return NULL;
+    aios_action *a = d->action;
+    d->action = NULL;
+    return a;
 }
 
 /* ---------------- shared helpers ---------------- */
@@ -180,7 +188,16 @@ static aios_status scripted_route(const char *line, sh_decision *out,
             bool one_word = true;
             for (const char *q = path; q && *q; q++)
                 if (isspace((unsigned char)*q)) one_word = false;
-            if (one_word && path[0]) {
+            /* The last space must leave ROOM for content: "write one" has its
+             * only space at index 5, which is before t+6, so `last_sp - (t+6)`
+             * underflows to SIZE_MAX and the memcpy that follows writes a 10-byte
+             * string into a 0-byte allocation. That is not a routing mistake, it
+             * is a heap overflow reachable by typing two words.
+             *
+             * Guarding here means the phrase simply does not match this route and
+             * falls through to the text reply, which is the honest answer: there
+             * is no content/path split to be found in "write one". */
+            if (one_word && path[0] && last_sp > t + 6) {
                 size_t clen = (size_t)(last_sp - (t + 6));
                 char *content = (char *)malloc(clen + 1);
                 if (content) {
@@ -399,11 +416,66 @@ static aios_status llm_route(const char *line, tool_reg *tools,
 
 /* ---------------- entry ---------------- */
 
+/* Turn a finished decision into the descriptor it implies.
+ *
+ * Done once, here, rather than in each of the eleven places that fill a
+ * sh_decision: the routers know WHICH tool/goal, but the descriptor also
+ * needs declared effects per tool, a budget per kind, and the human intent.
+ * Spreading that across the routers would guarantee one of them drifts.
+ *
+ * origin is left UNSPECIFIED on purpose: the caller decides whether this
+ * route was human or AI. A routed natural-language line is AI (the router
+ * chose), which is why shell.c stamps ORIGIN_AI.
+ *
+ * Returns NULL only on allocation failure or for SH_ROUTE_REPLY, which
+ * proposes no action at all (the shell answers from its own knowledge and
+ * touches nothing). */
+static aios_action *decision_to_descriptor(sh_decision *d, const char *line) {
+    if (!d || d->kind == SH_ROUTE_REPLY) return NULL;
+
+    aios_act_kind kind = ACT_TOOL;
+    const char *target = NULL;
+
+    switch (d->kind) {
+    case SH_ROUTE_TOOL:
+        target = d->tool;
+        kind = ACT_TOOL;
+        break;
+    case SH_ROUTE_AGENT:
+        target = d->goal;
+        kind = d->bg ? ACT_JOB_SPAWN : ACT_AGENT;
+        break;
+    default:
+        return NULL;
+    }
+    if (!target || !*target) return NULL;
+
+    aios_action *a = aios_action_new(kind, ORIGIN_UNSPECIFIED, target);
+    if (!a) return NULL;
+
+    /* The human intent this serves is the line the human actually typed. */
+    aios_action_set_intent(a, line);
+
+    if (d->kind == SH_ROUTE_TOOL) {
+        /* args transfer to the descriptor: the router's copy becomes NULL so
+         * sh_decision_free() stays a no-op for it. */
+        if (d->args) aios_action_set_args(a, d->args);
+        d->args = NULL;
+        aios_action_declare_tool_effects(a, target, a->args);
+    }
+    return a;
+}
+
 aios_status sh_route(const char *mode, const char *line, tool_reg *tools,
                      sh_decision *out, char *err, size_t ecap) {
     if (err && ecap) err[0] = 0;
     if (!mode || !line || !out) return AIOS_ERR_ARG;
-    if (strcmp(mode, "llm") == 0 && tools)
-        return llm_route(line, tools, out, err, ecap);
-    return scripted_route(line, out, err, ecap, strcmp(mode, "micro") == 0);
+
+    aios_status st = (strcmp(mode, "llm") == 0 && tools)
+        ? llm_route(line, tools, out, err, ecap)
+        : scripted_route(line, out, err, ecap, strcmp(mode, "micro") == 0);
+    if (st != AIOS_OK) return st;
+
+    out->action = decision_to_descriptor(out, line);
+    return AIOS_OK;
 }

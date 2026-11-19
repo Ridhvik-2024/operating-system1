@@ -51,6 +51,10 @@ services layer above it is rewritten around three native abstractions:
 +--------------------------------------------------------------+
 ```
 
+**Licence:** Apache-2.0 (see `LICENSE`). **Contributing:** see
+`CONTRIBUTING.md` and `context/RULES.md`. **Roadmap to desktop capability:**
+`context/ROADMAP-TO-WINDOWS.md`.
+
 This repository is **AI-OS v1.1 (M10 `desktop`)** — a self-contained
 C11 runtime layer (zero external dependencies, builds in seconds)
 **plus a bootable OS image** — and since M10 the OS has a graphical
@@ -94,7 +98,7 @@ aios/
 ```bash
 make          # builds libaios.a, tool-exec, aiosh, aios-governor,
               # aios-demo, aios-memctl
-make test     # builds and runs all tests (10 suites)
+make test     # builds and runs all tests (15 suites)
 make install  # PREFIX=/usr/local (DESTDIR-aware); see INSTALL.md
 ```
 
@@ -132,7 +136,7 @@ Linux 6.6.142-0-virt base | system services layer: AI-native ...
 [init] durable: this is boot #2 for this data disk
 [init] autopilot governor: pid 433 (mode balanced)
 [init] phase 1/2: AI-OS selftest (M1-M8 unit + integration suite)
-  ... 10 suites ...
+  ... 15 suites ...
 AIOS-SELFTEST: PASS
 AIOS-BOOT-OK selftest=PASS
 
@@ -313,7 +317,8 @@ PASS build/tests/test_kernel       ( 4 checks, 5 env-skipped on the host;
                                     full pass inside the booted OS)
 PASS build/tests/test_autopilot    (61 checks, 3 env-skipped)
 PASS build/tests/test_durable      (35 checks, 1 env-skipped)
-== 10 passed, 0 failed ==
+PASS build/tests/test_fb           (89 checks)
+== 15 passed, 0 failed ==
 ```
 
 The sandbox suite proves: arithmetic evaluation, fs round-trips inside the
@@ -353,7 +358,7 @@ the drop-in contract for real artwork). Proof: `boot/boot-gui-test.sh`
 screendumps the desktop through QEMU, pixel-asserts the wallpaper /
 accent bar / five title bars / cursor, then types `6*7` through the
 virtio keyboard — the GUI answers `42` (screenshots in
-`download/m10-boot-shots/`). Acceptance record:
+the script's own `download/m10-boot-shots/`). Acceptance record:
 [docs/ACCEPTANCE-M10.md](docs/ACCEPTANCE-M10.md).
 
 ## Install, upgrade, hardening, performance (M9 / v1.0)
