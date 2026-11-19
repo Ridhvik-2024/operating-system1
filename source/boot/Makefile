@@ -253,15 +253,15 @@ $(INITRD): $(MKCPIO) $(BLD)/aios-init $(BLD)/aiosh \
 	     echo "   this file is tracked in git, so raising it is a reviewed commit:"; \
 	     echo "   that is the only form of this guard that can fail in CI"; \
 	 fi; \
-	@echo "   M11/W0-C raise (+2,000): C1 governor supervision in init.c (+1,285"
-	@echo "   bytes of text), C4 the boot ring in init.c plus the log builtin in"
-	@echo "   shell.c (+1,351), C3 flock and the tail reader in durable.c (+668)."
-	@echo "   Three W0-C features, the last open items on the roadmap exit test."
-	@echo "   The raise is 2,000 against 1,980 measured - about 1% headroom, not"
-	@echo "   a new 128KB cushion. Deliberately NOT paid for by dropping a suite:"
-	@echo "   all 17 installed suites exercise something in the image (audit,"
-	@echo "   sandbox, kernel, durable), unlike test_stoich/test_nullspace which"
-	@echo "   are pure arithmetic and are already LINK_ONLY."
+	 echo "   M11/W0-C raise (+2,000): C1 governor supervision in init.c (+1,285"
+	 echo "   bytes of text), C4 the boot ring in init.c plus the log builtin in"
+	 echo "   shell.c (+1,351), C3 flock and the tail reader in durable.c (+668)."
+	 echo "   Three W0-C features, the last open items on the roadmap exit test."
+	 echo "   The raise is 2,000 against 1,980 measured - about 1% headroom, not"
+	 echo "   a new 128KB cushion. Deliberately NOT paid for by dropping a suite:"
+	 echo "   all 17 installed suites exercise something in the image (audit,"
+	 echo "   sandbox, kernel, durable), unlike test_stoich/test_nullspace which"
+	 echo "   are pure arithmetic and are already LINK_ONLY."
 	 echo "   (the cap is toolchain-dependent: a static link against a newer" ; \
 	 echo "    glibc is larger. Pin it from the LARGEST supported toolchain," ; \
 	 echo "    not from the smallest.)" ; \
