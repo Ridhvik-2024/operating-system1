@@ -159,6 +159,20 @@ user-visible; all of it is what lets everything else land safely.
     "supervised" while nothing was running. Only an assertion on the log line
     caught it.
 
+- **W0 overall: NOT complete.** The bar at the top of this table says *"0 known
+  S1 gaps"*, and that number is not zero. `G6` (authority model / trust split) is
+  S1 and only half done: M7 made the origin tag a **required** argument and
+  enforced it at three layers, which stops an *honest* `aiosh` from promoting on
+  a model's behalf. It does not stop a *compromised* one, because every AI-OS
+  process still runs as the same uid with full root inside the initramfs — the
+  tag is a voluntary argument in one trust domain. Closing it needs clause (2) of
+  G6's own fix: AI work in a different uid/gid plus a user namespace with
+  `no_new_privs`, and PID 1 behind a small request protocol so it stops being a
+  peer of the things it supervises. That is not a card; it is the next phase.
+  **Everything else W0 promised is done** — CI green on 22.04 + 24.04 and in the
+  two-boot QEMU job, M1–M8 landed, the governor supervised and *proven*
+  supervised by CI. Do not read "W0-A/B/C done" as "W0 done".
+
 **W0 total: 6–8 weeks. It produces no new feature a user can see, and it is the
 highest-leverage work in this document.**
 
